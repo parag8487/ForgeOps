@@ -19,10 +19,10 @@ ForgeOps is one repository under **two licences**, split by path. The nearest
 `LICENSE` file governs, and the split is stated here explicitly so nothing has
 to be inferred.
 
-| Path | Licence | SPDX identifier |
-|:---|:---|:---|
-| Repository root — everything except paths carrying their own `LICENSE` (`backend/`, `frontend/`, `policies/`, `scripts/`, `docs/`, root tooling) | Functional Source License 1.1, Apache 2.0 future licence | `FSL-1.1-ALv2` |
-| `agent/` — the local agent and the CLI | Apache License 2.0 | `Apache-2.0` |
+| Path                                                                                                                                             | Licence                                                  | SPDX identifier |
+| :----------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------- | :-------------- |
+| Repository root — everything except paths carrying their own `LICENSE` (`backend/`, `frontend/`, `policies/`, `scripts/`, `docs/`, root tooling) | Functional Source License 1.1, Apache 2.0 future licence | `FSL-1.1-ALv2`  |
+| `agent/` — the local agent and the CLI                                                                                                           | Apache License 2.0                                       | `Apache-2.0`    |
 
 **Two-year Apache conversion.** Under the FSL, each version of the software
 covered by the root `LICENSE` also carries an irrevocable additional grant under

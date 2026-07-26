@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: FSL-1.1-ALv2
+# ForgeOps release — design.md §8.1 supply-chain chain of custody.
+#
+#   tagged commit → GoReleaser (6 targets, CGO_ENABLED=0, -trimpath,
+#   mod_timestamp) → Syft CycloneDX SBOM per artifact → Cosign keyless
+#   (OIDC → Fulcio) → Rekor transparency log → SLSA provenance → GitHub Release
+#
+# Every link is verifiable by a third party with NO shared secret: the signing
+# identity is this workflow's OIDC identity, the certificate is issued by
+# Fulcio, and the signature is logged in Rekor. `make verify-release` is the
+# check that custody actually worked (criterion 16).
+#
+# `id-token: write` is what makes keyless signing possible — it is the OIDC
+# token the workflow presents to Fulcio. It is NOT a long-lived secret.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release and upload artifacts
+      id-token: write # keyless signing: OIDC token for Fulcio
+      attestations: write # SLSA provenance attestation
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # GoReleaser needs full history for the changelog
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.26"
+          cache-dependency-path: agent/go.sum
+
+      - name: Install Syft (CycloneDX SBOM)
+        uses: anchore/sbom-action/download-syft@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.18.0
+
+      - name: Install Cosign (keyless signing)
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
+      # ── Build: 6 targets, CGO_ENABLED=0, reproducible metadata ────────────
+      # tree-sitter is deliberately absent from go.mod (D-1), which is exactly
+      # what keeps CGO_ENABLED=0 viable across all six targets.
+      - name: GoReleaser release
+        uses: goreleaser/goreleaser-action@9c156ee8a17a598857849441385a2041ef570552 # v6.3.0
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+          workdir: agent
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── SBOM: one CycloneDX document per released artifact ─────────────────
+      - name: Generate a CycloneDX SBOM per artifact
+        working-directory: agent
+        run: |
+          set -eu
+          for f in dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm; do
+            [ -e "$f" ] || continue
+            syft "file:$f" -o cyclonedx-json > "$f.sbom.json"
+            grep -q '"bomFormat"' "$f.sbom.json"
+            echo "sbom: $f.sbom.json"
+          done
+
+      # ── Sign: keyless, OIDC → Fulcio, logged in Rekor ──────────────────────
+      - name: Cosign keyless sign every artifact and its SBOM
+        working-directory: agent
+        run: |
+          set -eu
+          for f in dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/checksums.txt dist/*.sbom.json; do
+            [ -e "$f" ] || continue
+            cosign sign-blob --yes \
+              --output-signature "$f.sig" \
+              --output-certificate "$f.pem" \
+              "$f"
+            echo "signed: $f"
+          done
+
+      # ── Provenance: SLSA attestation for the build ─────────────────────────
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        with:
+          subject-path: |
+            agent/dist/*.tar.gz
+            agent/dist/*.zip
+            agent/dist/*.deb
+            agent/dist/*.rpm
+
+      # ── Publish the custody artifacts alongside the binaries ──────────────
+      - name: Upload signatures, certificates and SBOMs to the release
+        working-directory: agent
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF#refs/tags/}"
+          for f in dist/*.sig dist/*.pem dist/*.sbom.json; do
+            [ -e "$f" ] || continue
+            gh release upload "$tag" "$f" --clobber
+          done
+
+      # ── Verify our own custody before declaring the release good ───────────
+      # A release that cannot be verified is not a release (design.md §14.4).
+      - name: Self-verify one artifact end to end
+        working-directory: agent
+        run: |
+          set -eu
+          artifact="$(ls dist/*.tar.gz 2>/dev/null | head -n1 || true)"
+          [ -n "$artifact" ] || { echo "no tar.gz to verify"; exit 1; }
+          cosign verify-blob \
+            --certificate "$artifact.pem" \
+            --signature "$artifact.sig" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/v.*$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$artifact"
+          test -f "$artifact.sbom.json"
+          echo "verify-release: OK signature verified and SBOM present"
