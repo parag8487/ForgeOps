@@ -10,7 +10,7 @@ describe("package-policy", () => {
     expect(pkg.private).toBe(true);
   });
 
-  it('has license FSL-1.1-ALv2', () => {
+  it("has license FSL-1.1-ALv2", () => {
     expect(pkg.license).toBe("FSL-1.1-ALv2");
   });
 
@@ -35,9 +35,7 @@ describe("package-policy", () => {
     const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
     const depNames = Object.keys(allDeps);
     for (const lib of forbidden) {
-      const found = depNames.find(
-        (name) => name === lib || name.includes(lib.replace(".js", "")),
-      );
+      const found = depNames.find((name) => name === lib || name.includes(lib.replace(".js", "")));
       expect(found, `Forbidden dependency found: ${found}`).toBeUndefined();
     }
   });

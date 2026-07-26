@@ -97,7 +97,7 @@ Docker volumes, or lockfiles. Optional Compose profiles are separate commands:
 
 | Component | Command                           | Notes                                                                  |
 | :-------- | :-------------------------------- | :--------------------------------------------------------------------- |
-| Agent     | `go test -race -shuffle=on ./...` | run from `agent/`; needs `CGO_ENABLED=1` and a gcc — see below          |
+| Agent     | `go test -race -shuffle=on ./...` | run from `agent/`; needs `CGO_ENABLED=1` and a gcc — see below         |
 | Backend   | `pytest`                          | async tests via `pytest-asyncio`; Compose-managed PostgreSQL and Redis |
 | Frontend  | `vitest --run`                    | never watch mode                                                       |
 | E2E       | Playwright                        | `make e2e` against a built frontend                                    |
@@ -106,7 +106,7 @@ Docker volumes, or lockfiles. Optional Compose profiles are separate commands:
 ### The race detector on Windows
 
 `-race` requires cgo, and cgo requires a **gcc-compatible** compiler. Visual Studio
-Build Tools do *not* work: they provide `cl.exe`, which rejects the gcc-style flags
+Build Tools do _not_ work: they provide `cl.exe`, which rejects the gcc-style flags
 cgo passes and fails with `invalid numeric argument '/Werror'`. Install MinGW-w64
 instead:
 

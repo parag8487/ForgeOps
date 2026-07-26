@@ -17,9 +17,7 @@ test.describe("Shell layout", () => {
     await expect(skipLink).toHaveText("Skip to main content");
   });
 
-  test("Home link is keyboard activatable and has aria-current=page at /", async ({
-    page,
-  }) => {
+  test("Home link is keyboard activatable and has aria-current=page at /", async ({ page }) => {
     const homeLink = page.getByRole("link", { name: "Home" });
     await expect(homeLink).toBeVisible();
     await expect(homeLink).toHaveAttribute("aria-current", "page");

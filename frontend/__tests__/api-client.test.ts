@@ -11,9 +11,7 @@ vi.mock("@/lib/env", () => ({
 
 describe("isProblemDetails", () => {
   it("returns true for valid ProblemDetails", () => {
-    expect(
-      isProblemDetails({ type: "urn:test", title: "Error", status: 400 }),
-    ).toBe(true);
+    expect(isProblemDetails({ type: "urn:test", title: "Error", status: 400 })).toBe(true);
   });
 
   it("returns true for ProblemDetails with optional fields", () => {
@@ -118,9 +116,7 @@ describe("api client (request function)", () => {
   });
 
   it("handles 204 No Content by returning undefined", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
-      new Response(null, { status: 204 }),
-    );
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
 
     // Dynamic import to get the module with mocked env
     const { api } = await import("@/lib/api/client");
