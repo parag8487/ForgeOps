@@ -4,7 +4,7 @@
 #
 # Sourced by scripts/lock-backend.sh and scripts/check-lock-freshness.sh.
 #
-# design.md §7.7 and §16.2 make `pip-tools==7.4.1` the ONLY lock generator, so
+# design.md §7.7 and §16.2 make `pip-tools==7.6.0` the ONLY lock generator, so
 # this resolver refuses any other version rather than silently producing a lock
 # with different resolution behaviour. `pip-compile` is frequently not on PATH
 # (it lives inside the backend virtualenv), so the venv is searched first and the
@@ -14,7 +14,7 @@
 # Exports: PIP_COMPILE_CMD (an array-safe command string is avoided; callers use
 # the run_pip_compile function instead).
 
-PIP_TOOLS_REQUIRED_VERSION="${FORGEOPS_PIP_TOOLS_VERSION:-7.4.1}"
+PIP_TOOLS_REQUIRED_VERSION="${FORGEOPS_PIP_TOOLS_VERSION:-7.6.0}"
 
 _PIP_COMPILE_PYTHON=""
 

@@ -105,16 +105,16 @@ class TestPyprojectMetadata:
             assert "langchain" not in dep.lower(), f"Disallowed dependency found: {dep}. LangChain is Phase 1."
 
     def test_pip_tools_version(self):
-        """pip-tools must be exactly 7.4.1 in the dev dependencies."""
+        """pip-tools must be exactly 7.6.0 in the dev dependencies."""
         data = _load_pyproject()
         dev_deps = data["project"]["optional-dependencies"]["dev"]
         found = False
         for dep in dev_deps:
             if dep.startswith("pip-tools"):
-                assert dep == "pip-tools==7.4.1", f"pip-tools version must be ==7.4.1, got: {dep}"
+                assert dep == "pip-tools==7.6.0", f"pip-tools version must be ==7.6.0, got: {dep}"
                 found = True
                 break
-        assert found, "pip-tools==7.4.1 must be in the dev dependencies"
+        assert found, "pip-tools==7.6.0 must be in the dev dependencies"
 
     def test_ruff_config_present(self):
         """Backend-scoped ruff config must be present."""

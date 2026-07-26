@@ -25,7 +25,10 @@ func terminateGroup(cmd *exec.Cmd, grace time.Duration) {
 	_ = syscall.Kill(pgid, syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() {
-		cmd.Wait()
+		// The exit status is deliberately discarded: this goroutine exists only to
+		// learn WHETHER the process group died within the grace period, and the
+		// caller already has the real error from the primary cmd.Wait().
+		_ = cmd.Wait()
 		close(done)
 	}()
 	select {

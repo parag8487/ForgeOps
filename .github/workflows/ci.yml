@@ -32,7 +32,7 @@ env:
   NODE_VERSION: "22"
   PNPM_VERSION: "10"
   TOFU_VERSION: "1.12.5"
-  PIP_TOOLS_VERSION: "7.4.1"
+  PIP_TOOLS_VERSION: "7.6.0"
 
 jobs:
   # ── 0. paths-filter ───────────────────────────────────────────────────────

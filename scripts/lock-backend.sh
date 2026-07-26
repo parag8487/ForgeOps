@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: FSL-1.1-ALv2
 # scripts/lock-backend.sh — Regenerate hash-pinned backend lockfiles from pyproject.toml.
-# Uses pip-tools==7.4.1. Both lockfiles are committed.
+# Uses pip-tools==7.6.0. Both lockfiles are committed.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

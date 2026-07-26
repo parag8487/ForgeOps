@@ -8,7 +8,7 @@ SHELL := /bin/sh
 
 # Pinned toolchain versions verified by bootstrap (design.md §16.2, §16.4).
 DOCKER_COMPOSE_VERSION := 2.24.7
-PIP_TOOLS_VERSION := 7.4.1
+PIP_TOOLS_VERSION := 7.6.0
 
 .PHONY: help bootstrap init-env clean
 .PHONY: build build-agent build-backend build-frontend

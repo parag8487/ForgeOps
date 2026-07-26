@@ -28,14 +28,14 @@ supported shells for these targets.
 | POSIX shell             | `sh` (dash/bash)       | Git Bash or WSL2 on Windows                                       |
 | Go toolchain            | 1.26                   | agent; builds run with `CGO_ENABLED=0`                            |
 | Python                  | `>=3.13,<3.14`         | backend                                                           |
-| `pip-tools`             | 7.4.1 (exact)          | the only lock generator                                           |
+| `pip-tools`             | 7.6.0 (exact)          | the only lock generator                                           |
 | Node.js + pnpm          | pnpm 10+               | frontend                                                          |
 | Docker + Docker Compose | Compose 2.24.7 (exact) | long-form `env_file.required` is required                         |
 | OpenTofu                | 1.12.5 (exact)         | IaC runner tests; also available in the `tools` profile container |
 | `pre-commit`            | pinned by `bootstrap`  | Gitleaks, Ruff, gofmt, Prettier, hygiene                          |
 
 `make bootstrap` verifies the pinned toolchain, including Docker Compose 2.24.7 and
-`pip-tools==7.4.1`, and installs git hooks. It never silently rewrites lockfiles.
+`pip-tools==7.6.0`, and installs git hooks. It never silently rewrites lockfiles.
 
 ## Getting started
 
