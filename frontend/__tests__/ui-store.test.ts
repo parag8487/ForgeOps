@@ -41,7 +41,6 @@ describe("ui-store", () => {
 
   it("persists state via the persist middleware config", () => {
     // The store is configured with persist middleware - verify the name
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const persistOptions = (useUiStore as any).persist;
     expect(persistOptions).toBeDefined();
     expect(persistOptions.getOptions().name).toBe("ui");

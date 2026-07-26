@@ -12,7 +12,9 @@ export const options = {
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8000";
 
-export default function () {
+// Named rather than anonymous: k6 requires a default export, and giving it a name
+// makes it identifiable in k6's own output and in stack traces.
+export default function healthSmoke() {
   const res = http.get(`${BASE_URL}/health`);
   check(res, {
     "status is 200": (r) => r.status === 200,

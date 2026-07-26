@@ -100,10 +100,10 @@ jobs:
         run: pip install "pip-tools==${PIP_TOOLS_VERSION}"
       # Regenerate both locks and fail on ANY diff.
       - name: Backend lock freshness (no diff allowed)
-        run: sh scripts/check-lock-freshness.sh
+        run: bash scripts/check-lock-freshness.sh
       # tofu init -lockfile=readonly + six-platform freshness in an isolated copy.
       - name: OpenTofu six-platform lock integrity
-        run: sh scripts/check-tofu-lock.sh
+        run: bash scripts/check-tofu-lock.sh
 
   # ── 3+4+5. agent: lint → test → build (working-directory: agent) ──────────
   agent:
@@ -119,11 +119,15 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: agent/go.sum
+      # golangci-lint must be BUILT with a Go at least as new as the version it
+      # analyses. The prebuilt release binaries are compiled with an older
+      # toolchain and refuse to load a go1.26 config ("the Go language version
+      # (go1.23) used to build golangci-lint is lower than the targeted Go version
+      # (1.26)"), so it is installed from source with the Go set up above.
+      - name: Install golangci-lint (built with this Go)
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.2
       - name: Lint
-        uses: golangci/golangci-lint-action@55c2c1448f86e01eaae002a5a3a9624417608d84 # v6.5.2
-        with:
-          version: v1.62.2
-          working-directory: agent
+        run: golangci-lint run ./...
       # PRD §9: -race and -shuffle=on. Linux runners have cgo, so -race works.
       - name: Test
         run: go test -race -shuffle=on ./... -count=1
@@ -200,7 +204,7 @@ jobs:
           NEXT_PUBLIC_APP_NAME: ForgeOpsCI
         run: pnpm exec next build
       - name: Assert the generated client uses the supplied build URL
-        run: sh ../scripts/check-frontend-container.sh || true
+        run: bash ../scripts/check-frontend-container.sh || true
 
   # ── 8. compose smoke: exactly the five default services, from no .env ─────
   compose-smoke:
@@ -241,11 +245,10 @@ jobs:
         with:
           version: ${{ env.PNPM_VERSION }}
       - name: go mod verify + govulncheck
-        working-directory: agent
         run: |
-          go mod verify
+          cd agent && go mod verify && cd ..
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+          bash scripts/check-govulncheck.sh
       - name: pip-audit
         working-directory: backend
         run: |
