@@ -105,13 +105,14 @@ async def test_nonpositive_ttl_no_key(server_ttl, max_ttl, key, value):
     cache = TtlToolCache(redis, max_ttl_ms=max_ttl)
     ref = ReferenceCacheModel(max_ttl_ms=max_ttl)
 
-    stored = await cache.put(key, value, server_ttl)
+    tools = [{"name": value}]
+    stored = await cache.put(key, tools, server_ttl)
 
     # Reference says: no storage
     assert not ref.should_store(server_ttl)
     # Actual behavior matches
     assert stored is False
-    assert not redis.has_key(key)
+    assert not redis.has_key(cache.key_for(key))
 
 
 # --- P-06b: min(server_ttl, max_ttl) clamping ---
@@ -131,12 +132,13 @@ async def test_ttl_clamping(server_ttl, max_ttl, key, value):
     cache = TtlToolCache(redis, max_ttl_ms=max_ttl)
     ref = ReferenceCacheModel(max_ttl_ms=max_ttl)
 
-    stored = await cache.put(key, value, server_ttl)
+    tools = [{"name": value}]
+    stored = await cache.put(key, tools, server_ttl)
 
     expected_ttl = ref.effective_ttl(server_ttl)
     assert ref.should_store(server_ttl)
     assert stored is True
-    assert redis.get_stored_ttl(key) == expected_ttl
+    assert redis.get_stored_ttl(cache.key_for(key)) == expected_ttl
 
 
 # --- P-06c: Reference model agreement ---
@@ -156,15 +158,16 @@ async def test_reference_model_agreement(server_ttl, max_ttl, key, value):
     cache = TtlToolCache(redis, max_ttl_ms=max_ttl)
     ref = ReferenceCacheModel(max_ttl_ms=max_ttl)
 
-    stored = await cache.put(key, value, server_ttl)
+    tools = [{"name": value}]
+    stored = await cache.put(key, tools, server_ttl)
 
     if ref.should_store(server_ttl):
         assert stored is True
-        assert redis.has_key(key)
-        assert redis.get_stored_ttl(key) == ref.effective_ttl(server_ttl)
+        assert redis.has_key(cache.key_for(key))
+        assert redis.get_stored_ttl(cache.key_for(key)) == ref.effective_ttl(server_ttl)
     else:
         assert stored is False
-        assert not redis.has_key(key)
+        assert not redis.has_key(cache.key_for(key))
 
 
 # --- P-06d: Never serve after expiry ---
@@ -183,15 +186,16 @@ async def test_never_serve_after_expiry(server_ttl, max_ttl, key, value):
     redis = FakeRedis()
     cache = TtlToolCache(redis, max_ttl_ms=max_ttl)
 
+    tools = [{"name": value}]
     # Store a value
-    await cache.put(key, value, server_ttl)
+    await cache.put(key, tools, server_ttl)
 
     # Before expiry: should return value
     result_before = await cache.get(key)
-    assert result_before == value
+    assert result_before == tools
 
     # Simulate expiry
-    redis.simulate_expiry(key)
+    redis.simulate_expiry(cache.key_for(key))
 
     # After expiry: must return None (never serve stale)
     result_after = await cache.get(key)
@@ -214,8 +218,9 @@ async def test_server_ttl_respected_when_smaller(server_ttl, key, value):
     redis = FakeRedis()
     cache = TtlToolCache(redis, max_ttl_ms=max_ttl)
 
-    await cache.put(key, value, server_ttl)
-    assert redis.get_stored_ttl(key) == server_ttl
+    tools = [{"name": value}]
+    await cache.put(key, tools, server_ttl)
+    assert redis.get_stored_ttl(cache.key_for(key)) == server_ttl
 
 
 # --- P-06f: max_ttl < server_ttl clamps down ---
@@ -234,5 +239,6 @@ async def test_max_ttl_clamps_down(max_ttl, key, value):
     redis = FakeRedis()
     cache = TtlToolCache(redis, max_ttl_ms=max_ttl)
 
-    await cache.put(key, value, server_ttl)
-    assert redis.get_stored_ttl(key) == max_ttl
+    tools = [{"name": value}]
+    await cache.put(key, tools, server_ttl)
+    assert redis.get_stored_ttl(cache.key_for(key)) == max_ttl

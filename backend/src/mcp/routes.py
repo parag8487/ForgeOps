@@ -28,6 +28,7 @@ from fastapi.responses import HTMLResponse, ORJSONResponse
 from ..core.errors import ProblemException
 from .apps import CSP_POLICY, SANDBOX_ATTRS, McpAppRegistry
 from .routing import MCP_METHOD_HEADER, MCP_NAME_HEADER
+from .tasks import TaskConflictError
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
 
@@ -146,29 +147,53 @@ async def _handle_tasks(
             detail="params.id is required for this tasks method.",
         )
 
-    if method == "tasks/get":
-        record = await store.get(task_id)
-    elif method == "tasks/cancel":
-        # Cancelling an already-terminal task returns that state with HTTP 200
-        # and does not error: cancellation is idempotent (Design §11.5).
-        record = await store.cancel(task_id)
-    elif method == "tasks/update":
-        state = params.get("state")
-        if not state:
+    try:
+        if method == "tasks/get":
+            record = await store.get(task_id)
+        elif method == "tasks/cancel":
+            # Cancelling an already-terminal task returns that state with HTTP 200
+            # and does not error: cancellation is idempotent (Design §11.5).
+            record = await store.cancel(task_id)
+        elif method == "tasks/update":
+            state = params.get("state")
+            if not state:
+                raise ProblemException(
+                    status=400,
+                    type_suffix="mcp-missing-task-state",
+                    title="Missing task state",
+                    detail="params.state is required for tasks/update.",
+                )
+            record = await store.update(task_id, state)
+        else:
             raise ProblemException(
                 status=400,
-                type_suffix="mcp-missing-task-state",
-                title="Missing task state",
-                detail="params.state is required for tasks/update.",
+                type_suffix="mcp-unsupported-method",
+                title="Unsupported MCP method",
+                detail=f"Method '{method}' is not supported by this gateway.",
             )
-        record = await store.update(task_id, state)
-    else:
+    except TaskConflictError as exc:
+        # Two writers raced; the compare-and-set loser is told so explicitly
+        # rather than silently overwriting the winner (P-10).
+        raise ProblemException(
+            status=409,
+            type_suffix="mcp-task-conflict",
+            title="Task state conflict",
+            detail="The task changed state concurrently; re-read it and retry.",
+        ) from exc
+    except ValueError as exc:
+        if "not found" in str(exc):
+            raise ProblemException(
+                status=404,
+                type_suffix="mcp-unknown-task",
+                title="Unknown task",
+                detail=f"No task with id '{task_id}'.",
+            ) from exc
         raise ProblemException(
             status=400,
-            type_suffix="mcp-unsupported-method",
-            title="Unsupported MCP method",
-            detail=f"Method '{method}' is not supported by this gateway.",
-        )
+            type_suffix="mcp-invalid-task-transition",
+            title="Invalid task transition",
+            detail=str(exc),
+        ) from exc
 
     if record is None:
         raise ProblemException(

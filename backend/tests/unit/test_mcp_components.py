@@ -35,6 +35,26 @@ class FakeRedis:
             return -1  # no expiry
         return ttl  # Simulate positive TTL
 
+    async def eval(self, script: str, numkeys: int, *keys_and_args) -> int:
+        """Faithfully emulate the CAS_TRANSITION_LUA script."""
+        import json as _json
+
+        key = keys_and_args[0]
+        expected_state = keys_and_args[1]
+        new_record_json = keys_and_args[2]
+        ttl_ms_str = keys_and_args[3]
+
+        if key not in self._store:
+            return -1
+
+        current_json = self._store[key][0]
+        current = _json.loads(current_json)
+        if current["state"] != expected_state:
+            return 0
+
+        self._store[key] = (new_record_json, int(ttl_ms_str))
+        return 1
+
 
 class ErrorRedis:
     """Redis that always raises on every operation."""
@@ -64,11 +84,12 @@ class TestTtlToolCache:
         redis = FakeRedis()
         cache = TtlToolCache(redis, max_ttl_ms=60_000)
 
-        stored = await cache.put("tool:list:terraform", '["tool1", "tool2"]', server_ttl_ms=30_000)
+        tools = [{"name": "tool1"}, {"name": "tool2"}]
+        stored = await cache.put("terraform", tools, server_ttl_ms=30_000)
         assert stored is True
 
-        result = await cache.get("tool:list:terraform")
-        assert result == '["tool1", "tool2"]'
+        result = await cache.get("terraform")
+        assert result == tools
 
     async def test_put_respects_max_ttl(self):
         """Effective TTL = min(server_ttl_ms, max_ttl_ms)."""
@@ -77,9 +98,9 @@ class TestTtlToolCache:
         redis = FakeRedis()
         cache = TtlToolCache(redis, max_ttl_ms=10_000)
 
-        await cache.put("key1", "value1", server_ttl_ms=50_000)
+        await cache.put("server1", [{"name": "t1"}], server_ttl_ms=50_000)
         # The stored TTL should be 10_000 (the max)
-        _, ttl = redis._store["key1"]
+        _, ttl = redis._store[cache.key_for("server1")]
         assert ttl == 10_000
 
     async def test_put_with_smaller_server_ttl(self):
@@ -89,8 +110,8 @@ class TestTtlToolCache:
         redis = FakeRedis()
         cache = TtlToolCache(redis, max_ttl_ms=60_000)
 
-        await cache.put("key2", "value2", server_ttl_ms=5_000)
-        _, ttl = redis._store["key2"]
+        await cache.put("server2", [{"name": "t2"}], server_ttl_ms=5_000)
+        _, ttl = redis._store[cache.key_for("server2")]
         assert ttl == 5_000
 
     async def test_non_positive_ttl_creates_no_key(self):
@@ -211,10 +232,10 @@ class TestRedisTaskStore:
         redis = FakeRedis()
         store = RedisTaskStore(redis)
 
-        record = await store.create(tool_name="terraform.plan", arguments={"dir": "/infra"})
+        record = await store.create(kind="terraform.plan", owner="user1")
         assert record.state == TaskState.SUBMITTED
-        assert record.tool_name == "terraform.plan"
-        assert record.arguments == {"dir": "/infra"}
+        assert record.kind == "terraform.plan"
+        assert record.owner == "user1"
         assert record.task_id is not None
 
     async def test_get_retrieves_created_task(self):
@@ -223,7 +244,7 @@ class TestRedisTaskStore:
         redis = FakeRedis()
         store = RedisTaskStore(redis)
 
-        created = await store.create(tool_name="ansible.run")
+        created = await store.create(kind="ansible.run", owner="default")
         retrieved = await store.get(created.task_id)
         assert retrieved is not None
         assert retrieved.task_id == created.task_id
@@ -244,7 +265,7 @@ class TestRedisTaskStore:
         redis = FakeRedis()
         store = RedisTaskStore(redis)
 
-        record = await store.create(tool_name="test.tool")
+        record = await store.create(kind="test.tool", owner="default")
         updated = await store.update(record.task_id, TaskState.WORKING)
         assert updated.state == TaskState.WORKING
 
@@ -258,7 +279,7 @@ class TestRedisTaskStore:
         redis = FakeRedis()
         store = RedisTaskStore(redis)
 
-        record = await store.create(tool_name="test.tool")
+        record = await store.create(kind="test.tool", owner="default")
         # submitted → completed is invalid
         with pytest.raises(ValueError, match="Invalid transition"):
             await store.update(record.task_id, TaskState.COMPLETED)
@@ -278,7 +299,7 @@ class TestRedisTaskStore:
         redis = FakeRedis()
         store = RedisTaskStore(redis)
 
-        record = await store.create(tool_name="test.tool")
+        record = await store.create(kind="test.tool", owner="default")
         await store.update(record.task_id, TaskState.WORKING)
         cancelled = await store.cancel(record.task_id)
         assert cancelled.state == TaskState.CANCELLED
@@ -290,7 +311,7 @@ class TestRedisTaskStore:
         redis = FakeRedis()
         store = RedisTaskStore(redis)
 
-        record = await store.create(tool_name="test.tool")
+        record = await store.create(kind="test.tool", owner="default")
         await store.update(record.task_id, TaskState.WORKING)
         await store.update(record.task_id, TaskState.COMPLETED, result={"done": True})
 
@@ -305,7 +326,7 @@ class TestRedisTaskStore:
         redis = FakeRedis()
         store = RedisTaskStore(redis)
 
-        record = await store.create(tool_name="test.tool")
+        record = await store.create(kind="test.tool", owner="default")
         await store.update(record.task_id, TaskState.WORKING)
         first = await store.cancel(record.task_id)
         assert first.state == TaskState.CANCELLED
@@ -341,9 +362,11 @@ class TestOpaGatewayPolicy:
         mock_resp.raise_for_status = MagicMock()
         mock_http.post = AsyncMock(return_value=mock_resp)
 
-        policy = OpaGatewayPolicy(http=mock_http)
+        policy = OpaGatewayPolicy(opa_url="http://opa:8181", http=mock_http)
         tools = [{"name": "allowed_tool"}, {"name": "blocked_tool"}]
-        result = await policy.filter_tools(tools, subject="user1")
+        result = await policy.filter_tools(
+            server="terraform", tools=tools, claims={"sub": "user1"}, blast_radius="read_only"
+        )
 
         assert result == [{"name": "allowed_tool"}]
         mock_http.post.assert_called_once()
@@ -355,8 +378,13 @@ class TestOpaGatewayPolicy:
         mock_http = AsyncMock()
         mock_http.post = AsyncMock(side_effect=ConnectionError("OPA down"))
 
-        policy = OpaGatewayPolicy(http=mock_http)
-        result = await policy.filter_tools([{"name": "tool1"}], subject="user1")
+        policy = OpaGatewayPolicy(opa_url="http://opa:8181", http=mock_http)
+        result = await policy.filter_tools(
+            server="terraform",
+            tools=[{"name": "tool1"}],
+            claims={"sub": "user1"},
+            blast_radius="read_only",
+        )
 
         assert result == []
 
@@ -370,9 +398,15 @@ class TestOpaGatewayPolicy:
         mock_resp.raise_for_status = MagicMock()
         mock_http.post = AsyncMock(return_value=mock_resp)
 
-        policy = OpaGatewayPolicy(http=mock_http)
+        policy = OpaGatewayPolicy(opa_url="http://opa:8181", http=mock_http)
         # Should not raise
-        await policy.authorise_call(tool_name="safe.tool", subject="user1")
+        await policy.authorise_call(
+            server="terraform",
+            tool="safe.tool",
+            metadata={},
+            claims={"sub": "user1"},
+            blast_radius="read_only",
+        )
 
     async def test_authorise_call_denies_with_403(self):
         """Denied call raises 403."""
@@ -384,9 +418,15 @@ class TestOpaGatewayPolicy:
         mock_resp.raise_for_status = MagicMock()
         mock_http.post = AsyncMock(return_value=mock_resp)
 
-        policy = OpaGatewayPolicy(http=mock_http)
+        policy = OpaGatewayPolicy(opa_url="http://opa:8181", http=mock_http)
         with pytest.raises(ProblemException) as exc_info:
-            await policy.authorise_call(tool_name="dangerous.tool", subject="user1")
+            await policy.authorise_call(
+                server="terraform",
+                tool="dangerous.tool",
+                metadata={},
+                claims={"sub": "user1"},
+                blast_radius="read_only",
+            )
         assert exc_info.value.problem.status == 403
 
     async def test_authorise_call_denies_on_opa_failure(self):
@@ -396,9 +436,15 @@ class TestOpaGatewayPolicy:
         mock_http = AsyncMock()
         mock_http.post = AsyncMock(side_effect=ConnectionError("OPA down"))
 
-        policy = OpaGatewayPolicy(http=mock_http)
+        policy = OpaGatewayPolicy(opa_url="http://opa:8181", http=mock_http)
         with pytest.raises(ProblemException) as exc_info:
-            await policy.authorise_call(tool_name="any.tool", subject="user1")
+            await policy.authorise_call(
+                server="terraform",
+                tool="any.tool",
+                metadata={},
+                claims={"sub": "user1"},
+                blast_radius="read_only",
+            )
         assert exc_info.value.problem.status == 403
 
 

@@ -47,6 +47,28 @@ class FakeRedisForTasks:
     async def get(self, name: str) -> str | None:
         return self._store.get(name)
 
+    async def eval(self, script: str, numkeys: int, *keys_and_args) -> int:
+        """Faithfully emulate the CAS_TRANSITION_LUA script.
+
+        Parses the stored JSON, compares state to expected, and only then writes.
+        """
+        import json as _json
+
+        key = keys_and_args[0]
+        expected_state = keys_and_args[1]
+        new_record_json = keys_and_args[2]
+        # keys_and_args[3] is ttl_ms_str (not needed for in-memory store)
+
+        if key not in self._store:
+            return -1
+
+        current = _json.loads(self._store[key])
+        if current["state"] != expected_state:
+            return 0
+
+        self._store[key] = new_record_json
+        return 1
+
 
 # --- Helper to run async in sync context ---
 
@@ -77,7 +99,7 @@ class TaskStateMachine(RuleBasedStateMachine):
     @rule(target=tasks, tool=st.text(min_size=1, max_size=10, alphabet="abcdefghijklmnop"))
     def create_task(self, tool):
         """Create a new task — always starts in SUBMITTED."""
-        record = _run(self.store.create(tool_name=tool))
+        record = _run(self.store.create(kind=tool, owner="default"))
         assert record.state == TaskState.SUBMITTED
         self.model[record.task_id] = TaskState.SUBMITTED
         return record.task_id
@@ -150,7 +172,7 @@ async def test_concurrent_updates_at_most_one_wins():
     store = RedisTaskStore(redis)
 
     # Create a task in SUBMITTED state
-    record = await store.create(tool_name="concurrent_test")
+    record = await store.create(kind="concurrent_test", owner="default")
     task_id = record.task_id
 
     # Try to transition to WORKING and CANCELLED concurrently
@@ -191,7 +213,7 @@ async def test_concurrent_updates_terminal_blocks_second():
     store = RedisTaskStore(redis)
 
     # Create and move to COMPLETED (terminal)
-    record = await store.create(tool_name="terminal_test")
+    record = await store.create(kind="terminal_test", owner="default")
     task_id = record.task_id
     await store.update(task_id, TaskState.WORKING)
     await store.update(task_id, TaskState.COMPLETED)

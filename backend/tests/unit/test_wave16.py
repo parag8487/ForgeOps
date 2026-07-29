@@ -30,8 +30,11 @@ class TestHandleToolsCall:
     ):
         """Build an McpGateway with mocked dependencies."""
         from src.mcp.auth import Claims
+        from src.mcp.cache import TtlToolCache
         from src.mcp.gateway import McpGateway
+        from src.mcp.policy import OpaGatewayPolicy
         from src.mcp.registry import ServerDescriptor
+        from src.mcp.upstream import McpUpstream
 
         # Verifier
         verifier = AsyncMock()
@@ -62,26 +65,29 @@ class TestHandleToolsCall:
         router = MagicMock()
         router.route = MagicMock(return_value=route)
 
-        # Policy
-        policy = AsyncMock()
+        # Policy. `spec=` is load-bearing: it makes the double reject a call that
+        # the real OpaGatewayPolicy would reject. Behaviour is configured on the
+        # spec'd child mock, never by reassigning the attribute — reassigning
+        # discards signature enforcement, which is how a broken gateway once
+        # passed CI.
+        policy = AsyncMock(spec=OpaGatewayPolicy)
         if policy_allow:
-            policy.authorise_call = AsyncMock(return_value=None)
+            policy.authorise_call.return_value = None
         else:
-            policy.authorise_call = AsyncMock(
-                side_effect=ProblemException(
-                    status=403,
-                    type_suffix="mcp-call-denied",
-                    title="Tool call denied",
-                    detail="Policy denied.",
-                )
+            policy.authorise_call.side_effect = ProblemException(
+                status=403,
+                type_suffix="mcp-call-denied",
+                title="Tool call denied",
+                detail="Policy denied.",
             )
 
-        # Cache (not used by tools/call but needed for constructor)
-        cache = AsyncMock()
+        # Cache: consulted by local metadata resolution, never for dispatch.
+        cache = AsyncMock(spec=TtlToolCache)
+        cache.get.return_value = None
 
         # Upstream
-        upstream = AsyncMock()
-        upstream.call_tool = AsyncMock(return_value=upstream_result or {"content": [{"type": "text", "text": "ok"}]})
+        upstream = AsyncMock(spec=McpUpstream)
+        upstream.call_tool.return_value = upstream_result or {"content": [{"type": "text", "text": "ok"}]}
 
         # Registry (not directly used but required)
         registry = MagicMock()

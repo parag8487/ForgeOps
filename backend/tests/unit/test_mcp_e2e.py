@@ -123,18 +123,18 @@ def header_router(registry: McpServerRegistry) -> HeaderRouter:
 @pytest.fixture()
 def mock_upstream() -> AsyncMock:
     """Mock upstream that tracks call counts."""
+    from src.mcp.upstream import ToolListResult
+
     upstream = AsyncMock(spec=McpUpstream)
-    upstream.list_tools = AsyncMock(
-        return_value={
-            "tools": [
-                {"name": "plan", "description": "Run terraform plan"},
-                {"name": "apply", "description": "Run terraform apply"},
-                {"name": "destroy", "description": "Destroy infrastructure"},
-            ],
-            "ttl_ms": 30000,
-        }
+    upstream.list_tools.return_value = ToolListResult(
+        tools=[
+            {"name": "plan", "description": "Run terraform plan"},
+            {"name": "apply", "description": "Run terraform apply"},
+            {"name": "destroy", "description": "Destroy infrastructure"},
+        ],
+        ttl_ms=30000,
     )
-    upstream.call_tool = AsyncMock(return_value={"result": "success", "output": "Plan: 3 to add"})
+    upstream.call_tool.return_value = {"result": "success", "output": "Plan: 3 to add"}
     return upstream
 
 
@@ -143,9 +143,9 @@ def mock_policy() -> AsyncMock:
     """Mock OPA policy — allows everything by default."""
     policy = AsyncMock(spec=OpaGatewayPolicy)
     # filter_tools: pass through all tools by default
-    policy.filter_tools = AsyncMock(side_effect=lambda **kwargs: kwargs.get("tools", []))
+    policy.filter_tools.side_effect = lambda **kwargs: kwargs.get("tools", [])
     # authorise_call: allows by default (no exception)
-    policy.authorise_call = AsyncMock(return_value=None)
+    policy.authorise_call.return_value = None
     return policy
 
 
@@ -153,8 +153,8 @@ def mock_policy() -> AsyncMock:
 def mock_cache() -> AsyncMock:
     """Mock TTL cache — miss by default."""
     cache = AsyncMock(spec=TtlToolCache)
-    cache.get = AsyncMock(return_value=None)
-    cache.put = AsyncMock(return_value=None)
+    cache.get.return_value = None
+    cache.put.return_value = None
     return cache
 
 
@@ -181,7 +181,9 @@ def gateway(
 
 @pytest.fixture()
 def mock_redis_for_tasks() -> AsyncMock:
-    """Fake Redis for task store."""
+    """Fake Redis for task store with faithful CAS eval."""
+    import json as _json
+
     store: dict[str, str] = {}
 
     async def fake_set(name: str, value: str, px: int | None = None) -> None:
@@ -190,9 +192,23 @@ def mock_redis_for_tasks() -> AsyncMock:
     async def fake_get(name: str) -> str | None:
         return store.get(name)
 
+    async def fake_eval(script: str, numkeys: int, *keys_and_args) -> int:
+        key = keys_and_args[0]
+        expected_state = keys_and_args[1]
+        new_record_json = keys_and_args[2]
+        # keys_and_args[3] is ttl_ms_str, not needed for in-memory
+        if key not in store:
+            return -1
+        current = _json.loads(store[key])
+        if current["state"] != expected_state:
+            return 0
+        store[key] = new_record_json
+        return 1
+
     redis = AsyncMock()
     redis.set = AsyncMock(side_effect=fake_set)
     redis.get = AsyncMock(side_effect=fake_get)
+    redis.eval = AsyncMock(side_effect=fake_eval)
     return redis
 
 
@@ -346,13 +362,11 @@ class TestToolsCallDenied:
         self, gateway: McpGateway, valid_token: str, mock_upstream: AsyncMock, mock_policy: AsyncMock
     ):
         # OPA denies the call
-        mock_policy.authorise_call = AsyncMock(
-            side_effect=ProblemException(
-                status=403,
-                type_suffix="mcp-call-denied",
-                title="Tool call denied",
-                detail="Policy denied tool 'destroy'.",
-            )
+        mock_policy.authorise_call.side_effect = ProblemException(
+            status=403,
+            type_suffix="mcp-call-denied",
+            title="Tool call denied",
+            detail="Policy denied tool 'destroy'.",
         )
 
         body = json.dumps(
@@ -379,13 +393,11 @@ class TestToolsCallDenied:
         self, gateway: McpGateway, valid_token: str, mock_upstream: AsyncMock, mock_policy: AsyncMock
     ):
         """Multiple denied calls all produce zero upstream invocations."""
-        mock_policy.authorise_call = AsyncMock(
-            side_effect=ProblemException(
-                status=403,
-                type_suffix="mcp-call-denied",
-                title="Tool call denied",
-                detail="Denied.",
-            )
+        mock_policy.authorise_call.side_effect = ProblemException(
+            status=403,
+            type_suffix="mcp-call-denied",
+            title="Tool call denied",
+            detail="Denied.",
         )
 
         for tool_name in ["destroy", "apply", "delete_all"]:
@@ -421,9 +433,9 @@ class TestTasksLifecycle:
         store = RedisTaskStore(mock_redis_for_tasks)
 
         # CREATE
-        task = await store.create(tool_name="plan", arguments={"dir": "/infra"})
+        task = await store.create(kind="plan", owner="user1")
         assert task.state == TaskState.SUBMITTED
-        assert task.tool_name == "plan"
+        assert task.kind == "plan"
 
         # POLL (get)
         polled = await store.get(task.task_id)
@@ -442,7 +454,7 @@ class TestTasksLifecycle:
     async def test_cancel_working_task(self, mock_redis_for_tasks: AsyncMock):
         store = RedisTaskStore(mock_redis_for_tasks)
 
-        task = await store.create(tool_name="apply", arguments={})
+        task = await store.create(kind="apply", owner="default")
         # Transition to WORKING
         await store.update(task.task_id, TaskState.WORKING)
 
@@ -457,7 +469,7 @@ class TestTasksLifecycle:
     async def test_cancel_completed_task_is_noop(self, mock_redis_for_tasks: AsyncMock):
         store = RedisTaskStore(mock_redis_for_tasks)
 
-        task = await store.create(tool_name="plan", arguments={})
+        task = await store.create(kind="plan", owner="default")
         await store.update(task.task_id, TaskState.WORKING)
         await store.update(task.task_id, TaskState.COMPLETED, result={"output": "done"})
 

@@ -84,39 +84,39 @@ def _make_gateway(
     # Policy
     policy = AsyncMock(spec=OpaGatewayPolicy)
     if policy_denies:
-        policy.authorise_call = AsyncMock(
-            side_effect=ProblemException(
-                status=403,
-                type_suffix="mcp-call-denied",
-                title="Tool call denied",
-                detail="Policy denied.",
-            )
+        policy.authorise_call.side_effect = ProblemException(
+            status=403,
+            type_suffix="mcp-call-denied",
+            title="Tool call denied",
+            detail="Policy denied.",
         )
-        policy.filter_tools = AsyncMock(return_value=[])
+        policy.filter_tools.return_value = []
     else:
-        policy.authorise_call = AsyncMock(return_value=None)
-        policy.filter_tools = AsyncMock(return_value=[{"name": "tool1"}])
+        policy.authorise_call.return_value = None
+        policy.filter_tools.return_value = [{"name": "tool1"}]
 
     # Cache
     cache = AsyncMock(spec=TtlToolCache)
-    cache.get = AsyncMock(return_value=None)
-    cache.put = AsyncMock(return_value=True)
+    cache.get.return_value = None
+    cache.put.return_value = True
 
     # Upstream
+    from src.mcp.upstream import ToolListResult
+
     upstream = AsyncMock(spec=McpUpstream)
     counter = upstream_counter or MagicMock()
     counter.call_count = 0
 
     async def _list_tools(server_desc, **kw):
         counter()
-        return {"tools": [{"name": "tool1"}], "ttl_ms": 5000}
+        return ToolListResult(tools=[{"name": "tool1"}], ttl_ms=5000)
 
     async def _call_tool(server_desc, call, **kw):
         counter()
         return {"result": "ok"}
 
-    upstream.list_tools = AsyncMock(side_effect=_list_tools)
-    upstream.call_tool = AsyncMock(side_effect=_call_tool)
+    upstream.list_tools.side_effect = _list_tools
+    upstream.call_tool.side_effect = _call_tool
 
     gateway = McpGateway(
         registry=registry,
