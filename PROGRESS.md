@@ -21,14 +21,15 @@ exactly `completed`, `in-progress`, `not-started` or `blocked`.
 
 Phase 0 is `completed`: all 108 executable task leaves are implemented, all 18 completion
 criteria carry real evidence, and P-01 through P-15 are all present and passing. The work
-lives on the branch `phase-0-implementation` at commit `2e35737`; merging it into `main` is
-the repository owner's decision and has deliberately not been done here.
+lives on the branch `phase-0-implementation`; merging it into `main` is the repository
+owner's decision and has deliberately not been done here.
 
 ## Authoritative gates
 
 | Gate                     | Reference                                                                             | Result                                                                                                       |
 | :----------------------- | :------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------- |
-| CI                       | run `30474610382`, commit `2e35737`                                                   | all 9 jobs pass: changes, pre-commit, lock-integrity, backend, frontend, agent, supply, audit, compose-smoke |
+| CI (code gate)           | run `30474610382`, commit `2e35737`                                                   | all 9 jobs pass: changes, pre-commit, lock-integrity, backend, frontend, agent, supply, audit, compose-smoke |
+| CI (documentation gate)  | run `30476517964`, commit `8f2cee8`                                                   | all 9 jobs pass                                                                                              |
 | Release chain of custody | run `30469955653`, tag `v0.0.1-rc3` (commit `7f5213f`)                                | all steps green; 94 release assets; 31 Rekor entries, indices `2281269542`–`2281270394`                      |
 | Secret scanning          | gitleaks `v8.30.1`, full history (`--log-opts=--all`) plus the one unreachable commit | no leaks found                                                                                               |
 
