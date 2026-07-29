@@ -43,7 +43,10 @@ class TestPlanDocument:
     def test_from_json_real_sample(self):
         """Test using the real plan-sample.json from task 9.5."""
         if not PLAN_SAMPLE_PATH.exists():
-            pytest.skip("plan-sample.json not found")
+            pytest.fail(
+                "agent/testdata/plan-sample.json is committed and is criterion 13's "
+                "only fixture; a missing file must fail, not skip"
+            )
         data = PLAN_SAMPLE_PATH.read_text(encoding="utf-8")
         doc = PlanDocument.from_json(data)
         assert doc.format_version == "1.2"
@@ -175,7 +178,10 @@ class TestValidationPipeline:
     async def test_real_sample(self):
         """Pipeline over the real plan-sample.json."""
         if not PLAN_SAMPLE_PATH.exists():
-            pytest.skip("plan-sample.json not found")
+            pytest.fail(
+                "agent/testdata/plan-sample.json is committed and is criterion 13's "
+                "only fixture; a missing file must fail, not skip"
+            )
         data = PLAN_SAMPLE_PATH.read_text(encoding="utf-8")
         doc = PlanDocument.from_json(data)
         pipeline = ValidationPipeline()

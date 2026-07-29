@@ -26,6 +26,7 @@ Redis client) is what is actually under test.
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import subprocess
 import time
@@ -33,6 +34,8 @@ from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
+
+from .capability import require_capability
 
 PROBLEM_CONTENT_TYPE = "application/problem+json"
 
@@ -128,9 +131,17 @@ class TestReadinessRecovery:
 
     def test_readiness_recovers_without_restarting_the_process(self, database_url: str, tmp_path) -> None:
         _pg_bin = os.environ.get("FORGEOPS_TEST_PG_BIN", r"C:\IMP\kiro\_toolchain\pg17\bin")
-        redis_server = os.environ.get("FORGEOPS_TEST_REDIS_SERVER", r"C:\Program Files\Redis\redis-server.exe")
-        if not os.path.exists(redis_server):
-            pytest.skip(f"no real redis-server available at {redis_server}")
+        # Prefer a redis-server on PATH (how Linux and CI have it) and fall back to
+        # the local Windows install path. The previous default was Windows-only, so
+        # this test skipped everywhere else — including CI.
+        redis_server = os.environ.get("FORGEOPS_TEST_REDIS_SERVER", "") or (
+            shutil.which("redis-server") or r"C:\Program Files\Redis\redis-server.exe"
+        )
+        if not os.path.exists(redis_server) and shutil.which(redis_server) is None:
+            require_capability(
+                f"no real redis-server binary available at {redis_server}; this test must "
+                "start and stop its own Redis to observe the unavailable -> available transition"
+            )
 
         # The already-running test PostgreSQL is reachable; Redis is started on a
         # port that is closed when the app boots, so the app must observe the

@@ -198,6 +198,54 @@ fi
 
 rm -f "$TMPF_COMPOSE"
 
+# ── 13. The generated client bundle actually carries the build-time URL ──────
+#
+# Assertions 1-12 read the Dockerfile and docker-compose.yml. Design §13.3 asks
+# for more than that: "a container-build test inspects/executes the generated
+# client bundle and proves requests use the supplied browser-reachable URL rather
+# than a server-internal hostname or runtime-only value." A static grep cannot
+# tell the difference between a value Next.js inlines and one it reads at runtime,
+# which is the whole point of the criterion.
+#
+# So when a build output exists, grep it. NEXT_PUBLIC_API_BASE_URL names the URL
+# the build was given; the emitted client chunks must contain it.
+BUILD_DIR="$REPO_ROOT/frontend/.next"
+
+if [ -d "$BUILD_DIR" ]; then
+  echo ""
+  echo "==> Inspecting the generated client bundle in frontend/.next ..."
+  expected="${NEXT_PUBLIC_API_BASE_URL:-}"
+  if [ -z "$expected" ]; then
+    echo "FAIL: NEXT_PUBLIC_API_BASE_URL is not set, so the inlined value cannot be verified"
+    echo "      Re-run with the same value the build used, e.g."
+    echo "      NEXT_PUBLIC_API_BASE_URL=http://ci.example.test:9999/api/v1 bash scripts/check-frontend-container.sh"
+    errors=$((errors + 1))
+  elif grep -rqF "$expected" "$BUILD_DIR/static" 2>/dev/null; then
+    echo "  OK: the client bundle contains the build-time URL ($expected)"
+  else
+    echo "FAIL: the client bundle does NOT contain the build-time URL ($expected)"
+    echo "      NEXT_PUBLIC_* must be inlined at build time; a runtime-only value is insufficient."
+    errors=$((errors + 1))
+  fi
+
+  # A server-internal Compose hostname must never reach browser code.
+  if grep -rqE 'https?://(backend|api|opa|postgres|redis|frontend):[0-9]+' "$BUILD_DIR/static" 2>/dev/null; then
+    echo "FAIL: the client bundle references an internal Compose hostname"
+    errors=$((errors + 1))
+  else
+    echo "  OK: no internal Compose hostname in the client bundle"
+  fi
+else
+  echo ""
+  echo "==> frontend/.next not present: skipping the bundle inspection."
+  echo "    Static assertions above still ran. Build first for full criterion 6 evidence:"
+  echo "    (cd frontend && NEXT_PUBLIC_API_BASE_URL=http://ci.example.test:9999/api/v1 pnpm exec next build)"
+  if [ -n "${FORGEOPS_REQUIRE_BUNDLE_CHECK:-}" ]; then
+    echo "FAIL: FORGEOPS_REQUIRE_BUNDLE_CHECK is set but frontend/.next does not exist"
+    errors=$((errors + 1))
+  fi
+fi
+
 echo ""
 if [ "$errors" -eq 0 ]; then
   echo "OK: frontend/Dockerfile and docker-compose.yml pass all Phase 0 container assertions"

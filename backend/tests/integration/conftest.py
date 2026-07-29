@@ -21,13 +21,15 @@ import os
 
 import pytest
 
+from .capability import require_capability
+
 TEST_DATABASE_URL_ENV = "FORGEOPS_TEST_DATABASE_URL"
 
 
 def _require_database_url() -> str:
     url = os.environ.get(TEST_DATABASE_URL_ENV, "").strip()
     if not url:
-        pytest.skip(
+        require_capability(
             f"{TEST_DATABASE_URL_ENV} is not set; these tests require a real "
             "PostgreSQL 17 with the pgvector extension available "
             "(design.md §7.6)"

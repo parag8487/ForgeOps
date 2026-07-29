@@ -36,6 +36,8 @@ import httpx
 import pytest
 from src.mcp.policy import DEFAULT_ALLOW_PATH, DEFAULT_FILTER_PATH, OpaGatewayPolicy
 
+from .capability import require_capability
+
 # Same digest as docker-compose.yml, so the policy runs on the engine it ships with.
 OPA_IMAGE = "openpolicyagent/opa:1.4.2@sha256:35a093d9ae828373cf88f68ecaa8189ab26287468074a3b78f0601d9c8b7a4f5"
 POLICY_DIR = Path(__file__).resolve().parents[3] / "policies"
@@ -71,7 +73,7 @@ def opa_url() -> str:
 
     docker = shutil.which("docker")
     if docker is None:
-        pytest.skip("no FORGEOPS_TEST_OPA_URL and no docker on PATH to start one")
+        require_capability("no FORGEOPS_TEST_OPA_URL and no docker on PATH to start one")
 
     name = f"forgeops-opa-test-{uuid.uuid4().hex[:8]}"
     started = subprocess.run(  # noqa: S603 - fixed argv, no shell
@@ -96,7 +98,7 @@ def opa_url() -> str:
         text=True,
     )
     if started.returncode != 0:
-        pytest.skip(f"could not start the OPA container: {started.stderr.strip()[:200]}")
+        require_capability(f"could not start the OPA container: {started.stderr.strip()[:200]}")
 
     try:
         port = subprocess.run(  # noqa: S603
@@ -107,7 +109,7 @@ def opa_url() -> str:
         ).stdout.splitlines()[0]
         url = f"http://127.0.0.1:{port.rsplit(':', 1)[-1].strip()}"
         if not _wait_until_healthy(url):
-            pytest.skip("the OPA container never became healthy")
+            require_capability("the OPA container never became healthy")
         yield url
     finally:
         subprocess.run([docker, "rm", "-f", name], capture_output=True, check=False)  # noqa: S603
