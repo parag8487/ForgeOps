@@ -63,16 +63,43 @@ def _wait_for_port(port: int, timeout: float = 20.0) -> bool:
     return False
 
 
+@pytest.fixture(autouse=True)
+def _restore_environment() -> Iterator[None]:
+    """Undo this module's environment mutations after every test.
+
+    `_build_app` assigns `DATABASE_URL` and `REDIS_URL` directly, because the app
+    factory reads them through pydantic-settings at construction time. Those
+    assignments used to persist, so every later test in the session saw a DSN
+    pointing at a deliberately-closed port — it surfaced in CI as
+    `test_cas_holds_against_a_real_redis` failing to reach Redis on a random high
+    port. A process-wide mutation leaking out of a test is a defect even when the
+    ordering happens to hide it.
+    """
+    snapshot = dict(os.environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(snapshot)
+        _clear_settings_cache()
+
+
+def _clear_settings_cache() -> None:
+    from src.core.config import get_settings
+
+    if hasattr(get_settings, "cache_clear"):
+        get_settings.cache_clear()
+
+
 def _build_app(database_url: str, redis_url: str):
     """Import the app factory with a project configuration applied to the env."""
     os.environ["DATABASE_URL"] = database_url
     os.environ["REDIS_URL"] = redis_url
     os.environ.setdefault("MCP_OIDC_AUDIENCE", "forgeops-mcp-gateway")
     os.environ.setdefault("OPA_URL", "http://127.0.0.1:8181")
-    from src.core.config import get_settings
     from src.main import create_app
 
-    get_settings.cache_clear() if hasattr(get_settings, "cache_clear") else None
+    _clear_settings_cache()
     return create_app()
 
 

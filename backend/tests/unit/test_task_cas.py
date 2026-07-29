@@ -159,13 +159,17 @@ async def test_commit_reports_a_vanished_task_as_not_found(store: RedisTaskStore
 # ── The same guarantee against a real Redis ─────────────────────────────────
 #
 # CI sets REDIS_URL for the backend job, so this runs there rather than skipping.
+# The DSN is captured at import time on purpose: other modules assign REDIS_URL to
+# point at deliberately-closed ports, and reading it at call time made this test
+# depend on collection order.
+_REDIS_URL_AT_IMPORT = os.environ.get("REDIS_URL", "").strip()
 
 
 @pytest.mark.asyncio
 async def test_cas_holds_against_a_real_redis():
     from tests.integration.capability import require_capability
 
-    url = os.environ.get("REDIS_URL", "").strip()
+    url = _REDIS_URL_AT_IMPORT
     if not url:
         require_capability("REDIS_URL is not set; the in-memory CAS tests above still apply")
 
