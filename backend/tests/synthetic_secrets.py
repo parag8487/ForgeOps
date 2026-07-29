@@ -10,8 +10,9 @@ them as source literals makes secret scanners fire on the repository itself:
 * GitGuardian incident 35267706 was a JWT-shaped placeholder in
   `test_p09_rfc9457.py` — synthetic, never a working credential, but a red gate on
   the pull request for the lifetime of that commit.
-* `gitleaks detect --no-git` flags a bare `-----BEGIN RSA PRIVATE KEY-----`
-  delimiter under its `private-key` rule even with no key bytes after it.
+* `gitleaks detect --no-git` flags a bare PEM `BEGIN ... KEY` delimiter under its
+  `private-key` rule even with no key bytes after it. (Deliberately not spelled out
+  here either — a comment explaining the problem should not reproduce it.)
 
 A blocked scan that everyone learns to wave through is worse than no scan, so the
 shapes are composed from fragments here. No contiguous literal exists in any
