@@ -19,16 +19,24 @@ logger = logging.getLogger(__name__)
 # KEYS[1] = bucket key
 # ARGV[1] = capacity (max tokens)
 # ARGV[2] = refill_rate (tokens per second)
-# ARGV[3] = now (current timestamp in seconds, float as string)
-# ARGV[4] = tokens_to_consume (usually 1)
+# ARGV[3] = tokens_to_consume (usually 1)
+#
+# The clock is read from Redis TIME inside the script, never supplied by the
+# caller, so the bucket is authoritative across replicas (design §14.1).
 #
 # Returns: [allowed(0|1), remaining, retry_after_ms]
 TOKEN_BUCKET_LUA = """
 local key = KEYS[1]
 local capacity = tonumber(ARGV[1])
 local refill_rate = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
-local consume = tonumber(ARGV[4])
+local consume = tonumber(ARGV[3])
+
+-- Redis is the single time authority. A client-supplied timestamp would let
+-- replicas with skewed clocks refill the same bucket at different rates, and a
+-- caller able to influence the app clock could refill it arbitrarily fast.
+-- TIME returns {seconds, microseconds} and is fixed for the duration of one EVAL.
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + (tonumber(t[2]) / 1000000)
 
 local bucket = redis.call('HMGET', key, 'tokens', 'last_refill')
 local tokens = tonumber(bucket[1])
@@ -97,6 +105,8 @@ class RedisTokenBucketLimiter:
         self._capacity = capacity
         self._refill_rate = refill_rate
         self._prefix = key_prefix
+        # Kept for the pure reference model in tests only. The runtime bucket
+        # reads Redis TIME inside the Lua script; this clock never reaches it.
         self._clock = clock or time.time
 
     async def check(self, bucket_id: str, *, tokens: int = 1) -> RateLimitDecision:
@@ -109,7 +119,6 @@ class RedisTokenBucketLimiter:
             RateLimitServiceError on Redis failure (fail-closed → 503).
         """
         key = f"{self._prefix}{bucket_id}"
-        now = self._clock()
 
         try:
             result = await self._redis.eval(
@@ -118,7 +127,6 @@ class RedisTokenBucketLimiter:
                 key,
                 str(self._capacity),
                 str(self._refill_rate),
-                str(now),
                 str(tokens),
             )
         except Exception as exc:
