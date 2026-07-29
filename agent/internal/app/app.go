@@ -125,16 +125,32 @@ func (a *App) Run(ctx context.Context) error {
 }
 
 // Close performs graceful shutdown of all subsystems in reverse construction order.
+//
+// The whole sequence is bounded by cfg.ShutdownTimeout (P-07). A closer that
+// blocks past the deadline is abandoned rather than allowed to hang the process:
+// the goroutine is deliberately left running because the process is exiting.
 func (a *App) Close() error {
 	a.closeOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), a.cfg.ShutdownTimeout)
 		defer cancel()
-		_ = ctx // reserved for future bounded close operations
-		for i := len(a.closers) - 1; i >= 0; i-- {
-			c := a.closers[i]
-			if err := c.fn(); err != nil {
-				a.closeErr = errors.Join(a.closeErr, fmt.Errorf("%s: %w", c.name, err))
+
+		done := make(chan error, 1)
+		go func() {
+			var errs error
+			for i := len(a.closers) - 1; i >= 0; i-- {
+				c := a.closers[i]
+				if err := c.fn(); err != nil {
+					errs = errors.Join(errs, fmt.Errorf("%s: %w", c.name, err))
+				}
 			}
+			done <- errs
+		}()
+
+		select {
+		case err := <-done:
+			a.closeErr = err
+		case <-ctx.Done():
+			a.closeErr = fmt.Errorf("shutdown exceeded %s: %w", a.cfg.ShutdownTimeout, ctx.Err())
 		}
 	})
 	return a.closeErr

@@ -235,6 +235,21 @@ func (r *TofuRunner) run(ctx context.Context, binPath string, args []string, wor
 	_ = stdoutW.Close()
 	_ = stderrW.Close()
 
+	// Terminate the whole process group as soon as the context is done, WHILE the
+	// child is still live. Signalling after cmd.Wait targets a reaped pgid, and
+	// the grace-then-SIGKILL escalation cannot observe a process it no longer
+	// owns. `reaped` stops the watchdog on the normal path.
+	reaped := make(chan struct{})
+	var termOnce sync.Once
+	terminate := func() { termOnce.Do(func() { terminateGroup(cmd, r.cfg.KillGrace) }) }
+	go func() {
+		select {
+		case <-ctx.Done():
+			terminate()
+		case <-reaped:
+		}
+	}()
+
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -266,6 +281,7 @@ func (r *TofuRunner) run(ctx context.Context, binPath string, args []string, wor
 	// Reap the process. This is safe with the scanners still running: the
 	// child cannot block on a full pipe because they are draining it.
 	waitErr := cmd.Wait()
+	close(reaped)
 
 	// The scanners normally finish the instant the child's descriptors close.
 	// If a surviving descendant still holds a write end, close the read ends
@@ -286,7 +302,10 @@ func (r *TofuRunner) run(ctx context.Context, binPath string, args []string, wor
 		// the process which produces an ExitError, but the root cause is the
 		// context being done.
 		if ctx.Err() != nil {
-			terminateGroup(cmd, r.cfg.KillGrace)
+			// Idempotent: the watchdog above has normally already run. This covers
+			// the race where the child exited just as the deadline expired but a
+			// descendant still holds the group.
+			terminate()
 			return stdout, stderr, -1, ctx.Err()
 		}
 

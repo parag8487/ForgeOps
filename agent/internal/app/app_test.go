@@ -2,6 +2,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"pgregory.net/rapid"
+
+	"github.com/parag8487/ForgeOps/agent/internal/config"
 )
 
 // TestProperty_P07_ShutdownOrdering is a property-based test verifying that
@@ -152,4 +155,112 @@ func TestProperty_P07_ShutdownOrdering(t *testing.T) {
 			rt.Fatalf("failures configured but got nil error")
 		}
 	})
+}
+
+
+// ── Tests against the REAL App.Close ────────────────────────────────────────
+//
+// TestProperty_P07_ShutdownOrdering above re-implements the close loop, so it
+// cannot observe a defect in App.Close itself — that is how the discarded
+// timeout context survived review. The tests below call the real method.
+
+// newTestApp builds the minimum App needed to exercise Close.
+func newTestApp(timeout time.Duration, closers ...namedCloser) *App {
+	return &App{
+		cfg:     &config.Config{ShutdownTimeout: timeout},
+		closers: closers,
+	}
+}
+
+func TestAppClose_ClosesInReverseOrderExactlyOnce(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	record := func(name string) namedCloser {
+		return namedCloser{name: name, fn: func() error {
+			mu.Lock()
+			order = append(order, name)
+			mu.Unlock()
+			return nil
+		}}
+	}
+
+	a := newTestApp(5*time.Second, record("first"), record("second"), record("third"))
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	want := []string{"third", "second", "first"}
+	if len(order) != len(want) {
+		t.Fatalf("closed %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("closed %v, want %v", order, want)
+		}
+	}
+
+	// Idempotent: a second Close must not re-invoke anything.
+	if err := a.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if len(order) != len(want) {
+		t.Fatalf("second Close re-invoked closers: %v", order)
+	}
+}
+
+func TestAppClose_ContinuesPastAFailingCloser(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	a := newTestApp(5*time.Second,
+		namedCloser{name: "bottom", fn: func() error {
+			mu.Lock()
+			order = append(order, "bottom")
+			mu.Unlock()
+			return nil
+		}},
+		namedCloser{name: "boom", fn: func() error { return errors.New("boom") }},
+	)
+
+	err := a.Close()
+	if err == nil {
+		t.Fatal("expected the close error to be reported")
+	}
+	if len(order) != 1 || order[0] != "bottom" {
+		t.Fatalf("a failing closer stopped the rest: %v", order)
+	}
+}
+
+// TestAppClose_EnforcesShutdownDeadline is the regression guard for P-07's
+// "total shutdown <= configured timeout" clause. Reverting App.Close to
+// discarding its context (`_ = ctx`) makes this test hang until the Go test
+// timeout instead of returning, so the clause can no longer be silently lost.
+func TestAppClose_EnforcesShutdownDeadline(t *testing.T) {
+	const shutdownTimeout = 150 * time.Millisecond
+
+	release := make(chan struct{})
+	defer close(release) // let the abandoned closer exit when the test ends
+
+	a := newTestApp(shutdownTimeout, namedCloser{
+		name: "wedged",
+		fn: func() error {
+			<-release
+			return nil
+		},
+	})
+
+	start := time.Now()
+	err := a.Close()
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected a deadline error when a closer never returns")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+	}
+	// Generous upper bound: the point is that Close returns at all, bounded by
+	// the configured timeout rather than by the blocked closer.
+	if elapsed > 10*shutdownTimeout {
+		t.Fatalf("Close took %v, want roughly %v", elapsed, shutdownTimeout)
+	}
 }
