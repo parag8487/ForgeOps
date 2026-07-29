@@ -157,7 +157,6 @@ func TestProperty_P07_ShutdownOrdering(t *testing.T) {
 	})
 }
 
-
 // ── Tests against the REAL App.Close ────────────────────────────────────────
 //
 // TestProperty_P07_ShutdownOrdering above re-implements the close loop, so it
