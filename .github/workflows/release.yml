@@ -194,6 +194,19 @@ jobs:
           echo "provenance predicate:"
           cat dist/provenance-predicate.json
 
+      # Three outputs per artifact, each with a distinct job:
+      #   .intoto.jsonl        the signed DSSE envelope (--output-signature)
+      #   .att.pem             the Fulcio certificate that signed it
+      #   .att.sigstore.json   a Sigstore bundle carrying the envelope, the
+      #                        certificate AND the Rekor inclusion proof
+      #
+      # The bundle exists because verification must not depend on a Rekor
+      # *search*. cosign 2.4.3's search path builds a `dsse` proposed entry
+      # without the `verifiers` field that the current Rekor server requires,
+      # so `POST /api/v1/log/entries/retrieve` answers 400. Verifying from the
+      # bundle uses the embedded inclusion proof offline instead, which is both
+      # the recommended path and the one a third party can run behind a
+      # network that cannot reach Rekor.
       - name: Cosign attest-blob SLSA provenance for every artifact
         working-directory: agent
         run: |
@@ -203,10 +216,13 @@ jobs:
             cosign attest-blob --yes \
               --predicate dist/provenance-predicate.json \
               --type slsaprovenance1 \
-              --output-attestation "$f.intoto.jsonl" \
+              --new-bundle-format \
+              --bundle "$f.att.sigstore.json" \
+              --output-signature "$f.intoto.jsonl" \
               --output-certificate "$f.att.pem" \
               "$f"
             test -s "$f.intoto.jsonl"
+            test -s "$f.att.sigstore.json"
             echo "attested: $f.intoto.jsonl"
           done
 
@@ -221,8 +237,8 @@ jobs:
             [ -e "$f" ] || continue
             echo "verify-attestation: cosign verify-blob-attestation $f"
             cosign verify-blob-attestation \
-              --signature "$f.intoto.jsonl" \
-              --certificate "$f.att.pem" \
+              --bundle "$f.att.sigstore.json" \
+              --new-bundle-format \
               --type slsaprovenance1 \
               --check-claims=true \
               --certificate-identity-regexp "$identity" \
@@ -262,7 +278,7 @@ jobs:
           set -eu
           tag="${GITHUB_REF#refs/tags/}"
           uploaded=0
-          for f in dist/*.sig dist/*.pem dist/*.sbom.json dist/*.intoto.jsonl dist/provenance-predicate.json; do
+          for f in dist/*.sig dist/*.pem dist/*.sbom.json dist/*.intoto.jsonl dist/*.att.sigstore.json dist/provenance-predicate.json; do
             [ -e "$f" ] || continue
             gh release upload "$tag" "$f" --clobber
             uploaded=$((uploaded + 1))
