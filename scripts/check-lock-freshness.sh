@@ -10,6 +10,20 @@
 # false staleness. The check instead copies pyproject.toml into a temp directory
 # and regenerates with the SAME relative output filename, so a clean tree
 # produces byte-identical output including the header.
+#
+# Why the EXISTING locks are seeded into the temp directory too:
+# pip-compile honours the pins already present in its output file and only moves
+# them when the inputs force it (that is what makes `--upgrade` a separate flag).
+# If the temp directory contained pyproject.toml alone, every run would re-resolve
+# each transitive to the newest compatible release, so the gate would turn red the
+# moment any transitive dependency published — unrelated to whether the committed
+# lock is actually stale. That was observed directly: two runs minutes apart
+# disagreed only because `annotated-doc` released 0.0.5 in between.
+#
+# Seeding makes the question the right one: "does the committed lock still satisfy
+# pyproject.toml?" rather than "has anything anywhere been released since?".
+# Deliberate upgrades remain possible and explicit via `make lock-backend` with
+# pip-compile's --upgrade, which is never used by this check.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -24,6 +38,15 @@ TMPDIR_LOCK="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_LOCK"' EXIT
 
 cp "$BACKEND_DIR/pyproject.toml" "$TMPDIR_LOCK/pyproject.toml"
+
+# Seed the current pins so pip-compile re-resolves only what pyproject.toml forces
+# (see the header note). A missing lock is fine — that is genuine staleness and the
+# diff below will report it.
+for lock in requirements.lock requirements-dev.lock; do
+	if [ -f "$BACKEND_DIR/$lock" ]; then
+		cp "$BACKEND_DIR/$lock" "$TMPDIR_LOCK/$lock"
+	fi
+done
 
 printf '==> check-lock-freshness: regenerating both locks in an isolated copy\n'
 

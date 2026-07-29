@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -181,8 +182,15 @@ func TestInterleavedStreams(t *testing.T) {
 	script := writeFakeScript(t, dir, "tofu", scriptExit0())
 
 	var sinkLines []string
+	// LineSink is invoked from BOTH the stdout and stderr scanner goroutines
+	// concurrently, so the shared slice needs a mutex. Without it this is a real
+	// data race — the race detector caught it on Linux CI even though a local
+	// Windows run happened not to hit the interleaving.
+	var sinkMu sync.Mutex
 	runner := newTestRunner(t, script)
 	runner.SetSink(func(stream string, line string) {
+		sinkMu.Lock()
+		defer sinkMu.Unlock()
 		sinkLines = append(sinkLines, stream+":"+line)
 	})
 
@@ -197,14 +205,19 @@ func TestInterleavedStreams(t *testing.T) {
 	if len(result.Stderr) == 0 {
 		t.Fatal("expected stderr lines")
 	}
-	if len(sinkLines) == 0 {
+	// Snapshot under the same lock the sink used, then assert on the copy.
+	sinkMu.Lock()
+	sinkSnapshot := append([]string(nil), sinkLines...)
+	sinkMu.Unlock()
+
+	if len(sinkSnapshot) == 0 {
 		t.Fatal("expected sink to receive lines")
 	}
 
 	// Verify streams are labeled correctly.
 	hasStdout := false
 	hasStderr := false
-	for _, l := range sinkLines {
+	for _, l := range sinkSnapshot {
 		if strings.HasPrefix(l, "stdout:") {
 			hasStdout = true
 		}
@@ -213,7 +226,7 @@ func TestInterleavedStreams(t *testing.T) {
 		}
 	}
 	if !hasStdout || !hasStderr {
-		t.Fatalf("expected both stdout and stderr in sink, got: %v", sinkLines)
+		t.Fatalf("expected both stdout and stderr in sink, got: %v", sinkSnapshot)
 	}
 }
 
