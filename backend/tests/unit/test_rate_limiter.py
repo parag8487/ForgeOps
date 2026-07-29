@@ -69,18 +69,26 @@ class LuaExecutingRedis:
     """Mock Redis that executes the token bucket Lua via reference model.
 
     Maintains per-key state to simulate actual Redis behavior.
+    The fake owns its own clock (mirroring Redis TIME), because the real Lua
+    script reads redis.call('TIME') rather than accepting a caller timestamp.
+    Tests advance `self.now` directly to simulate time passage.
     """
 
     def __init__(self):
         self._buckets: dict[str, dict[str, float]] = {}
+        self.now: float = 0.0
 
     async def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> list[int]:
-        """Simulate Redis EVAL by running the reference algorithm."""
+        """Simulate Redis EVAL by running the reference algorithm.
+
+        ARGV is now: [1]=capacity, [2]=refill_rate, [3]=tokens_to_consume.
+        The clock comes from self.now (the fake server's clock).
+        """
         key = keys_and_args[0]
         capacity = float(keys_and_args[1])
         refill_rate = float(keys_and_args[2])
-        now = float(keys_and_args[3])
-        consume = float(keys_and_args[4])
+        consume = float(keys_and_args[3])
+        now = self.now
 
         if key not in self._buckets:
             self._buckets[key] = {"tokens": capacity, "last_refill": now}
@@ -121,26 +129,25 @@ class TestLuaMatchesReferenceModel:
     async def test_basic_allow_deny_cycle(self):
         """Consuming tokens until denied matches reference."""
         redis = LuaExecutingRedis()
-        clock_time = 0.0
+        redis.now = 0.0
 
         limiter = RedisTokenBucketLimiter(
             redis=redis,
             capacity=5,
             refill_rate=1.0,
-            clock=lambda: clock_time,
         )
         ref = ReferenceTokenBucket(capacity=5, refill_rate=1.0)
 
         # Consume all 5 tokens
         for _ in range(5):
             result = await limiter.check("user:route")
-            ref_allowed, ref_remaining, ref_retry = ref.check(clock_time)
+            ref_allowed, ref_remaining, ref_retry = ref.check(redis.now)
             assert result.allowed == ref_allowed
             assert result.remaining == ref_remaining
 
         # 6th should be denied
         result = await limiter.check("user:route")
-        ref_allowed, ref_remaining, ref_retry = ref.check(clock_time)
+        ref_allowed, ref_remaining, ref_retry = ref.check(redis.now)
         assert result.allowed is False
         assert ref_allowed is False
         assert result.retry_after_seconds is not None
@@ -149,68 +156,66 @@ class TestLuaMatchesReferenceModel:
     async def test_refill_over_time(self):
         """Tokens refill over time, matching reference."""
         redis = LuaExecutingRedis()
-        clock_time = 0.0
+        redis.now = 0.0
 
         limiter = RedisTokenBucketLimiter(
             redis=redis,
             capacity=10,
             refill_rate=2.0,
-            clock=lambda: clock_time,
         )
         ref = ReferenceTokenBucket(capacity=10, refill_rate=2.0)
 
         # Consume all
         for _ in range(10):
             await limiter.check("bucket1")
-            ref.check(clock_time)
+            ref.check(redis.now)
 
         # Denied
         result = await limiter.check("bucket1")
-        ref_allowed, _, _ = ref.check(clock_time)
+        ref_allowed, _, _ = ref.check(redis.now)
         assert result.allowed is False
         assert ref_allowed is False
 
-        # Advance time by 3 seconds â†’ should refill 6 tokens
-        clock_time = 3.0
+        # Advance the fake server's clock by 3 seconds → should refill 6 tokens
+        redis.now = 3.0
         for i in range(6):
             result = await limiter.check("bucket1")
-            ref_allowed, ref_remaining, _ = ref.check(clock_time)
+            ref_allowed, ref_remaining, _ = ref.check(redis.now)
             assert result.allowed == ref_allowed, f"Mismatch at refill consume {i}"
 
         # 7th should be denied (only 6 refilled)
         result = await limiter.check("bucket1")
-        ref_allowed, _, _ = ref.check(clock_time)
+        ref_allowed, _, _ = ref.check(redis.now)
         assert result.allowed is False
         assert ref_allowed is False
 
     async def test_partial_refill(self):
         """Partial time produces partial refill matching reference."""
         redis = LuaExecutingRedis()
-        clock_time = 0.0
+        redis.now = 0.0
 
         limiter = RedisTokenBucketLimiter(
             redis=redis,
             capacity=10,
             refill_rate=2.0,  # 2 per second
-            clock=lambda: clock_time,
         )
         ref = ReferenceTokenBucket(capacity=10, refill_rate=2.0)
 
         # Use all tokens
         for _ in range(10):
             await limiter.check("b")
-            ref.check(clock_time)
+            ref.check(redis.now)
 
-        # Advance 0.5s â†’ 1 token refilled
-        clock_time = 0.5
+        # Advance the fake server's clock 0.5s → 1 token refilled
+        redis.now = 0.5
         result = await limiter.check("b")
-        ref_allowed, _, _ = ref.check(clock_time)
+        ref_allowed, _, _ = ref.check(redis.now)
         assert result.allowed == ref_allowed
         assert result.allowed is True
 
         # Next should fail
         result = await limiter.check("b")
-        ref_allowed, _, _ = ref.check(clock_time)
+        ref_allowed, _, _ = ref.check(redis.now)
         assert result.allowed == ref_allowed
         assert result.allowed is False
 
@@ -226,13 +231,12 @@ class TestConcurrentConsumption:
     async def test_concurrent_tasks_respect_capacity(self):
         """Multiple concurrent tasks cannot exceed bucket capacity."""
         redis = LuaExecutingRedis()
-        clock_time = 0.0
+        redis.now = 0.0
 
         limiter = RedisTokenBucketLimiter(
             redis=redis,
             capacity=20,
             refill_rate=0.0,  # No refill â€” fixed capacity
-            clock=lambda: clock_time,
         )
 
         allowed_count = 0
@@ -257,13 +261,12 @@ class TestConcurrentConsumption:
     async def test_concurrent_with_refill(self):
         """Concurrent tasks with refill still respect capacity at any instant."""
         redis = LuaExecutingRedis()
-        clock_time = 0.0
+        redis.now = 0.0
 
         limiter = RedisTokenBucketLimiter(
             redis=redis,
             capacity=10,
             refill_rate=5.0,  # 5 per second
-            clock=lambda: clock_time,
         )
 
         results: list[bool] = []
@@ -284,7 +287,7 @@ class TestConcurrentConsumption:
         assert sum(results) == 0
 
         # Advance time by 2 seconds â†’ 10 tokens refilled (capped at capacity 10)
-        clock_time = 2.0
+        redis.now = 2.0
         results.clear()
         tasks = [asyncio.create_task(consume()) for _ in range(15)]
         await asyncio.gather(*tasks)
@@ -303,13 +306,12 @@ class TestKeyIsolation:
     async def test_separate_buckets_independent(self):
         """Different bucket IDs are completely independent."""
         redis = LuaExecutingRedis()
-        clock_time = 0.0
+        redis.now = 0.0
 
         limiter = RedisTokenBucketLimiter(
             redis=redis,
             capacity=5,
             refill_rate=0.0,  # No refill
-            clock=lambda: clock_time,
         )
 
         # Exhaust bucket A
@@ -334,13 +336,12 @@ class TestKeyIsolation:
     async def test_many_independent_buckets(self):
         """Multiple buckets operate independently."""
         redis = LuaExecutingRedis()
-        clock_time = 0.0
+        redis.now = 0.0
 
         limiter = RedisTokenBucketLimiter(
             redis=redis,
             capacity=3,
             refill_rate=0.0,
-            clock=lambda: clock_time,
         )
 
         # Exhaust 5 different buckets
@@ -386,13 +387,12 @@ class TestHTTPRouteLevelBehaviors:
     async def test_exhaustion_returns_retry_after(self):
         """Exhausted bucket returns retry_after_seconds > 0 (â†’ 429)."""
         redis = LuaExecutingRedis()
-        clock_time = 0.0
+        redis.now = 0.0
 
         limiter = RedisTokenBucketLimiter(
             redis=redis,
             capacity=1,
             refill_rate=2.0,
-            clock=lambda: clock_time,
         )
 
         # Consume the only token
@@ -430,13 +430,12 @@ class TestBearerLimiterCacheProviderOrdering:
     async def test_rate_limit_denial_prevents_downstream(self):
         """When rate limiter denies, no cache or provider calls are made."""
         redis = LuaExecutingRedis()
-        clock_time = 0.0
+        redis.now = 0.0
 
         limiter = RedisTokenBucketLimiter(
             redis=redis,
             capacity=1,  # Only 1 token
             refill_rate=0.001,  # Nearly no refill
-            clock=lambda: clock_time,
         )
 
         # Consume the single token
@@ -463,13 +462,12 @@ class TestBearerLimiterCacheProviderOrdering:
     async def test_allowed_permits_downstream(self):
         """When rate limiter allows, downstream processing can proceed."""
         redis = LuaExecutingRedis()
-        clock_time = 0.0
+        redis.now = 0.0
 
         limiter = RedisTokenBucketLimiter(
             redis=redis,
             capacity=100,
             refill_rate=10.0,
-            clock=lambda: clock_time,
         )
 
         result = await limiter.check("allowed-bucket")
