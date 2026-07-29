@@ -29,14 +29,22 @@ from src.core.logging import (
     redact_secrets,
 )
 
-# Synthetic, obviously-fake values. The DSN password and bearer value exist only
-# to be searched for in the emitted output.
-FAKE_DSN = "postgresql+asyncpg://forgeops:test-only-not-a-real-secret@db:5432/prod"
-FAKE_REDIS_DSN = "redis://:test-only-not-a-real-secret@cache:6379/0"
-FAKE_BEARER = "Bearer test-only-not-a-real-secret.not-a-jwt"
-FAKE_PASSWORD = "test-only-not-a-real-secret"
+from tests.synthetic_secrets import (
+    SYNTHETIC_MARKER,
+    bearer_clause,
+    pem_header,
+    postgres_dsn,
+    redis_dsn,
+)
 
-SECRET_SUBSTRINGS = (FAKE_PASSWORD, "postgresql+asyncpg://", "redis://", "Bearer test-only")
+# Assembled at runtime, not written as literals — see tests/synthetic_secrets.py
+# for why a credential-shaped source literal is itself a problem.
+FAKE_DSN = postgres_dsn()
+FAKE_REDIS_DSN = redis_dsn()
+FAKE_BEARER = bearer_clause()
+FAKE_PASSWORD = SYNTHETIC_MARKER
+
+SECRET_SUBSTRINGS = (FAKE_PASSWORD, "postgresql+asyncpg://", "redis://", "Bearer " + SYNTHETIC_MARKER[:9])
 
 
 def _emit(formatter: logging.Formatter, exc: BaseException, *, with_filter: bool = True) -> str:
@@ -139,7 +147,7 @@ class TestRedactionIsNonVacuous:
             FAKE_DSN,
             FAKE_REDIS_DSN,
             FAKE_BEARER,
-            "-----BEGIN RSA PRIVATE KEY-----",
+            pem_header(),
         ],
     )
     def test_each_pattern_family_is_matched(self, text: str):

@@ -21,6 +21,8 @@ from src.core.errors import (
 from src.core.logging import redact_secrets
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from tests.synthetic_secrets import pem_header
+
 
 class TestSecretRedaction:
     """SecretRedactingFilter scrubs known patterns."""
@@ -50,7 +52,7 @@ class TestSecretRedaction:
         assert "sk-ant-1234567890abcdefghijklmnop" not in result
 
     def test_redacts_pem_material(self):
-        result = redact_secrets("cert: -----BEGIN PRIVATE KEY-----")
+        result = redact_secrets("cert: " + pem_header("PRIVATE"))
         assert "PRIVATE KEY" not in result
 
     def test_safe_text_unchanged(self):

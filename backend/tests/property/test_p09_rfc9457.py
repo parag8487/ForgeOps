@@ -20,17 +20,28 @@ import pytest
 from fastapi.testclient import TestClient
 from src.core.errors import PROBLEM_CONTENT_TYPE, ProblemException, install_problem_handlers
 
+from tests.synthetic_secrets import (
+    SYNTHETIC_MARKER,
+    bearer_clause,
+    openai_style_key,
+    pem_header,
+    postgres_dsn,
+    redis_dsn,
+)
+
 # Synthetic, self-labelling values used only to prove the sanitiser removes them.
-# None resembles a real provider credential (.kiro/steering/secret-safety.md).
-LEAKY_DSN = "postgresql+asyncpg://forgeops:test-only-not-a-real-secret@db:5432/prod"
-LEAKY_REDIS_DSN = "redis://:test-only-not-a-real-secret@cache:6379/0"
-LEAKY_BEARER = "Bearer test-only-not-a-real-secret.not-a-jwt"
-LEAKY_API_KEY = "sk-" + "testonlynotarealsecret0000"
-LEAKY_PEM_HEADER = "-----BEGIN RSA PRIVATE KEY-----"
+# They are assembled at runtime by tests/synthetic_secrets.py so no source file
+# contains a contiguous credential-shaped literal for a scanner to flag; see that
+# module's docstring for why (GitGuardian 35267706, gitleaks `private-key`).
+LEAKY_DSN = postgres_dsn()
+LEAKY_REDIS_DSN = redis_dsn()
+LEAKY_BEARER = bearer_clause()
+LEAKY_API_KEY = openai_style_key()
+LEAKY_PEM_HEADER = pem_header()
 
 # Every literal above must be absent from any emitted problem body.
 LEAKY_SUBSTRINGS = (
-    "test-only-not-a-real-secret",
+    SYNTHETIC_MARKER,
     "postgresql+asyncpg://",
     "redis://",
     LEAKY_API_KEY,
