@@ -211,29 +211,29 @@ func (r *TofuRunner) run(ctx context.Context, binPath string, args []string, wor
 	if err != nil {
 		return nil, nil, -1, fmt.Errorf("stdout pipe: %w", err)
 	}
-	defer stdoutR.Close()
+	defer func() { _ = stdoutR.Close() }()
 
 	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
-		stdoutW.Close()
+		_ = stdoutW.Close()
 		return nil, nil, -1, fmt.Errorf("stderr pipe: %w", err)
 	}
-	defer stderrR.Close()
+	defer func() { _ = stderrR.Close() }()
 
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 
 	if err := cmd.Start(); err != nil {
-		stdoutW.Close()
-		stderrW.Close()
+		_ = stdoutW.Close()
+		_ = stderrW.Close()
 		return nil, nil, -1, fmt.Errorf("start command: %w", err)
 	}
 
 	// The child holds its own descriptors now. Dropping the parent's copies is
 	// what lets the read ends reach EOF when the child (and any descendant
 	// that inherited them) exits.
-	stdoutW.Close()
-	stderrW.Close()
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -273,8 +273,8 @@ func (r *TofuRunner) run(ctx context.Context, binPath string, args []string, wor
 	select {
 	case <-drained:
 	case <-time.After(r.drainGrace()):
-		stdoutR.Close()
-		stderrR.Close()
+		_ = stdoutR.Close()
+		_ = stderrR.Close()
 		<-drained
 	}
 
