@@ -118,12 +118,40 @@ commit `7f5213f`). Every link produced evidence:
 | GitHub Release            | 94 assets; `uploaded 83 custody files to v0.0.1-rc3`                                                                                                     |
 | GitHub native attestation | `GitHub native attestation: skipped` — dormant by design while the repository is private (D-20)                                                          |
 
-**Independent verification from published assets.** The `v0.0.1-rc3` `linux_amd64` custody
-set was downloaded from the release and checked on the workstation, not in the runner:
+**Independent verification from published assets.** All 94 `v0.0.1-rc3` release assets
+(127.8 MB) were downloaded and checked on the workstation, not in the runner. The asset set
+is complete: 12 artifacts and manifests, 21 `.sig`, 21 `.pem`, 10 `.sbom.json`, 10
+`.intoto.jsonl`, 10 `.att.pem`, 10 `.att.sigstore.json`.
 
-- `sha256` of the downloaded `tar.gz` is `5983caa9897f30e8c44a47c701f84f10843c123429f3032e6f09eacca10ef109`, matching its `checksums.txt` line.
-- `…tar.gz.intoto.jsonl` is a real DSSE envelope: `payloadType: application/vnd.in-toto+json`, one signature. Its decoded statement is `predicateType: https://slsa.dev/provenance/v1`, `subject[0].digest.sha256` equal to the hash above, and `predicate.runDetails.builder.id` = `https://github.com/parag8487/ForgeOps/.github/workflows/release.yml@refs/tags/v0.0.1-rc3`.
-- `cosign verify-blob-attestation --bundle …att.sigstore.json --new-bundle-format --type slsaprovenance1 --check-claims=true` with the expected identity regexp and OIDC issuer printed **`Verified OK`, exit 0**, using the inclusion proof embedded in the bundle. This succeeded even though Rekor is unreachable from this network.
+- **Integrity, 10/10.** Every one of the 10 entries in `checksums.txt` matches the
+  downloaded file's SHA-256: `checksum match: 10 ok, 0 bad`. The `linux_amd64` archive is
+  `5983caa9897f30e8c44a47c701f84f10843c123429f3032e6f09eacca10ef109`.
+- **SBOMs, 10/10.** Every `.sbom.json` parses and declares `bomFormat: CycloneDX`.
+- **Provenance, 10/10, offline.** `cosign verify-blob-attestation --bundle
+<artifact>.att.sigstore.json --new-bundle-format --type slsaprovenance1
+--check-claims=true` with the expected identity regexp and OIDC issuer printed
+  **`Verified OK`, exit 0** for all ten artifacts. `--check-claims` means each attestation's
+  in-toto subject digest was matched against the downloaded bytes. This succeeded even
+  though Rekor is unreachable from this network, because the inclusion proof travels inside
+  the bundle.
+- **Envelope shape.** The `linux_amd64` `.intoto.jsonl` is a real DSSE envelope:
+  `payloadType: application/vnd.in-toto+json`, one signature. Its decoded statement is
+  `predicateType: https://slsa.dev/provenance/v1`, `subject[0].digest.sha256` equal to the
+  hash above, and `predicate.runDetails.builder.id` is
+  `https://github.com/parag8487/ForgeOps/.github/workflows/release.yml@refs/tags/v0.0.1-rc3`.
+- **Six real platform binaries**, extracted from the published archives: `linux_amd64` ELF
+  64-bit machine 62 (x86-64) 40.4 MB, `linux_arm64` ELF 64-bit machine 183 (aarch64)
+  37.8 MB, `darwin_amd64` Mach-O 41.3 MB, `darwin_arm64` Mach-O 38.9 MB, `windows_amd64` PE
+  41.5 MB, `windows_arm64` PE 38.3 MB.
+- **The published binary self-reports the tagged commit.** Running the downloaded
+  `windows_amd64` executable natively prints `forgeops-agent 0.0.1-rc3 (commit:
+7f5213f65931b80f6abd6a16baa46c808e723e75, built: 2026-07-29T16:15:30Z)`, which is exactly
+  the commit that `v0.0.1-rc3` points at and the commit named in the provenance predicate's
+  `resolvedDependencies`. Source, provenance and shipped binary agree.
+
+`cosign verify-blob` on the same assets fails locally, and only because of the network:
+`x509: certificate is valid for *.airtel.com, airtel.com, not rekor.sigstore.dev`. That path
+requires a Rekor search, which is why criterion 16 is proven inside the runner.
 
 ## Deviations, environment notes and outstanding items
 
