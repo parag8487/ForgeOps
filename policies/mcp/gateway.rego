@@ -35,6 +35,15 @@ filter := [t |
 
 # Allow rule: for tools/call authorization — is the specific named tool
 # allowed for this agent's blast radius?
+#
+# `default allow := false` is load-bearing, not decoration. Without it a deny is
+# an UNDEFINED document, and OPA reports an undefined document exactly as it
+# reports a missing or renamed policy: HTTP 200 with no `result` key. The gateway
+# treats an undefined document as a loud 503 so a mis-deployed bundle cannot
+# masquerade as "everything denied", which means a deny has to be a defined
+# `false`. Rego tests that assert `not allow` are unaffected by the default.
+default allow := false
+
 allow if {
 	some t in input.tools
 	t.name == input.tool
