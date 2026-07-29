@@ -84,6 +84,32 @@ CycloneDX SBOMs, Cosign keyless signatures, and SLSA provenance. `make sbom`,
 and verification of a published artifact. An artifact that cannot be verified is not a
 release. Keyless signing needs network access to Sigstore at release time.
 
+Each artifact is published alongside `.sig` and `.pem` (Cosign keyless signature and Fulcio
+certificate), `.sbom.json` (CycloneDX), `.intoto.jsonl` (the signed DSSE envelope carrying
+an in-toto SLSA v1 provenance statement), and `.att.sigstore.json` (a Sigstore bundle with
+the same attestation plus its Rekor inclusion proof).
+
+Provenance comes from `cosign attest-blob`, not from GitHub's artifact attestation API,
+because that API is unavailable for private repositories outside GitHub Enterprise Cloud
+(decision D-20 in `PROGRESS.md`). Two consequences are worth knowing:
+
+- `gh attestation verify` will **not** find these attestations. Verify them with cosign.
+- Verifying from the bundle needs no access to Rekor, because the inclusion proof is
+  embedded, so it works behind a network that blocks or intercepts `rekor.sigstore.dev`:
+
+```sh
+cosign verify-blob-attestation \
+  --bundle  <artifact>.att.sigstore.json \
+  --new-bundle-format --type slsaprovenance1 --check-claims=true \
+  --certificate-identity-regexp '^https://github.com/parag8487/ForgeOps/.github/workflows/release.yml@refs/tags/v.*$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  <artifact>
+```
+
+The native GitHub attestation step is retained in `release.yml` and gated on
+`github.event.repository.private == false`. It reports `skipped` while the repository is
+private and starts producing attestations by itself if the repository is made public.
+
 ## Before any non-local deployment
 
 Phase 1 §1.11 adds Authentik/OIDC login, JWT lifecycle, and RBAC across all routes, plus
