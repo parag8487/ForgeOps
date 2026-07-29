@@ -26,8 +26,8 @@ class TestSecretRedaction:
     """SecretRedactingFilter scrubs known patterns."""
 
     def test_redacts_bearer_token(self):
-        result = redact_secrets("Authorization: Bearer eyJhbGciOiJSUzI1NiJ9.test.sig")
-        assert "eyJhbGciOiJSUzI1NiJ9" not in result
+        result = redact_secrets("Authorization: Bearer test-only-not-a-real-secret.not-a-jwt")
+        assert "test-only-not-a-real-secret" not in result
         assert "[REDACTED]" in result
 
     def test_redacts_postgresql_url(self):
@@ -94,7 +94,7 @@ class TestProblemHandlers:
 
         @app.get("/raise-bearer-leak")
         async def _raise_bearer_leak():
-            raise RuntimeError("Failed with Bearer eyJhbGciOiJSUzI1NiJ9.test.sig")
+            raise RuntimeError("Failed with Bearer test-only-not-a-real-secret.not-a-jwt")
 
         return app
 
@@ -154,7 +154,7 @@ class TestProblemHandlers:
         assert r.status_code == 500
         body = r.json()
         assert "Bearer" not in json.dumps(body)
-        assert "eyJhbGci" not in json.dumps(body)
+        assert "test-only-not-a-real-secret" not in json.dumps(body)
 
     def test_problem_status_equals_http_status(self, client: TestClient):
         """For every rendered problem: body status == HTTP status."""

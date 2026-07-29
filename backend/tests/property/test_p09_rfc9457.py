@@ -104,7 +104,7 @@ def app():
         """Simulates an unhandled exception with embedded secrets."""
         raise RuntimeError(
             "Connection failed: postgresql+asyncpg://admin:s3cr3t@db:5432/prod "
-            "with token Bearer eyJhbGciOiJSUzI1NiJ9.payload.signature"
+            "with token Bearer test-only-not-a-real-secret.not-a-jwt"
         )
 
     @app.post("/api/v1/analysis/plan")
@@ -185,7 +185,7 @@ class TestP09Rfc9457Compliance:
         assert "postgresql" not in body_text.lower()
         assert "asyncpg" not in body_text.lower()
         assert "Bearer" not in body_text
-        assert "eyJhbG" not in body_text
+        assert "test-only-not-a-real-secret" not in body_text
 
     def test_500_has_generic_detail(self, client: TestClient):
         """500 detail should be a safe generic message."""
