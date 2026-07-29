@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
@@ -192,18 +193,47 @@ func (r *TofuRunner) run(ctx context.Context, binPath string, args []string, wor
 	// Set platform-specific process group attributes.
 	setProcessGroup(cmd)
 
-	stdoutPipe, err := cmd.StdoutPipe()
+	// The runner owns its pipes rather than using cmd.StdoutPipe/StderrPipe.
+	//
+	// os/exec closes the pipes it hands out inside cmd.Wait, and the
+	// StdoutPipe contract states it is "incorrect to call Wait before all
+	// reads from the pipe have completed". Waiting first raced the scanners
+	// and intermittently truncated stdout, surfacing as a nil
+	// ValidateResult.Diagnostics (CI run 30468655307, runner_test.go:145
+	// "expected diagnostics JSON"). Draining first instead risks hanging
+	// forever, because a killed process tree can leave a grandchild holding
+	// the write end open so the scanners never see EOF.
+	//
+	// Owning the pipes removes the dilemma: cmd.Wait never touches them, so
+	// the process can be reaped first and the drain can then be bounded and
+	// forced to completion by closing the read ends ourselves.
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return nil, nil, -1, fmt.Errorf("stdout pipe: %w", err)
 	}
-	stderrPipe, err := cmd.StderrPipe()
+	defer stdoutR.Close()
+
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		stdoutW.Close()
 		return nil, nil, -1, fmt.Errorf("stderr pipe: %w", err)
 	}
+	defer stderrR.Close()
+
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 
 	if err := cmd.Start(); err != nil {
+		stdoutW.Close()
+		stderrW.Close()
 		return nil, nil, -1, fmt.Errorf("start command: %w", err)
 	}
+
+	// The child holds its own descriptors now. Dropping the parent's copies is
+	// what lets the read ends reach EOF when the child (and any descendant
+	// that inherited them) exits.
+	stdoutW.Close()
+	stderrW.Close()
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -212,7 +242,7 @@ func (r *TofuRunner) run(ctx context.Context, binPath string, args []string, wor
 	// Stream stdout.
 	go func() {
 		defer wg.Done()
-		lines := r.scanPipe(stdoutPipe, "stdout")
+		lines := r.scanPipe(stdoutR, "stdout")
 		mu.Lock()
 		stdout = lines
 		mu.Unlock()
@@ -221,19 +251,35 @@ func (r *TofuRunner) run(ctx context.Context, binPath string, args []string, wor
 	// Stream stderr.
 	go func() {
 		defer wg.Done()
-		lines := r.scanPipe(stderrPipe, "stderr")
+		lines := r.scanPipe(stderrR, "stderr")
 		mu.Lock()
 		stderr = lines
 		mu.Unlock()
 	}()
 
-	// cmd.Wait closes the pipes after the process exits, which unblocks the
-	// scanner goroutines. On context cancellation, CommandContext kills the
-	// process which also closes the pipes.
+	drained := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(drained)
+	}()
+
+	// Reap the process. This is safe with the scanners still running: the
+	// child cannot block on a full pipe because they are draining it.
 	waitErr := cmd.Wait()
 
-	// Wait for both goroutines to drain remaining buffered output.
-	wg.Wait()
+	// The scanners normally finish the instant the child's descriptors close.
+	// If a surviving descendant still holds a write end, close the read ends
+	// to unblock them rather than waiting forever.
+	select {
+	case <-drained:
+	case <-time.After(r.drainGrace()):
+		stdoutR.Close()
+		stderrR.Close()
+		<-drained
+	}
+
+	// Both scanner goroutines have returned, so stdout and stderr are complete
+	// and safe to read without the mutex.
 
 	if waitErr != nil {
 		// Check context cancellation first — on Windows, CommandContext kills
@@ -253,6 +299,16 @@ func (r *TofuRunner) run(ctx context.Context, binPath string, args []string, wor
 	}
 
 	return stdout, stderr, exitCode, nil
+}
+
+// drainGrace bounds how long run waits for the output scanners after the child
+// process has been reaped. A surviving descendant can hold a pipe write end
+// open, in which case the scanners never see EOF and must be forced out.
+func (r *TofuRunner) drainGrace() time.Duration {
+	if r.cfg.KillGrace > 0 {
+		return r.cfg.KillGrace
+	}
+	return 10 * time.Second
 }
 
 // scanPipe reads lines from a pipe, capping each line at MaxLineBytes.
