@@ -18,7 +18,33 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from src.core.errors import PROBLEM_CONTENT_TYPE, install_problem_handlers
+from src.core.errors import PROBLEM_CONTENT_TYPE, ProblemException, install_problem_handlers
+
+# Synthetic, self-labelling values used only to prove the sanitiser removes them.
+# None resembles a real provider credential (.kiro/steering/secret-safety.md).
+LEAKY_DSN = "postgresql+asyncpg://forgeops:test-only-not-a-real-secret@db:5432/prod"
+LEAKY_REDIS_DSN = "redis://:test-only-not-a-real-secret@cache:6379/0"
+LEAKY_BEARER = "Bearer test-only-not-a-real-secret.not-a-jwt"
+LEAKY_API_KEY = "sk-" + "testonlynotarealsecret0000"
+LEAKY_PEM_HEADER = "-----BEGIN RSA PRIVATE KEY-----"
+
+# Every literal above must be absent from any emitted problem body.
+LEAKY_SUBSTRINGS = (
+    "test-only-not-a-real-secret",
+    "postgresql+asyncpg://",
+    "redis://",
+    LEAKY_API_KEY,
+    LEAKY_PEM_HEADER,
+)
+
+# Routes whose `detail` is built from a credential-bearing string.
+LEAKY_ROUTES = [
+    "/api/v1/leaky-dsn",
+    "/api/v1/leaky-redis",
+    "/api/v1/leaky-bearer",
+    "/api/v1/leaky-key",
+    "/api/v1/leaky-pem",
+]
 
 # Patterns that MUST NOT appear in any problem detail or body
 _SECRET_PATTERNS = [
@@ -68,7 +94,6 @@ def _assert_rfc9457_compliant(response: Any, expected_status: int | None = None)
 def app():
     """Create a test app that mirrors the production error handling."""
     from fastapi import FastAPI
-    from src.core.errors import ProblemException
     from starlette.exceptions import HTTPException as StarletteHTTPException
 
     app = FastAPI()
@@ -123,6 +148,60 @@ def app():
     async def _forbidden():
         """Simulates a 403 response."""
         raise StarletteHTTPException(status_code=403, detail="Insufficient permissions")
+
+    # ── Routes whose problem `detail` carries a secret ────────────────────────
+    #
+    # These exist because P-09's secret clause was previously unreachable: the
+    # 500 handler emits a fixed generic detail, so emptying the redaction pattern
+    # lists changed nothing and all 13 tests stayed green. A handler that puts a
+    # credential-bearing string into `detail` is the realistic leak, and it is
+    # the path `_sanitize_detail` exists to guard. Every literal is synthetic and
+    # self-labelling per .kiro/steering/secret-safety.md.
+
+    @app.get("/api/v1/leaky-dsn")
+    async def _leaky_dsn():
+        raise ProblemException(
+            status=503,
+            type_suffix="dependency-unavailable",
+            title="Dependency unavailable",
+            detail=f"Could not connect to {LEAKY_DSN}",
+        )
+
+    @app.get("/api/v1/leaky-redis")
+    async def _leaky_redis():
+        raise ProblemException(
+            status=503,
+            type_suffix="dependency-unavailable",
+            title="Dependency unavailable",
+            detail=f"Could not connect to {LEAKY_REDIS_DSN}",
+        )
+
+    @app.get("/api/v1/leaky-bearer")
+    async def _leaky_bearer():
+        raise ProblemException(
+            status=502,
+            type_suffix="upstream-error",
+            title="Upstream error",
+            detail=f"Upstream rejected {LEAKY_BEARER}",
+        )
+
+    @app.get("/api/v1/leaky-key")
+    async def _leaky_key():
+        raise ProblemException(
+            status=502,
+            type_suffix="upstream-error",
+            title="Upstream error",
+            detail=f"Provider rejected the key {LEAKY_API_KEY}",
+        )
+
+    @app.get("/api/v1/leaky-pem")
+    async def _leaky_pem():
+        raise ProblemException(
+            status=500,
+            type_suffix="internal",
+            title="Internal error",
+            detail=f"Failed to parse {LEAKY_PEM_HEADER}",
+        )
 
     return app
 
@@ -205,3 +284,59 @@ class TestP09Rfc9457Compliance:
         r = client.get("/api/v1/servers/test-123")
         body = r.json()
         assert body["instance"] == "/api/v1/servers/test-123"
+
+
+class TestP09SecretClauseAtRouteLevel:
+    """P-09 clause 4, asserted where it can actually fail.
+
+    The rest of this file exercised routes whose `detail` was already a safe
+    constant, so emptying `src.core.errors._LEAK_PATTERNS` left all of them green
+    — the secret clause was decorative. These tests drive handlers that put a
+    synthetic credential into `detail` and then assert the emitted body is clean,
+    so removing the sanitiser fails P-09 rather than passing it.
+    """
+
+    @pytest.mark.parametrize("path", LEAKY_ROUTES, ids=[p.rsplit("/", 1)[-1] for p in LEAKY_ROUTES])
+    def test_a_credential_in_the_detail_never_reaches_the_body(self, client: TestClient, path: str):
+        response = client.get(path)
+
+        assert response.status_code >= 400
+        body_text = json.dumps(response.json())
+
+        for pattern in _SECRET_PATTERNS:
+            assert not pattern.search(body_text), f"{path}: pattern {pattern.pattern!r} matched the problem body"
+        for literal in LEAKY_SUBSTRINGS:
+            assert literal not in body_text, f"{path}: {literal!r} leaked into the problem body"
+
+    @pytest.mark.parametrize("path", LEAKY_ROUTES, ids=[p.rsplit("/", 1)[-1] for p in LEAKY_ROUTES])
+    def test_the_response_is_still_rfc9457_after_sanitisation(self, client: TestClient, path: str):
+        """Suppressing `detail` must not break the required members or status."""
+        response = client.get(path)
+
+        _assert_rfc9457_compliant(response)
+        body = response.json()
+        assert body["status"] == response.status_code
+        # `_sanitize_detail` suppresses the whole field rather than masking part
+        # of it, so a leaky detail becomes absent — never a partial credential.
+        assert body.get("detail") in (None, ""), f"detail survived sanitisation: {body.get('detail')!r}"
+
+    def test_every_error_route_in_this_module_is_secret_free(self, client: TestClient):
+        """One sweep over both the safe and the leaky routes."""
+        paths = [
+            "/auth/me",
+            "/api/v1/servers/unknown-id",
+            "/api/v1/conflict",
+            "/api/v1/rate-limited",
+            "/api/v1/crash",
+            "/api/v1/forbidden",
+            *LEAKY_ROUTES,
+        ]
+        offenders: list[str] = []
+        for path in paths:
+            body_text = json.dumps(client.get(path).json())
+            if any(p.search(body_text) for p in _SECRET_PATTERNS):
+                offenders.append(path)
+            elif any(literal in body_text for literal in LEAKY_SUBSTRINGS):
+                offenders.append(path)
+
+        assert offenders == [], f"secret material leaked from: {offenders}"

@@ -51,11 +51,26 @@ class SecretRedactingFilter(logging.Filter):
                 record.args = {k: redact_secrets(str(v)) if isinstance(v, str) else v for k, v in record.args.items()}
             elif isinstance(record.args, tuple):
                 record.args = tuple(redact_secrets(a) if isinstance(a, str) else a for a in record.args)
+        # A traceback is the most likely place a DSN or bearer token reaches a
+        # log: connection and HTTP errors put the URL in the exception message.
+        # `exc_text` is set when a formatter has already cached the traceback.
+        if isinstance(getattr(record, "exc_text", None), str):
+            record.exc_text = redact_secrets(record.exc_text)
         return True
 
 
 class JSONFormatter(logging.Formatter):
     """Emits structured JSON log records with required correlation fields."""
+
+    def formatException(self, ei: Any) -> str:
+        """Redact the formatted traceback.
+
+        The filter cannot reach this text: `exc_info` is a live exception tuple
+        and the traceback string only exists once a formatter renders it. Without
+        this override, `SecretRedactingFilter` scrubs the message while the
+        traceback beside it still carries the credential (§14.4).
+        """
+        return redact_secrets(super().formatException(ei))
 
     def format(self, record: logging.LogRecord) -> str:
         log_entry: dict[str, Any] = {
@@ -78,6 +93,17 @@ class JSONFormatter(logging.Formatter):
         return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(record.created)) + f".{int(record.msecs):03d}Z"
 
 
+class ConsoleFormatter(logging.Formatter):
+    """Human-readable formatter that redacts tracebacks like the JSON one.
+
+    Without this, `LOG_FORMAT=console` would leak a credential-bearing traceback
+    that `LOG_FORMAT=json` redacts.
+    """
+
+    def formatException(self, ei: Any) -> str:
+        return redact_secrets(super().formatException(ei))
+
+
 def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None:
     """Configure stdlib logging with JSON formatter and secret redaction."""
     config: dict[str, Any] = {
@@ -93,6 +119,7 @@ def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None
                 "()": JSONFormatter,
             },
             "console": {
+                "()": ConsoleFormatter,
                 "format": "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
             },
         },
