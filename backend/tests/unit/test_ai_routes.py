@@ -12,7 +12,7 @@ Tests:
 from __future__ import annotations
 
 import time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import jwt as pyjwt
 import pytest
@@ -20,12 +20,13 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from src.ai.rate_limit.redis_bucket import (
     RateLimitDecision,
     RateLimitServiceError,
     RedisTokenBucketLimiter,
 )
-from src.ai.routes import AIDeps, router
+from src.ai.routes import AIDeps, read_router, router
 from src.ai.routing.breaker import CircuitBreaker
 from src.ai.routing.endpoints import (
     EndpointAvailability,
@@ -184,25 +185,29 @@ def mock_breakers() -> dict[str, CircuitBreaker]:
 
 @pytest.fixture()
 def mock_model_router() -> AsyncMock:
-    """Mock model router that returns a successful result."""
-    router_mock = AsyncMock(spec=ModelRouter)
-    router_mock.complete = AsyncMock(
-        return_value=RoutingResult(
-            outcome=RoutingOutcome.OK,
-            endpoint_id="gpt-5.6-sol",
-            content="Hello, I can help with that!",
-            served_from="endpoint",
-            degraded=False,
-        )
+    """Autospec'd model router that returns a successful result.
+
+    create_autospec(..., spec_set=True) rather than AsyncMock(spec=...): `spec=`
+    restricts attribute names only, so `complete` could be called with any
+    signature at all. autospec copies the real signature onto the child and
+    spec_set makes assigning over it raise (design.md 0.4.3, D-23).
+    """
+    router_mock = create_autospec(ModelRouter, spec_set=True, instance=True)
+    router_mock.complete.return_value = RoutingResult(
+        outcome=RoutingOutcome.OK,
+        endpoint_id="gpt-5.6-sol",
+        content="Hello, I can help with that!",
+        served_from="endpoint",
+        degraded=False,
     )
     return router_mock
 
 
 @pytest.fixture()
 def mock_limiter() -> AsyncMock:
-    """Mock rate limiter — allows by default."""
-    limiter = AsyncMock(spec=RedisTokenBucketLimiter)
-    limiter.check = AsyncMock(return_value=RateLimitDecision(allowed=True, remaining=19))
+    """Autospec'd rate limiter - allows by default."""
+    limiter = create_autospec(RedisTokenBucketLimiter, spec_set=True, instance=True)
+    limiter.check.return_value = RateLimitDecision(allowed=True, remaining=19)
     return limiter
 
 
@@ -251,12 +256,96 @@ def app(ai_deps: AIDeps) -> FastAPI:
     app = FastAPI()
     install_problem_handlers(app)
     app.state.ai_deps = ai_deps
+    # The router now carries `require_mcp_principal` (design §4.4), which resolves the
+    # caller from `app.state.token_verifier`. It is pointed at the SAME verifier the
+    # handler uses, not a second one: a token the handler accepts must be a token the
+    # dependency accepts, and two verifiers in one app is how those diverge.
+    app.state.token_verifier = ai_deps.verifier
+    # `require_principal` reads `app.state.app_token_verifier`, a DIFFERENT state key from the one
+    # `require_mcp_principal` reads - the two audiences are verified separately by design (§11.2). Since
+    # `GET /tiers` moved to the user-authenticated router, an app that composed only the gateway verifier
+    # answered 500 where it should answer 401: an uncomposed verifier is a deployment error, not a fact
+    # about the caller, so the dependency raises rather than refusing.
+    #
+    # Pointed at the SAME verifier for the reason the comment above gives: two verifiers in one app is
+    # how the dependency's answer and the handler's answer diverge.
+    app.state.app_token_verifier = ai_deps.verifier
     app.include_router(router)
+    # THE SECOND ROUTER. `GET /tiers` moved off the completion router when it turned out a browser
+    # session token could never satisfy the gateway-audience dependency the completion surface carries,
+    # so the Models screen reported "Not authenticated to read model tiers" to a signed-in user for ever.
+    # Both routers share the prefix, so the paths are unchanged; a test app has to mount both.
+    app.include_router(read_router)
+
+    # `GET /tiers` READS THE DATABASE NOW, and that is not incidental to what it reports.
+    #
+    # Availability stopped being a statement about the protocol and became a conjunction that
+    # includes "is a credential actually configured", which means operator-set credentials in
+    # `provider_credentials` plus the last real connection test recorded against each. Neither fact
+    # exists in `AIDeps`.
+    #
+    # The double returns NO ROWS, so these tests describe a deployment where nothing has been
+    # configured through the UI — which is the case the shape assertions below are about, and the
+    # case a fresh install is in. The credential lifecycle itself is asserted against a real
+    # database in the integration suite, because sealing and unsealing a value is exactly the thing
+    # a double would let pass without doing.
+    from src.core.db import get_session
+
+    # Only the ONE field the route reads. A full `Settings()` needs a database and a Redis URL,
+    # neither of which a unit test has, and asking for them here would make this fixture assert
+    # something about the environment rather than about the route.
+    class _SealKeyOnlySettings:
+        local_secret_seal_key = SecretStr("unit-test-seal-key-not-a-deployment-value")
+
+    app.state.settings = _SealKeyOnlySettings()
+
+    class _NoRows:
+        def scalars(self) -> _NoRows:
+            return self
+
+        def all(self) -> list[object]:
+            return []
+
+    class _EmptySession:
+        async def execute(self, *_args: object, **_kwargs: object) -> _NoRows:
+            return _NoRows()
+
+    app.dependency_overrides[get_session] = lambda: _EmptySession()
     return app
 
 
 @pytest.fixture()
 def client(app: FastAPI) -> TestClient:
+    return TestClient(app)
+
+
+@pytest.fixture()
+def authed_client(app: FastAPI) -> TestClient:
+    """A client whose requests already carry a resolved principal.
+
+    Used by tests about the RESPONSE SHAPE of an authenticated route. Overriding the
+    dependency rather than minting a token per test keeps those tests about the thing
+    they assert; the authentication requirement itself is asserted separately, against
+    a client with no override, and by Q-19 over the whole router.
+    """
+    import uuid as _uuid
+
+    from src.auth.dependencies import require_mcp_principal, require_principal
+    from src.auth.models import UserRole
+    from src.auth.principal import Principal
+
+    principal = Principal.for_user(
+        user_id=_uuid.uuid4(),
+        subject="test-only-not-a-real-subject",
+        email="tiers@example.invalid",
+        role=UserRole.DEVELOPER,
+    )
+    app.dependency_overrides[require_mcp_principal] = lambda: principal
+    # `GET /tiers` now sits on `read_router`, which requires a USER principal rather than the gateway
+    # audience - a browser session token could never satisfy the latter, which is why the Models screen
+    # reported "Not authenticated to read model tiers" to a correctly signed-in user. Overridden here for
+    # the same reason the other one is: this file tests the tier handler, not the auth stack.
+    app.dependency_overrides[require_principal] = lambda: principal
     return TestClient(app)
 
 
@@ -285,17 +374,27 @@ def valid_token(rsa_keypair) -> str:
 
 
 class TestTiersEndpoint:
-    """GET /api/v1/ai/tiers returns 6 tiers with endpoint info."""
+    """GET /api/v1/ai/tiers returns 6 tiers with endpoint info.
 
-    def test_returns_six_tiers(self, client: TestClient):
-        resp = client.get("/api/v1/ai/tiers")
+    Phase 1 makes this route AUTHENTICATED, reversing Phase 0's "tiers listing is
+    public". §4.4's public set is exhaustive and does not name it, and the reason is
+    substantive rather than procedural: the response names every configured endpoint,
+    its protocol and its breaker state, which is a map of the deployment's model
+    supply chain. An unauthenticated caller has no use for it.
+
+    The shape assertions therefore go through `authed_client`, and the reversal itself
+    is asserted below against a client with no principal.
+    """
+
+    def test_returns_six_tiers(self, authed_client: TestClient):
+        resp = authed_client.get("/api/v1/ai/tiers")
         assert resp.status_code == 200
         data = resp.json()
         assert "tiers" in data
         assert len(data["tiers"]) == 6
 
-    def test_tier_info_structure(self, client: TestClient):
-        resp = client.get("/api/v1/ai/tiers")
+    def test_tier_info_structure(self, authed_client: TestClient):
+        resp = authed_client.get("/api/v1/ai/tiers")
         data = resp.json()
         tier = data["tiers"][0]
         assert "name" in tier
@@ -303,9 +402,20 @@ class TestTiersEndpoint:
         assert "primary_protocol" in tier
         assert "available" in tier
         assert "breaker_state" in tier
+        # The three facts `available` is now derived from, each reported separately so the screen can
+        # say WHICH one is missing. A single boolean could not distinguish "ForgeOps has no adapter
+        # for this protocol" from "you have not set an API key", which have opposite remedies.
+        assert "protocol_supported" in tier
+        assert "credential_configured" in tier
+        assert "credential_required" in tier
+        assert "reason" in tier
+        # And what a real call last said, which is the only field here that is evidence rather than
+        # configuration.
+        assert "last_test_ok" in tier
+        assert "last_tested_at" in tier
 
-    def test_tier_names_are_correct(self, client: TestClient):
-        resp = client.get("/api/v1/ai/tiers")
+    def test_tier_names_are_correct(self, authed_client: TestClient):
+        resp = authed_client.get("/api/v1/ai/tiers")
         data = resp.json()
         tier_names = {t["name"] for t in data["tiers"]}
         expected = {
@@ -318,18 +428,29 @@ class TestTiersEndpoint:
         }
         assert tier_names == expected
 
-    def test_openai_compatible_endpoints_are_available(self, client: TestClient):
-        resp = client.get("/api/v1/ai/tiers")
+    def test_a_supported_protocol_with_no_credential_is_not_available(self, authed_client: TestClient):
+        """`available` used to mean "ForgeOps has an adapter for this protocol".
+
+        The screen rendered that as "this endpoint will answer", so a fresh install reported hosted
+        models as available when the only credentials present were the placeholders `.env.example`
+        ships. This asserts the corrected meaning: a supported protocol is necessary but not
+        sufficient, and the response names the credential that is missing.
+        """
+        resp = authed_client.get("/api/v1/ai/tiers")
         data = resp.json()
-        # high_coding primary is gpt-5.6-sol (openai_compatible → available)
         high_coding = next(t for t in data["tiers"] if t["name"] == "high_coding")
         assert high_coding["primary_endpoint"] == "gpt-5.6-sol"
         assert high_coding["primary_protocol"] == "openai_compatible"
-        assert high_coding["available"] is True
+        assert high_coding["protocol_supported"] is True, "the adapter exists"
+        assert high_coding["credential_required"] is True, "a hosted endpoint needs a key"
+        assert high_coding["credential_configured"] is False, "and this deployment has none stored"
+        assert high_coding["available"] is False, "so it must not be reported as available"
+        assert "openai" in high_coding["reason"], "the reason names what the operator must set"
+        assert high_coding["last_test_ok"] is None, "never tested is distinct from tested and failing"
         assert high_coding["breaker_state"] == "closed"
 
-    def test_native_protocol_endpoints_not_available(self, client: TestClient):
-        resp = client.get("/api/v1/ai/tiers")
+    def test_native_protocol_endpoints_not_available(self, authed_client: TestClient):
+        resp = authed_client.get("/api/v1/ai/tiers")
         data = resp.json()
         # high_analysis primary is claude-fable-5 (anthropic_native → not available)
         high_analysis = next(t for t in data["tiers"] if t["name"] == "high_analysis")
@@ -337,10 +458,51 @@ class TestTiersEndpoint:
         assert high_analysis["primary_protocol"] == "anthropic_native"
         assert high_analysis["available"] is False
 
-    def test_tiers_does_not_require_auth(self, client: TestClient):
-        """Tiers listing is public — no auth required."""
-        resp = client.get("/api/v1/ai/tiers")
-        assert resp.status_code == 200
+    def test_tiers_requires_a_principal(self, client: TestClient):
+        """Deny-by-default on the tier read, asserted where this file can assert it honestly.
+
+        THIS USED TO CALL THE ROUTE AND EXPECT 401. It cannot any more, and the reason is worth stating:
+        `GET /tiers` moved off the completion router onto one that requires a USER principal, because the
+        gateway-audience dependency it used to inherit can never be satisfied by a browser session token
+        — the Models screen reported "Not authenticated to read model tiers" to a correctly signed-in
+        user, permanently.
+
+        `require_principal` resolves against `app.state.app_token_verifier`, and this file's app is built
+        around an `OidcTokenVerifier` that has no `verify_principal`. Composing a stand-in that answered
+        401 would be a test double on the auth path proving only that the double works.
+
+        So the dependency is asserted STRUCTURALLY here — the same object `scripts/check-route-auth.py`
+        inspects — and the live 401 is asserted against the real composed app in
+        `tests/integration/test_ai_tiers_user_read.py::test_an_anonymous_caller_is_still_refused`.
+        """
+        from src.ai.routes import read_router
+        from src.ai.routes import router as completion_router
+        from src.auth.dependencies import require_mcp_principal, require_principal
+
+        def _deps(target) -> set[object]:
+            return {call for dep in target.dependencies if (call := getattr(dep, "dependency", None)) is not None}
+
+        # Asserted on the ROUTERS rather than on a test app's route table, because that is where the
+        # dependency is attached and it is the same object `scripts/check-route-auth.py` inspects.
+        assert require_principal in _deps(read_router), (
+            "the router carrying GET /api/v1/ai/tiers must require a principal; it is a user-facing "
+            "read and deny-by-default is attached at the router"
+        )
+        assert require_mcp_principal not in _deps(read_router), (
+            "the tier read must NOT carry the gateway-audience dependency; that is the defect this "
+            "split fixed, and a browser session token can never satisfy it"
+        )
+        # And the completion surface kept its stricter contract, which is the half a careless fix breaks.
+        assert require_mcp_principal in _deps(completion_router)
+        # `/tiers` lives on the read router and nowhere else, so the split is real rather than additive.
+        # An APIRouter stores the PREFIXED path, so the comparison is on the suffix.
+        tier_paths = [r.path for r in read_router.routes if getattr(r, "path", "").endswith("/tiers")]
+        assert tier_paths == ["/api/v1/ai/tiers"], (
+            f"expected exactly one tier route on the read router, got {tier_paths}"
+        )
+        assert not [r for r in completion_router.routes if getattr(r, "path", "").endswith("/tiers")], (
+            "the tier read must have MOVED off the completion router, not been duplicated onto both"
+        )
 
 
 # ---------------------------------------------------------------------------

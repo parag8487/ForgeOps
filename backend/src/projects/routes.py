@@ -1,0 +1,1498 @@
+# SPDX-License-Identifier: FSL-1.1-ALv2
+"""Project CRUD, activity and readiness (design.md Â§6.5 revision `0009`, Â§11.3, Â§11.4).
+
+**No migration accompanies this.** The `projects` table and the `Project` SQLModel have existed
+since revision `0009`, with `tenant_id`, a JSONB `settings` column, `created_at` and an `onupdate`
+`updated_at` â€” and `change_sets.project_id` and `generation_runs.project_id` are both foreign keys
+into it. What was missing was never the schema: these handlers simply never opened a session.
+
+That is the same shape as `src/approvals/` in this pass, and it is worth naming because it changes
+how the remaining gaps should be read. `create_project` built a `ProjectResponse` from its own
+request body and returned it with a fresh UUID, so a create appeared to succeed and stored nothing.
+`get_project` returned a fixed record â€” name `"Sample Project"`, path `/workspace/sample` â€” **for any
+id at all**, including ids that had never existed, which is worse than a 404 because a caller cannot
+tell a real project from the fixture. The `/projects` screen said so on its own face; that
+disclaimer is removed in the same commit as the fix, because it is no longer true.
+
+`GET ""` is new. Its absence is what forced the UI into a lookup-by-id box rather than a list, and
+`ProjectIdField` exists in the frontend purely because there was nothing to enumerate.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import uuid
+from datetime import datetime
+from typing import Annotated, Any, Final
+
+import httpx
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..audit.writer import AuditDraft
+from ..auth.dependencies import require_principal
+from ..auth.principal import Principal
+from ..core.db import get_session
+from ..core.errors import forbidden_problem, problem
+from ..integrations.github_link import GitHubLinkError, GitHubLinkNotFoundError, GitHubUserClient
+from .github_import import (
+    GitHubAppError,
+    GitHubAppNotConfiguredError,
+    GitHubAppTokenSource,
+    GitHubImporter,
+)
+from .github_push import (
+    GitHubPushRequest,
+    GitHubPushResponse,
+    push_project_to_github,
+)
+from .models import ProjectSettingsError, validate_project_settings
+from .vercel_deploy import (
+    VercelConfigCheckResponse,
+    VercelDeployRequest,
+    VercelDeployResponse,
+    check_project_vercel_config,
+    deploy_project_to_vercel,
+)
+
+router = APIRouter(
+    prefix="/api/v1/projects",
+    tags=["projects"],
+    dependencies=[Depends(require_principal)],
+)
+
+#: Page size ceiling for the list endpoint, mirroring the approvals surface so one concept has one
+#: bound rather than a different limit per collection.
+MAX_PAGE_SIZE = 100
+DEFAULT_PAGE_SIZE = 25
+
+_COLUMNS = "id, tenant_id, name, path, repo_url, settings, created_at, updated_at, archived_at"
+
+#: The most tags one project may carry. A ceiling rather than a default: tags are a filter, and a
+#: project with a thousand of them is not being filtered, it is being used as a free-text field.
+MAX_TAGS_PER_PROJECT = 50
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str = Field(..., max_length=200, min_length=1)
+    path: str = Field(..., max_length=1024, min_length=1)
+    repo_url: str | None = Field(default=None, max_length=1024)
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    path: str
+    repo_url: str | None
+    settings: dict[str, Any]
+    #: Present now that these are stored values rather than a constructed reply. A caller that
+    #: cannot see when a project was created cannot tell a fresh row from a stale one.
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    #: NULL while the project is active (revision `0013`, PRD FR-05). Soft and reversible.
+    archived_at: datetime | None = None
+    #: PRD FR-02. Read from `project_tags`, which revision `0009` created and nothing wrote to.
+    tags: list[str] = Field(default_factory=list)
+    #: PRD FR-03, and it is THIS caller's favourite rather than the project's. See
+    #: `models.ProjectFavourite` for why that distinction needed a table.
+    favourite: bool = False
+    #: How many files this project has in the codebase index.
+    #:
+    #: HERE RATHER THAN A READINESS SCORE, deliberately. The projects screen used to render
+    #: `readinessScore: 0` as a hardcoded literal for every project, so every project displayed a
+    #: zero regardless of its real score. The fix is not to compute the score for each row: a real
+    #: score is a `ReadinessEngine` evaluation over the project's whole index, and running one per
+    #: row would make a 25-project page do 25 index walks. So the list reports whether there is
+    #: anything to score — `0` means "never scanned", which the UI says in words — and the score
+    #: itself stays on the detail screen where exactly one is computed.
+    indexed_file_count: int = 0
+
+
+class ProjectPage(BaseModel):
+    """A keyset page of projects, newest first."""
+
+    projects: list[ProjectResponse]
+    next_cursor: str | None = None
+
+
+class ActivityFeedItem(BaseModel):
+    id: str
+    action: str
+    timestamp: str
+    details: str
+
+
+class ReadinessCheckResponse(BaseModel):
+    """One checklist item, with the indexed path that satisfied it.
+
+    Â§1.4 asks for "checklist checks" and a report that says "why it matters"; this is that, on the
+    wire. `evidence` is what makes a score auditable â€” a category at 40 with no evidence anywhere is
+    indistinguishable from a bug in the scorer.
+    """
+
+    id: str
+    category: str
+    passed: bool
+    points: int
+    max_points: int
+    evidence: str
+    why_it_matters: str
+
+    # ─── What a reader needs when a check FAILS ──────────────────────────────
+    #
+    # `evidence` was blanked on every failure, so the screen rendered "Evidence:" with nothing after
+    # it — on the one outcome that needs explaining. `why_it_matters` states a principle and says
+    # nothing about the repository being scored.
+    #
+    # Defaulted so a client older than this revision still deserialises, and so a check that somehow
+    # arrives without them renders as "not stated" rather than failing the whole report.
+    looked_for: str = ""
+    looked_in: str = ""
+    found: str = ""
+    remedy: str = ""
+    remedy_path: str = ""
+    line: int | None = None
+
+    # ─── Whether generation can fix it ───────────────────────────────────────
+    #
+    # Read by the readiness screen to state the position PER CHECK. The screen used to carry one
+    # blanket sentence — "Generation cannot raise this score" — which was wrong for 22 of the 29
+    # checks, and gave no reason for the 7 where it is true.
+    generatable: bool = False
+    blocked_because: str = ""
+    partial_offer: str = ""
+
+
+class ReadinessReportResponse(BaseModel):
+    project_id: uuid.UUID
+    score: int
+    level: str
+    summary_report: str
+    recommendations: list[str]
+    #: The Â§1.4 category breakdown: Containerization, CI/CD, Orchestration, Env Config, Security,
+    #: IaC â€” each 0-100. Â§12.6 step 5 asserts on a "category breakdown", so the chart on the
+    #: readiness screen had nothing real to render while this was dropped. Serialised straight from
+    #: the engine's own model, so it cannot drift into a different set of categories than the one it
+    #: computes.
+    #:
+    #: The set CHANGED with this commit. It was five categories â€” documentation, test coverage, CI
+    #: config, security policy, containerisation â€” which omitted three of Â§1.4's six and scored two
+    #: that Â§1.4 does not name. Test evidence is now a check inside CI/CD rather than a category of
+    #: its own, which is also what removes the old `has_tests` default of true.
+    categories: dict[str, int] = Field(default_factory=dict)
+    #: False when the project has no indexed files. A caller must be able to tell "scored zero" from
+    #: "never scanned", and a score alone cannot.
+    indexed: bool = True
+    #: How many indexed paths the score was computed from.
+    evaluated_paths: int = 0
+    checks: list[ReadinessCheckResponse] = Field(default_factory=list)
+    #: Invariant 3, made visible. The screen used to carry a blanket "generation cannot raise this
+    #: score", which is wrong for most checks and gives an operator no way to tell "the platform will
+    #: fix this" from "somebody has to sit down and do it".
+    #:
+    #: `reachable_score` is what a generation run can reach from here; `unreachable` names every point
+    #: it cannot and why, with a reason about the project rather than about this platform's roadmap.
+    #: After an apply the rescan is compared against `reachable_score`, and a gap is a defect.
+    reachable_score: int = 0
+    reachable_summary: str = ""
+    generation_would_fix: list[str] = Field(default_factory=list)
+    unreachable: list[str] = Field(default_factory=list)
+
+
+def _tenant_clause(tenant_id: uuid.UUID | None) -> str:
+    """Row visibility. `IS NULL` is matched explicitly rather than skipped.
+
+    A principal with no tenant must see only rows with no tenant. Omitting the predicate in that
+    case would show it every project in the installation.
+    """
+    return "tenant_id IS NULL" if tenant_id is None else "tenant_id = :tenant_id"
+
+
+def _tenant_params(tenant_id: uuid.UUID | None) -> dict[str, Any]:
+    return {} if tenant_id is None else {"tenant_id": tenant_id}
+
+
+def encode_cursor(created_at: Any, project_id: uuid.UUID) -> str:
+    """A URL-safe keyset cursor over `(created_at, id)`.
+
+    Base64url rather than the raw `"<iso>|<uuid>"`, and not for tidiness. An ISO-8601 timestamp
+    contains `+00:00`, and `+` in a query string decodes to a space â€” so a raw cursor round-tripped
+    through a URL arrives as `2026-08-20T23:28:19.866059 00:00` and no longer parses. Encoding
+    removes the whole class of problem rather than escaping one character.
+    """
+    raw = f"{created_at.isoformat()}|{project_id}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    """Split a cursor, raising `ValueError` on anything malformed.
+
+    Returns a real `datetime`, not the string: asyncpg binds a timestamp parameter by type and
+    refuses a `str` outright, so parsing here keeps that failure at the edge where the caller's
+    input is validated rather than inside the query.
+    """
+    padded = cursor + "=" * (-len(cursor) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except Exception as exc:  # noqa: BLE001 - any decode failure is one malformed-cursor answer
+        raise ValueError("a cursor must be base64url of '<created_at>|<id>'") from exc
+    timestamp, _, raw_id = raw.partition("|")
+    if not timestamp or not raw_id:
+        raise ValueError("a cursor must be base64url of '<created_at>|<id>'")
+    return datetime.fromisoformat(timestamp), uuid.UUID(raw_id)
+
+
+@router.post("", response_model=ProjectResponse, status_code=201, summary="Create a project")
+async def create_project(
+    body: ProjectCreateRequest,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ProjectResponse:
+    """Insert a project row owned by the caller's tenant.
+
+    The settings validation is unchanged and still refuses an unknown key rather than dropping it â€”
+    a typo in `embedding_backend` that silently kept the default would only surface later as a
+    project whose vectors are in the wrong table (D-48).
+    """
+    try:
+        validated = validate_project_settings(body.settings)
+    except ProjectSettingsError as exc:
+        # Reported through the framework's validation path so it renders as the registered
+        # `validation-failed` 422 rather than needing a new problem type; Appendix C.1's registry is
+        # closed. The offending key is already named in the exception message.
+        raise RequestValidationError([{"loc": ("body", "settings"), "msg": str(exc), "type": "value_error"}]) from exc
+
+    project_id = uuid.uuid4()
+    result = await session.execute(
+        text(
+            "INSERT INTO projects (id, tenant_id, name, path, repo_url, settings) "
+            "VALUES (:id, :tenant_id, :name, :path, :repo_url, CAST(:settings AS jsonb)) "
+            f"RETURNING {_COLUMNS}"
+        ),
+        {
+            "id": project_id,
+            "tenant_id": principal.tenant_id,
+            "name": body.name,
+            "path": body.path,
+            "repo_url": body.repo_url,
+            # Serialised explicitly: passing a dict to a JSONB parameter through `text()` leaves the
+            # driver to guess, and the guess differs between asyncpg and psycopg.
+            "settings": json.dumps(validated),
+        },
+    )
+    # RETURNING rather than a second SELECT, so `created_at` and `updated_at` are the values the
+    # database generated in this statement rather than a re-read that could see another writer.
+    row = result.mappings().first()
+    await session.commit()
+    if row is None:  # pragma: no cover - an INSERT ... RETURNING either returns a row or raises
+        raise forbidden_problem()
+    return ProjectResponse(**dict(row))
+
+
+async def hydrate_projects(
+    session: AsyncSession,
+    rows: list[dict[str, Any]],
+    *,
+    user_id: uuid.UUID,
+) -> list[ProjectResponse]:
+    """Attach tags, this user's favourite flag and the index file count to a page of rows.
+
+    THREE QUERIES FOR THE WHOLE PAGE, not three per row. The obvious shape — a helper that loads one
+    project's tags and is called in a loop — is a 3N query pattern, and on a 25-row page that is 75
+    round trips to render a list. `= ANY(:ids)` collapses each of the three to one.
+
+    Returns rows in the order given. The caller's ordering is the keyset order the cursor depends on,
+    so re-sorting here would break paging in a way that only shows up on page two.
+    """
+    if not rows:
+        return []
+    ids = [row["id"] for row in rows]
+
+    tag_rows = await session.execute(
+        text("SELECT project_id, tag FROM project_tags WHERE project_id = ANY(:ids) ORDER BY tag"),
+        {"ids": ids},
+    )
+    tags: dict[uuid.UUID, list[str]] = {}
+    for tag_row in tag_rows.mappings():
+        tags.setdefault(tag_row["project_id"], []).append(str(tag_row["tag"]))
+
+    favourite_rows = await session.execute(
+        text("SELECT project_id FROM project_favourites WHERE user_id = :user_id AND project_id = ANY(:ids)"),
+        {"user_id": user_id, "ids": ids},
+    )
+    favourites = {row["project_id"] for row in favourite_rows.mappings()}
+
+    count_rows = await session.execute(
+        text("SELECT project_id, count(*) AS files FROM file_tree WHERE project_id = ANY(:ids) GROUP BY project_id"),
+        {"ids": ids},
+    )
+    counts = {row["project_id"]: int(row["files"]) for row in count_rows.mappings()}
+
+    return [
+        ProjectResponse(
+            **row,
+            tags=tags.get(row["id"], []),
+            favourite=row["id"] in favourites,
+            indexed_file_count=counts.get(row["id"], 0),
+        )
+        for row in rows
+    ]
+
+
+@router.get("", response_model=ProjectPage, summary="List the caller's projects")
+async def list_projects(
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    cursor: str | None = None,
+    search: str | None = Query(default=None, max_length=200, description="Substring of the name or path"),
+    tag: list[str] | None = Query(default=None, description="Repeatable. A project must carry EVERY tag given."),
+    favourite: bool | None = Query(default=None, description="Restrict to (or exclude) this caller's favourites"),
+    archived: bool = Query(default=False, description="Show archived projects instead of active ones"),
+) -> ProjectPage:
+    """The endpoint whose absence forced the UI to be a lookup box, now filterable server-side.
+
+    Keyset over `(created_at, id)`, for the same reason the approvals list is: an offset shifts as
+    rows are inserted, so a client paging while projects are created sees duplicates or gaps.
+
+    **THE FILTERS RUN IN SQL, WHICH IS THE POINT OF THEM EXISTING.** PRD FR-02 and FR-03 ask for
+    search, tags and favourites, and the cheap version is to fetch every project and filter in the
+    browser. That is wrong in a way that is invisible while a tenant has six projects and total once
+    it has six hundred: it pages the wrong set, so `next_cursor` describes the unfiltered sequence
+    and the second page of a search silently omits matches.
+
+    `search` matches the name or the path, case-insensitively, and `%` and `_` in the term are
+    LITERAL characters rather than wildcards the caller did not ask for.
+
+    `tag` is repeatable and conjunctive: `?tag=prod&tag=eu` means both, not either. Conjunctive
+    because that is what narrowing means — a filter that widened as you added terms would be
+    surprising in exactly the situation you were trying to narrow.
+
+    `archived` is a separate view rather than an inclusive flag: the default excludes archived
+    projects, and asking for them shows those and only those. An "include archived" flag would mix a
+    project you have finished with the ones you have not, in one list, which is the state archiving
+    exists to end.
+    """
+    params: dict[str, Any] = {"limit": limit + 1, **_tenant_params(principal.tenant_id)}
+    clauses = [_tenant_clause(principal.tenant_id)]
+    clauses.append("archived_at IS NOT NULL" if archived else "archived_at IS NULL")
+
+    if search:
+        # `position(... in lower(...)) > 0` rather than LIKE, so a `%` typed into the search box is
+        # the character the operator typed. Same reasoning as `query_symbols` in analysis/routes.py.
+        clauses.append("(position(lower(:search) in lower(name)) > 0 OR position(lower(:search) in lower(path)) > 0)")
+        params["search"] = search.strip()
+
+    if tag:
+        # Every tag, not any: `HAVING count(DISTINCT tag) = :tag_count` over the requested set is
+        # what makes it conjunctive without one subquery per tag.
+        wanted = sorted({t.strip() for t in tag if t.strip()})
+        if wanted:
+            clauses.append(
+                "id IN (SELECT project_id FROM project_tags WHERE tag = ANY(:tags) "
+                "GROUP BY project_id HAVING count(DISTINCT tag) = :tag_count)"
+            )
+            params["tags"] = wanted
+            params["tag_count"] = len(wanted)
+
+    if favourite is not None:
+        predicate = "EXISTS" if favourite else "NOT EXISTS"
+        clauses.append(
+            f"{predicate} (SELECT 1 FROM project_favourites f "
+            "WHERE f.project_id = projects.id AND f.user_id = :favourite_user)"
+        )
+        params["favourite_user"] = principal.user_id
+
+    if cursor is not None:
+        try:
+            timestamp, last_id = decode_cursor(cursor)
+        except ValueError as exc:
+            raise RequestValidationError(
+                [{"loc": ("query", "cursor"), "msg": str(exc), "type": "value_error"}]
+            ) from exc
+        clauses.append("(created_at, id) < (:cursor_ts, :cursor_id)")
+        params["cursor_ts"] = timestamp
+        params["cursor_id"] = last_id
+
+    result = await session.execute(
+        text(
+            f"SELECT {_COLUMNS} FROM projects WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at DESC, id DESC LIMIT :limit"
+        ),
+        params,
+    )
+    rows = [dict(r) for r in result.mappings()]
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return ProjectPage(
+        projects=await hydrate_projects(session, rows, user_id=principal.user_id),
+        next_cursor=encode_cursor(rows[-1]["created_at"], rows[-1]["id"]) if has_more and rows else None,
+    )
+
+
+@router.get("/tags", response_model=list[str], summary="Every tag in use in this tenant")
+async def list_tags(
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> list[str]:
+    """The distinct tags across the caller's visible projects, so the filter can be a chooser.
+
+    Declared BEFORE `/{project_id}` on purpose: FastAPI matches in declaration order, and a literal
+    path registered after a parameterised one would be swallowed by it and answer
+    `422 value is not a valid uuid` for a request that is perfectly well formed.
+    """
+    result = await session.execute(
+        text(
+            "SELECT DISTINCT t.tag FROM project_tags t JOIN projects p ON p.id = t.project_id "
+            f"WHERE {_tenant_clause(principal.tenant_id)} ORDER BY t.tag"
+        ),
+        _tenant_params(principal.tenant_id),
+    )
+    return [str(row[0]) for row in result]
+
+
+async def load_visible_project(
+    session: AsyncSession, *, project_id: uuid.UUID, tenant_id: uuid.UUID | None
+) -> dict[str, Any]:
+    """One project the tenant may see, or the non-disclosing 403.
+
+    A 404 here would distinguish "no such project" from "another tenant's project", which Â§4.2 and
+    Q-20 forbid: the body must be byte-identical either way or it becomes an enumeration oracle for
+    project ids. `GovernanceChokepoint._admit` takes the same line for the same reason.
+
+    Public rather than `_load_project` because `analysis/routes.py` scopes the codebase index by
+    project too, and a second copy of this rule is a second place for it to drift.
+    """
+    result = await session.execute(
+        text(f"SELECT {_COLUMNS} FROM projects WHERE id = :id AND {_tenant_clause(tenant_id)}"),
+        {"id": project_id, **_tenant_params(tenant_id)},
+    )
+    row = result.mappings().first()
+    if row is None:
+        raise forbidden_problem()
+    return dict(row)
+
+
+@router.get("/{project_id}", response_model=ProjectResponse, summary="Read one project")
+async def get_project(
+    project_id: uuid.UUID,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ProjectResponse:
+    """Read a stored project.
+
+    This returned a fixed `"Sample Project"` for every id, including ids that had never existed.
+    A create-then-read now returns what was created.
+
+    Hydrated through the same helper the list uses, so the detail screen and the list row cannot
+    disagree about a project's tags or whether it is a favourite.
+    """
+    row = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    hydrated = await hydrate_projects(session, [row], user_id=principal.user_id)
+    return hydrated[0]
+
+
+@router.get("/{project_id}/activity", response_model=list[ActivityFeedItem], summary="Project activity")
+async def get_project_activity(
+    project_id: uuid.UUID,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> list[ActivityFeedItem]:
+    """The project's real governance history, read from `audit_events`.
+
+    This returned a single hardcoded `project_created` item dated 2026-08-06. The audit log is
+    append-only, hash-chained and already indexed on `(project_id, created_at)`, so an activity feed
+    is a query over it rather than a second store â€” and using it means the feed cannot disagree with
+    the audit viewer about what happened.
+
+    Existence is checked first so a caller cannot use an empty feed to learn that an id is
+    unallocated.
+    """
+    await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    result = await session.execute(
+        text(
+            "SELECT id, action, created_at, reason, outcome FROM audit_events "
+            "WHERE project_id = :project_id ORDER BY seq DESC LIMIT 50"
+        ),
+        {"project_id": project_id},
+    )
+    return [
+        ActivityFeedItem(
+            id=str(row["id"]),
+            action=str(row["action"]),
+            timestamp=row["created_at"].isoformat(),
+            # The audit record's own stated reason, which NFR-14 makes non-nullable, plus the
+            # outcome so an allowed and a denied transit are distinguishable in the feed.
+            details=f"{row['outcome']}: {row['reason']}",
+        )
+        for row in result.mappings()
+    ]
+
+
+@router.get("/{project_id}/readiness", response_model=ReadinessReportResponse, summary="Readiness score")
+async def get_project_readiness(
+    project_id: uuid.UUID,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ReadinessReportResponse:
+    """Score the project from its INDEX and return the Â§1.4 category breakdown.
+
+    What this used to score was `projects.settings`: `config_files` was literally
+    `sorted(settings.keys())` and `manifests` was `["Dockerfile"] if repo_url else []`, with
+    `"README.md"` substituted when the settings were empty. So the number described what an operator
+    had typed into the create form â€” it moved when the settings changed and stayed still when the
+    repository did â€” and a project with a `favourite` flag scored points for documentation.
+
+    It now reads `file_tree` and `file_contents`: the rows an agent scan persisted through
+    `POST /analysis/codebase/{project_id}/index`. `projects.settings` still participates, but only as
+    a REFINEMENT â€” `ignore_globs` removes paths from the evidence, because a path the operator has
+    declared out of scope is not evidence about the deployment. It can no longer stand in for the
+    repository.
+
+    A project with no indexed files scores zero, says `indexed: false`, and recommends running a
+    scan. That is the honest answer; scoring the settings instead would produce a number that looks
+    like a measurement of a repository nobody has read.
+    """
+    project = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+
+    from ..core.index_evidence import load_index_evidence
+    from .readiness import ReadinessEngine, apply_ignore_globs
+
+    evidence = await load_index_evidence(session, project_id=project_id)
+    settings = project.get("settings") or {}
+    ignore_globs = settings.get("ignore_globs") if isinstance(settings, dict) else None
+    refined = evidence.model_copy(update={"paths": apply_ignore_globs(evidence.paths, ignore_globs)})
+
+    result = ReadinessEngine().evaluate(refined)
+
+    # Invariant 3: state the reachable score BEFORE anything is generated, so the apply has something to
+    # be measured against. Computed from the engine's own result and the same fixability table the
+    # per-check `generatable` flag uses, so the screen cannot promise a fix the generator will not make.
+    from ..core.reachable_score import reachable_score as _reachable
+
+    prediction = _reachable(result)
+
+    if result.indexed:
+        summary = (
+            f"{project['name']} scored {result.overall_score}/100 and is categorised as "
+            f"'{result.level}', from {result.evaluated_paths} indexed file(s) in this project's "
+            f"codebase index."
+        )
+    else:
+        summary = (
+            f"{project['name']} has no indexed files, so there is nothing to score. Run an agent "
+            f"scan for this project; readiness is measured from the repository, not from its "
+            f"stored settings."
+        )
+
+    return ReadinessReportResponse(
+        project_id=project_id,
+        score=result.overall_score,
+        level=result.level,
+        summary_report=summary,
+        recommendations=result.recommendations,
+        categories=result.breakdown.model_dump(),
+        indexed=result.indexed,
+        evaluated_paths=result.evaluated_paths,
+        reachable_score=prediction.reachable,
+        reachable_summary=prediction.summary(),
+        generation_would_fix=[f"{check_id} (+{points})" for check_id, points in prediction.fixable],
+        unreachable=[str(item) for item in prediction.unreachable],
+        checks=[
+            ReadinessCheckResponse(
+                # Copied field-by-field rather than by `model_dump()`, deliberately: the engine's model
+                # and the wire model are allowed to diverge, and an automatic copy would silently
+                # publish anything added to the engine.
+                looked_for=check.looked_for,
+                looked_in=check.looked_in,
+                found=check.found,
+                remedy=check.remedy,
+                remedy_path=check.remedy_path,
+                line=check.line,
+                generatable=check.generatable,
+                blocked_because=check.blocked_because,
+                partial_offer=check.partial_offer,
+                id=check.id,
+                category=check.category,
+                passed=check.passed,
+                points=check.points,
+                max_points=check.max_points,
+                evidence=check.evidence,
+                why_it_matters=check.why_it_matters,
+            )
+            for check in result.checks
+        ],
+    )
+
+
+@router.post(
+    "/{project_id}/scan",
+    summary="Trigger an agent codebase scan for this project",
+)
+async def scan_project_codebase(
+    project_id: uuid.UUID,
+    request: Request,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    timeout_seconds: Annotated[
+        float,
+        Query(
+            description="Maximum time in seconds to wait for the agent scan. Defaults to 900s (15 minutes).",
+            ge=10.0,
+            le=1800.0,
+        ),
+    ] = 900.0,
+) -> dict[str, Any]:
+    """Trigger an agent codebase scan for this project and wait for the result."""
+    await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    chokepoint = getattr(request.app.state, "governance_chokepoint", None)
+    if chokepoint is None:
+        raise RuntimeError("app.state.governance_chokepoint is not composed")
+
+    result = await chokepoint.read_inventory(
+        session,
+        project_id=project_id,
+        principal=principal,
+        operation="scan.full",
+        args={"project_id": str(project_id)},
+        timeout_seconds=timeout_seconds,
+    )
+    return {"status": "succeeded", "result": result}
+
+
+# ─── PRD FR-05: archive and delete ───────────────────────────────────────────────────────────────
+#
+# Both were P0 with no route on either side. They are two operations rather than one with a flag,
+# because they answer different questions: archive is "I have stopped working on this", delete is
+# "this should not exist". Conflating them is how an archive ends up destroying an index.
+
+
+class ArchiveRequest(BaseModel):
+    """Why the project is being archived. Required, for NFR-14's "why"."""
+
+    model_config = {"extra": "forbid"}
+
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class DeleteRequest(BaseModel):
+    """Why the project is being deleted, and an explicit acknowledgement of what goes with it.
+
+    `confirm_name` must equal the project's own name. Not a checkbox: a checkbox is clicked by
+    reflex, and typing the name is the smallest gesture that proves the operator knows WHICH project
+    they are deleting. The same reason `gh repo delete` asks.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    reason: str = Field(min_length=1, max_length=500)
+    confirm_name: str = Field(min_length=1, max_length=200)
+
+
+class DeletionReport(BaseModel):
+    """What the delete actually removed, counted before the statement ran.
+
+    Returned rather than a bare 204 because the cascade is wide and an operator is entitled to know
+    what it took. A 204 would make "deleted an empty project" and "deleted 977 chunks and 14 change
+    sets" the same response.
+    """
+
+    project_id: uuid.UUID
+    #: Rows removed per table, by the database's own cascade.
+    cascaded: dict[str, int]
+    #: Audit rows that mention this project and SURVIVE. See the route's docstring.
+    audit_events_retained: int
+
+
+def _writer(request: Request) -> Any:
+    """The composed audit writer, or a loud failure.
+
+    A `RuntimeError` rather than a degraded write, following `audit/routes.py::_writer`: archiving or
+    deleting a project without a record would be exactly the unlogged action §1.9 exists to forbid,
+    and a missing writer is a composition error rather than a fact about the caller.
+    """
+    writer = getattr(request.app.state, "audit_writer", None)
+    if writer is None:
+        raise RuntimeError(
+            "app.state.audit_writer is not composed; project archive and delete depend on it "
+            "(design §1.9, §11.9). create_app() must build it in the lifespan."
+        )
+    return writer
+
+
+@router.post("/{project_id}/archive", response_model=ProjectResponse, summary="Archive a project (soft)")
+async def archive_project(
+    project_id: uuid.UUID,
+    body: ArchiveRequest,
+    request: Request,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ProjectResponse:
+    """Set `archived_at`, leaving every row that references the project untouched.
+
+    Reversible by `POST /unarchive`, and idempotent: archiving an already-archived project keeps the
+    FIRST timestamp rather than moving it, because the answer to "when did this stop being worked on"
+    is the first time, not the most recent click.
+
+    Nothing is deleted, nothing is unindexed, no device is unpaired. That is the whole distinction
+    from delete, and it is why archive is not implemented as "delete but keep the row".
+    """
+    before = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+
+    await session.execute(
+        text("UPDATE projects SET archived_at = now() WHERE id = :id AND archived_at IS NULL"),
+        {"id": project_id},
+    )
+    await _writer(request).append(
+        session,
+        AuditDraft(
+            action="project_archived",
+            resource_kind="project",
+            resource_id=str(project_id),
+            reason=body.reason,
+            outcome="allowed",
+            actor_kind="user",
+            actor_user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+            project_id=project_id,
+            before_state={"archived_at": None if before["archived_at"] is None else before["archived_at"].isoformat()},
+            after_state={"archived": True},
+        ),
+    )
+    await session.commit()
+    row = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    return (await hydrate_projects(session, [row], user_id=principal.user_id))[0]
+
+
+@router.post("/{project_id}/unarchive", response_model=ProjectResponse, summary="Restore an archived project")
+async def unarchive_project(
+    project_id: uuid.UUID,
+    body: ArchiveRequest,
+    request: Request,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ProjectResponse:
+    """Clear `archived_at`. The other half of "soft, reversible" actually being reversible."""
+    before = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+
+    await session.execute(text("UPDATE projects SET archived_at = NULL WHERE id = :id"), {"id": project_id})
+    await _writer(request).append(
+        session,
+        AuditDraft(
+            action="project_unarchived",
+            resource_kind="project",
+            resource_id=str(project_id),
+            reason=body.reason,
+            outcome="allowed",
+            actor_kind="user",
+            actor_user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+            project_id=project_id,
+            before_state={"archived_at": None if before["archived_at"] is None else before["archived_at"].isoformat()},
+            after_state={"archived": False},
+        ),
+    )
+    await session.commit()
+    row = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    return (await hydrate_projects(session, [row], user_id=principal.user_id))[0]
+
+
+#: Every table whose rows the database removes when a project row is deleted, each named with the
+#: constraint that does it. Enumerated as DATA so the count in `DeletionReport` cannot drift from the
+#: cascade: a table added with an `ON DELETE CASCADE` reference to `projects.id` and not added here
+#: would be silently deleted and silently unreported, which is the shape of surprise this route
+#: exists to prevent.
+#:
+#: `file_contents` is reached transitively through `file_tree`, so it is counted through the join
+#: rather than by `project_id`, which it does not have.
+CASCADING_TABLES: Final[tuple[tuple[str, str], ...]] = (
+    ("file_tree", "SELECT count(*) FROM file_tree WHERE project_id = :id"),
+    (
+        "file_contents",
+        "SELECT count(*) FROM file_contents c JOIN file_tree f ON f.id = c.file_id WHERE f.project_id = :id",
+    ),
+    ("file_dependencies", "SELECT count(*) FROM file_dependencies WHERE project_id = :id"),
+    (
+        "embeddings",
+        "SELECT count(*) FROM embeddings e JOIN file_tree f ON f.id = e.file_id WHERE f.project_id = :id",
+    ),
+    (
+        "embeddings_local",
+        "SELECT count(*) FROM embeddings_local l JOIN file_tree f ON f.id = l.file_id WHERE f.project_id = :id",
+    ),
+    ("change_sets", "SELECT count(*) FROM change_sets WHERE project_id = :id"),
+    ("generation_runs", "SELECT count(*) FROM generation_runs WHERE project_id = :id"),
+    ("agent_devices", "SELECT count(*) FROM agent_devices WHERE project_id = :id"),
+    ("secrets", "SELECT count(*) FROM secrets WHERE project_id = :id"),
+    ("policies", "SELECT count(*) FROM policies WHERE project_id = :id"),
+    ("policy_bundles", "SELECT count(*) FROM policy_bundles WHERE project_id = :id"),
+    ("project_tags", "SELECT count(*) FROM project_tags WHERE project_id = :id"),
+    ("project_favourites", "SELECT count(*) FROM project_favourites WHERE project_id = :id"),
+)
+
+
+@router.delete("/{project_id}", response_model=DeletionReport, summary="Delete a project and its dependent rows")
+async def delete_project(
+    project_id: uuid.UUID,
+    body: DeleteRequest,
+    request: Request,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> DeletionReport:
+    """Delete the project row and let the database's declared cascade take its dependents.
+
+    WHAT GOES, AND WHAT STAYS. Thirteen tables carry `ON DELETE CASCADE` references into
+    `projects.id` — the file tree, its contents, the dependency graph, both vector tables, change
+    sets, generation runs, agent devices, secrets, policies, policy bundles, tags and favourites — and
+    all of them go. They are counted BEFORE the delete and reported, because "deleted" with no
+    statement of scope is not informed consent.
+
+    **The audit trail survives, and it survives by design rather than by exemption.** Revision `0007`
+    gave `audit_events.project_id` no foreign key, with the reason written into the migration: "an
+    immutable log that cascades away when a project is deleted is not an immutable log." The table
+    additionally REVOKEs `UPDATE` and `DELETE` from the application role and carries a trigger that
+    raises on either, so there is no statement this route could issue that would remove those rows,
+    and none it could issue to blank the column either. The rows keep the id of a project that no
+    longer exists, which is the honest record: the events happened, and the thing they happened to is
+    gone. `audit_events_retained` says how many, so the operator learns the history outlives the
+    project instead of discovering it later.
+
+    A DELETE rather than an archive-with-a-longer-name: archive already exists above and is the
+    reversible option. This one is not reversible, which is why it asks for the name.
+    """
+    project = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+
+    if body.confirm_name != project["name"]:
+        # Reported through the framework's validation path so it renders as the registered
+        # `validation-failed` 422 rather than needing a new problem type; Appendix C.1 is closed.
+        # The message does not echo the real name — the caller can read it from `GET /projects/{id}`,
+        # and repeating it here would turn a confirmation into a fill-in-the-blank.
+        raise RequestValidationError(
+            [
+                {
+                    "loc": ("body", "confirm_name"),
+                    "msg": "confirm_name must exactly match the project's name",
+                    "type": "value_error",
+                }
+            ]
+        )
+
+    cascaded: dict[str, int] = {}
+    for table, query in CASCADING_TABLES:
+        count = await session.execute(text(query), {"id": project_id})
+        cascaded[table] = int(count.scalar() or 0)
+
+    retained = await session.execute(
+        text("SELECT count(*) FROM audit_events WHERE project_id = :id"), {"id": project_id}
+    )
+    audit_events_retained = int(retained.scalar() or 0)
+
+    # The audit row is written BEFORE the delete, deliberately. Writing it afterwards would leave a
+    # window in which the project is gone and no record says who removed it, and the hash chain is
+    # appended to inside this transaction — so if the delete fails, the record rolls back with it.
+    await _writer(request).append(
+        session,
+        AuditDraft(
+            action="project_deleted",
+            resource_kind="project",
+            resource_id=str(project_id),
+            reason=body.reason,
+            outcome="allowed",
+            actor_kind="user",
+            actor_user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+            project_id=project_id,
+            before_state={"name": project["name"], "path": project["path"], "cascaded": cascaded},
+            after_state=None,
+        ),
+    )
+    await session.execute(text("DELETE FROM projects WHERE id = :id"), {"id": project_id})
+    await session.commit()
+
+    return DeletionReport(
+        project_id=project_id,
+        cascaded=cascaded,
+        audit_events_retained=audit_events_retained,
+    )
+
+
+# ─── PRD FR-02 tags, FR-03 favourites ────────────────────────────────────────────────────────────
+
+
+class TagRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    #: Lower-cased and trimmed by the handler. A tag is an identifier for filtering, and `Prod` and
+    #: `prod` being two tags would split the filter without anyone intending it.
+    tag: str = Field(min_length=1, max_length=64)
+
+
+@router.put("/{project_id}/tags", response_model=ProjectResponse, summary="Add a tag to a project")
+async def add_project_tag(
+    project_id: uuid.UUID,
+    body: TagRequest,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ProjectResponse:
+    """Add one tag. Idempotent, and bounded.
+
+    PUT rather than POST because adding a tag that is already there is not a second tag —
+    `ON CONFLICT DO NOTHING` against `uq_project_tags_project_id_tag` makes the operation
+    idempotent, which is what PUT promises and POST does not.
+    """
+    await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    tag = body.tag.strip().lower()
+    if not tag:
+        raise RequestValidationError(
+            [{"loc": ("body", "tag"), "msg": "a tag cannot be only whitespace", "type": "value_error"}]
+        )
+
+    existing = await session.execute(
+        text("SELECT count(*) FROM project_tags WHERE project_id = :id"), {"id": project_id}
+    )
+    if int(existing.scalar() or 0) >= MAX_TAGS_PER_PROJECT:
+        raise RequestValidationError(
+            [
+                {
+                    "loc": ("body", "tag"),
+                    "msg": f"a project may carry at most {MAX_TAGS_PER_PROJECT} tags",
+                    "type": "value_error",
+                }
+            ]
+        )
+
+    await session.execute(
+        text(
+            "INSERT INTO project_tags (id, project_id, tag) VALUES (:id, :project_id, :tag) "
+            "ON CONFLICT (project_id, tag) DO NOTHING"
+        ),
+        {"id": uuid.uuid4(), "project_id": project_id, "tag": tag},
+    )
+    await session.commit()
+    row = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    return (await hydrate_projects(session, [row], user_id=principal.user_id))[0]
+
+
+@router.delete("/{project_id}/tags/{tag}", response_model=ProjectResponse, summary="Remove a tag")
+async def remove_project_tag(
+    project_id: uuid.UUID,
+    tag: str,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ProjectResponse:
+    """Remove one tag. Idempotent: removing a tag that is not there succeeds."""
+    await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    await session.execute(
+        text("DELETE FROM project_tags WHERE project_id = :project_id AND tag = :tag"),
+        {"project_id": project_id, "tag": tag.strip().lower()},
+    )
+    await session.commit()
+    row = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    return (await hydrate_projects(session, [row], user_id=principal.user_id))[0]
+
+
+@router.put("/{project_id}/favourite", response_model=ProjectResponse, summary="Mark as this caller's favourite")
+async def add_favourite(
+    project_id: uuid.UUID,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ProjectResponse:
+    """Star the project for the CALLER, not for the project.
+
+    `user_id` comes from the verified principal and there is no parameter for it, so one person
+    cannot star a project on another's behalf. That is the whole reason this is a table rather than
+    the `projects.settings.favourite` flag that has existed since revision `0009`.
+    """
+    await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    await session.execute(
+        text(
+            "INSERT INTO project_favourites (user_id, project_id) VALUES (:user_id, :project_id) "
+            "ON CONFLICT (user_id, project_id) DO NOTHING"
+        ),
+        {"user_id": principal.user_id, "project_id": project_id},
+    )
+    await session.commit()
+    row = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    return (await hydrate_projects(session, [row], user_id=principal.user_id))[0]
+
+
+@router.delete("/{project_id}/favourite", response_model=ProjectResponse, summary="Unstar")
+async def remove_favourite(
+    project_id: uuid.UUID,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ProjectResponse:
+    """Unstar for the caller. Idempotent."""
+    await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    await session.execute(
+        text("DELETE FROM project_favourites WHERE user_id = :user_id AND project_id = :project_id"),
+        {"user_id": principal.user_id, "project_id": project_id},
+    )
+    await session.commit()
+    row = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    return (await hydrate_projects(session, [row], user_id=principal.user_id))[0]
+
+
+class GitHubProjectRequest(BaseModel):
+    """What creating a project from a connected GitHub account needs.
+
+    NO INSTALLATION ID, NO OWNER, NO REPO TYPED BY HAND. That was the previous shape and nobody had the
+    first field; the repository is now identified by the `full_name` the picker listed, and the listing
+    came from the user's own linked account.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    #: `owner/name`, as GitHub spells it. Validated for shape here and then CONFIRMED against the API
+    #: before anything is written, so a value typed by hand cannot name a repository the user cannot see.
+    repo_full_name: str = Field(
+        ...,
+        min_length=3,
+        max_length=140,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$",
+    )
+    #: The absolute directory on the user's machine that will CONTAIN the clone. Typed, because a
+    #: browser cannot return an absolute path — `<input type="file" webkitdirectory>` yields contents
+    #: and relative names by design. The agent refuses anything outside the workspace root it was
+    #: started with, so this is a choice within that root rather than an arbitrary destination.
+    parent_directory: str = Field(default="", max_length=4096)
+    #: The folder to create inside it. Defaults to the repository's own name. Validated by the AGENT as
+    #: well — traversal, separators, reserved Windows device names and case-only collisions are refused
+    #: there, because the agent is the only party that can see the filesystem it is refusing about.
+    directory_name: str = Field(default="", max_length=255)
+    #: Defaults to the repository's default branch, read from the API rather than assumed to be `main`.
+    branch: str = Field(default="", max_length=255)
+
+
+@router.post(
+    "/from-github",
+    response_model=ProjectResponse,
+    status_code=201,
+    summary="Create a project from a repository on the caller's linked GitHub account",
+)
+async def create_project_from_github(
+    body: GitHubProjectRequest,
+    request: Request,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ProjectResponse:
+    """Confirm the repository against the API, then write a project that is awaiting its clone.
+
+    THE ORDERING PROBLEM, RESOLVED IN ONE LINE: the project row is created first with the path it will
+    have, and the clone happens afterwards through `POST /{id}/clone` once an agent is paired for it —
+    chosen over "let an already-paired agent accept a clone for a new project" because devices are
+    paired per project and the policy gate scopes on that, so the alternative would widen device scope
+    to save one step of onboarding.
+
+    The project is NOT left looking ordinary while its directory is missing. `settings.clone_state` is
+    `awaiting_clone`, which `GET /analysis/codebase/{id}/status` reports as `awaiting_clone` rather than
+    `empty` — the two share "zero indexed files" and have different next steps.
+
+    THE REPOSITORY IS RE-READ FROM THE API HERE, not taken from the request. The picker's list could be
+    minutes old, and a renamed or newly-private repository must fail now with GitHub's own reason rather
+    than later as a clone that cannot authenticate. The clone URL and the default branch come from that
+    read for the same reason: neither is a value this server should guess.
+    """
+    link_service = getattr(request.app.state, "github_link_service", None)
+    if link_service is None:  # pragma: no cover - composition failure, not a caller fact
+        raise RuntimeError("app.state.github_link_service is not composed; project-from-GitHub depends on it")
+
+    owner, _, name = body.repo_full_name.partition("/")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
+        try:
+            token = await link_service.usable_token(
+                session, user_id=principal.user_id, tenant_id=principal.tenant_id, client=client
+            )
+        except GitHubLinkNotFoundError as exc:
+            raise problem(
+                "github-link-absent",
+                detail=(
+                    "No GitHub account is linked to this user, so a repository cannot be read. Connect "
+                    "one from Settings → Integrations first."
+                ),
+            ) from exc
+        except GitHubLinkError as exc:
+            raise problem("github-link-failed", detail=str(exc)) from exc
+
+        try:
+            repository = await GitHubUserClient(api_base_url=request.app.state.settings.github_api_base_url).repository(
+                token, owner=owner, name=name, client=client
+            )
+        except GitHubAppError as exc:
+            raise problem(
+                "github-link-failed",
+                detail=(
+                    f"{exc} The repository must be one your linked GitHub account can read; it may have "
+                    "been renamed, made private, or removed from the App's access."
+                ),
+            ) from exc
+    await session.commit()
+
+    directory = (body.directory_name or repository.name).strip()
+    parent = body.parent_directory.strip()
+    # The path RECORDED is the path the clone is asked for. The agent reports the absolute path it
+    # actually created and `POST /{id}/clone` writes that back, so a project's path ends up being what
+    # exists on disk rather than what was typed — but it is never blank in between.
+    intended_path = f"{parent.rstrip('/').rstrip(chr(92))}/{directory}" if parent else directory
+    settings_payload = validate_project_settings(
+        {
+            **repository.as_project_settings(),
+            "clone_state": "awaiting_clone",
+            "repo_full_name": repository.full_name,
+            "clone_url": repository.clone_url,
+        }
+    )
+
+    project_id = uuid.uuid4()
+    result = await session.execute(
+        text(
+            "INSERT INTO projects (id, tenant_id, name, path, repo_url, settings) "
+            "VALUES (:id, :tenant_id, :name, :path, :repo_url, CAST(:settings AS jsonb)) "
+            f"RETURNING {_COLUMNS}"
+        ),
+        {
+            "id": project_id,
+            "tenant_id": principal.tenant_id,
+            "name": repository.name,
+            "path": intended_path,
+            "repo_url": repository.html_url,
+            "settings": json.dumps(settings_payload),
+        },
+    )
+    row = result.mappings().first()
+    if row is None:  # pragma: no cover - INSERT ... RETURNING either returns a row or raises
+        raise problem("repository-import-failed", detail="the project row could not be written")
+
+    await _writer(request).append(
+        session,
+        AuditDraft(
+            action="project_imported",
+            resource_kind="project",
+            resource_id=str(project_id),
+            # The repository and the path. No credential: the token was used above and is not a field
+            # of anything this record is built from.
+            reason=(
+                f"created {repository.full_name} as a project awaiting its clone into {intended_path} "
+                f"(default branch {repository.default_branch}, "
+                f"{'private' if repository.private else 'public'})"
+            ),
+            outcome="allowed",
+            actor_kind="user",
+            actor_user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+            project_id=project_id,
+            before_state=None,
+            after_state={
+                "repo_url": repository.html_url,
+                "default_branch": repository.default_branch,
+                "private": repository.private,
+                "clone_state": "awaiting_clone",
+                "path": intended_path,
+            },
+        ),
+    )
+    await session.commit()
+    loaded = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    return (await hydrate_projects(session, [loaded], user_id=principal.user_id))[0]
+
+
+class CloneDispatchResponse(BaseModel):
+    """What dispatching the clone reports. The change set is how it is tracked from here on."""
+
+    project_id: uuid.UUID
+    change_set_id: uuid.UUID
+    status: str
+    outcome: str
+    audit_seq: int
+    clone_state: str
+
+
+@router.post(
+    "/{project_id}/clone",
+    response_model=CloneDispatchResponse,
+    summary="Clone the project's GitHub repository onto the paired agent's machine",
+)
+async def clone_project_repository(
+    project_id: uuid.UUID,
+    request: Request,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> CloneDispatchResponse:
+    """Send the clone through the governance chokepoint. No other path can reach the operation.
+
+    A ROUTE THAT DECIDES NOTHING. It loads the project, fetches a usable credential, and hands both to
+    `chokepoint.clone_repository`, which runs admission, policy, the approval gate, the blast-radius
+    check, the audit record and the rollback handle before minting a signed envelope. §2.2.1 confines
+    `send_command` to `governance/` exactly so that this cannot be a route that sends a command.
+
+    SEPARATE FROM CREATION, because an agent must be paired for the project before it can be told to do
+    anything, and pairing is a step the user performs. A create that tried to clone in the same request
+    would fail for every user who has not paired yet — which is every user, the first time.
+    """
+    project = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    settings = project.get("settings") or {}
+    if not isinstance(settings, dict) or not settings.get("repo_full_name"):
+        raise problem(
+            "repository-import-failed",
+            detail=(
+                "This project was not created from a GitHub repository, so there is nothing to clone. "
+                "A project created with a local path is already pointing at a directory."
+            ),
+        )
+
+    chokepoint = getattr(request.app.state, "governance_chokepoint", None)
+    if chokepoint is None:  # pragma: no cover - composition failure
+        raise RuntimeError("app.state.governance_chokepoint is not composed")
+    link_service = getattr(request.app.state, "github_link_service", None)
+    if link_service is None:  # pragma: no cover - composition failure
+        raise RuntimeError("app.state.github_link_service is not composed")
+
+    stored_path = str(project.get("path") or "")
+    directory = stored_path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    parent = stored_path[: len(stored_path) - len(directory)].rstrip("/\\")
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
+        try:
+            token = await link_service.usable_token(
+                session, user_id=principal.user_id, tenant_id=principal.tenant_id, client=client
+            )
+        except GitHubLinkNotFoundError as exc:
+            raise problem(
+                "github-link-absent",
+                detail="No GitHub account is linked to this user, so the clone cannot authenticate.",
+            ) from exc
+        except GitHubLinkError as exc:
+            raise problem("github-link-failed", detail=str(exc)) from exc
+
+    submission = await chokepoint.clone_repository(
+        session,
+        project_id=project_id,
+        principal=principal,
+        repo_full_name=str(settings["repo_full_name"]),
+        clone_url=str(settings.get("clone_url") or ""),
+        parent_directory=parent,
+        directory_name=directory,
+        branch=str(settings.get("repo_default_branch") or ""),
+        credential=token,
+        reason=f"requested by {principal.email or principal.user_id}",
+        environment="dev",
+    )
+
+    # `cloning` while the command is in flight, so a second click does not look like a first one and a
+    # screen can say what is happening. The terminal transition — removing the key — happens when the
+    # agent's result arrives, not here: claiming success at dispatch is the defect this vocabulary
+    # exists to prevent.
+    next_state = "cloning" if submission.outcome == "applying" else "awaiting_clone"
+    await session.execute(
+        text(
+            # `CAST(:state AS text)` rather than `:state::text`: SQLAlchemy reads the `::` as the start
+            # of another bind parameter, so the statement reached Postgres with a literal colon and a
+            # syntax error. Caught by running the route against the real database — no unit test on this
+            # path would have, because the SQL is only parsed when it is sent.
+            "UPDATE projects SET settings = jsonb_set(settings, '{clone_state}', "
+            "to_jsonb(CAST(:state AS text))) WHERE id = :id"
+        ),
+        {"state": next_state, "id": project_id},
+    )
+    await session.commit()
+
+    return CloneDispatchResponse(
+        project_id=project_id,
+        change_set_id=submission.change_set_id,
+        status=submission.status,
+        outcome=submission.outcome,
+        audit_seq=submission.audit_seq,
+        clone_state=next_state,
+    )
+
+
+class GitHubImportRequest(BaseModel):
+    """The three things an import needs. `extra="forbid"` so a misspelled field is a 422, not a default."""
+
+    model_config = {"extra": "forbid"}
+
+    #: The App installation that grants access. There is no way to import without one: the App model
+    #: has no notion of a token that is not scoped to an installation.
+    installation_id: int = Field(..., ge=1)
+    owner: str = Field(..., max_length=39, min_length=1, pattern=r"^[A-Za-z0-9][A-Za-z0-9-]*$")
+    repo: str = Field(..., max_length=100, min_length=1, pattern=r"^[A-Za-z0-9._-]+$")
+
+
+@router.post(
+    "/import/github",
+    response_model=ProjectResponse,
+    status_code=201,
+    summary="Import a GitHub repository as a project",
+)
+async def import_github_repository(
+    body: GitHubImportRequest,
+    request: Request,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ProjectResponse:
+    """Read a repository over the real GitHub API and record it as a project (FR-01).
+
+    **This endpoint is new, and its absence was the finding.** `src/projects/github_import.py` has existed
+    since Leaf 12.2 with a `GitHubImporter` and a `GitHubAppTokenSource`, and nothing called either one —
+    the only thing that exercised them was a unit test asserting the fabricated token prefix. So FR-01
+    ("import a repository from GitHub") was satisfied by a class that no request could reach, returning a
+    credential no API would accept.
+
+    Registered BEFORE `/{project_id}` would match it? No — `/import/github` is a two-segment path and
+    `/{project_id}` is one, so there is no ambiguity to order around. `/tags` sits above for the same
+    reason and needs no special placement either.
+
+    The route is deliberately thin. It resolves the repository, writes one row, and audits it. It does
+    NOT clone, scan or index: those are the agent's, and coupling them here would make an import fail
+    because a scan did.
+    """
+    token_source = GitHubAppTokenSource()
+    if not token_source.configured:
+        # Checked before any network call so an unconfigured server answers immediately, and answers
+        # with the reason. This is the branch that used to return a fabricated token instead.
+        raise problem(
+            "repository-import-unconfigured",
+            detail=(
+                "This server has no GitHub App credentials configured, so it cannot import a "
+                "repository. Set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY."
+            ),
+        )
+
+    try:
+        imported = await GitHubImporter(token_source).import_repository(body.installation_id, body.owner, body.repo)
+    except GitHubAppNotConfiguredError as exc:
+        # Reachable despite the check above when the private key is present but unusable — a truncated
+        # PEM, say. Still a configuration fault, so still a 503.
+        raise problem("repository-import-unconfigured", detail=str(exc)) from exc
+    except GitHubAppError as exc:
+        # The upstream status is named in the detail but NOT copied into this response's status: a 404
+        # from GitHub means "this installation cannot see that repository", which is not the same claim
+        # as "this endpoint does not exist", and returning 404 here would say the latter.
+        raise problem("repository-import-failed", detail=str(exc)) from exc
+
+    settings_payload = validate_project_settings(imported.as_project_settings())
+    project_id = uuid.uuid4()
+    result = await session.execute(
+        text(
+            "INSERT INTO projects (id, tenant_id, name, path, repo_url, settings) "
+            "VALUES (:id, :tenant_id, :name, :path, :repo_url, CAST(:settings AS jsonb)) "
+            f"RETURNING {_COLUMNS}"
+        ),
+        {
+            "id": project_id,
+            "tenant_id": principal.tenant_id,
+            "name": imported.name,
+            # The workspace path an agent will later be pointed at. Derived from the repository name
+            # rather than accepted from the caller, so an import cannot nominate an arbitrary directory.
+            "path": f"{imported.owner}/{imported.name}",
+            "repo_url": imported.repo_url,
+            "settings": json.dumps(settings_payload),
+        },
+    )
+    row = result.mappings().first()
+    if row is None:  # pragma: no cover - RETURNING on a successful INSERT always yields a row
+        raise problem("repository-import-failed", detail="the project row could not be written")
+
+    await _writer(request).append(
+        session,
+        AuditDraft(
+            action="project_imported",
+            resource_kind="project",
+            resource_id=str(project_id),
+            # The installation id and the repository, never the token. `ImportedRepository` has no
+            # token field precisely so that this record cannot capture one by accident — the previous
+            # version returned the credential inside its result dict, so anything that logged the
+            # import outcome captured it.
+            reason=(
+                f"imported {imported.owner}/{imported.name} from GitHub "
+                f"(installation {body.installation_id}, default branch {imported.default_branch})"
+            ),
+            outcome="allowed",
+            actor_kind="user",
+            actor_user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+            project_id=project_id,
+            # No before state: the project did not exist. `None` rather than `{}`, which would claim
+            # an empty prior state was observed.
+            before_state=None,
+            after_state={
+                "repo_url": imported.repo_url,
+                "default_branch": imported.default_branch,
+                "private": imported.private,
+                "languages": list(imported.languages),
+                "manifests": list(imported.detected_manifests),
+            },
+        ),
+    )
+    await session.commit()
+    loaded = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    return (await hydrate_projects(session, [loaded], user_id=principal.user_id))[0]
+
+
+@router.post(
+    "/{project_id}/github/push",
+    response_model=GitHubPushResponse,
+    summary="Push project codebase to GitHub",
+)
+async def push_project_github(
+    project_id: uuid.UUID,
+    payload: GitHubPushRequest,
+    request: Request,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> GitHubPushResponse:
+    """Push the project's codebase directly to a new or existing GitHub repository."""
+    await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    github_service = getattr(request.app.state, "github_link_service", None)
+    if github_service is None:
+        raise RuntimeError("app.state.github_link_service is not composed")
+
+    return await push_project_to_github(
+        session,
+        project_id=project_id,
+        principal=principal,
+        github_service=github_service,
+        req=payload,
+    )
+
+
+@router.get(
+    "/{project_id}/vercel/config-check",
+    response_model=VercelConfigCheckResponse,
+    summary="Check project Vercel deployment configuration",
+)
+async def check_project_vercel(
+    project_id: uuid.UUID,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> VercelConfigCheckResponse:
+    """Inspect project files and framework to determine if vercel.json is needed."""
+    await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    return await check_project_vercel_config(session, project_id=project_id)
+
+
+@router.post(
+    "/{project_id}/vercel/deploy",
+    response_model=VercelDeployResponse,
+    summary="Deploy project to Vercel",
+)
+async def deploy_project_vercel(
+    project_id: uuid.UUID,
+    payload: VercelDeployRequest,
+    principal: Annotated[Principal, Depends(require_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> VercelDeployResponse:
+    """Deploy the project's codebase to Vercel and return the live deployment URL."""
+    project = await load_visible_project(session, project_id=project_id, tenant_id=principal.tenant_id)
+    return await deploy_project_to_vercel(
+        session,
+        project_id=project_id,
+        project_name=project["name"],
+        principal=principal,
+        req=payload,
+    )

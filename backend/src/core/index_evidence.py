@@ -1,0 +1,272 @@
+# SPDX-License-Identifier: FSL-1.1-ALv2
+"""The repository facts a readiness score is computed from, and the query that reads them.
+
+WHY THIS IS IN `core` AND NOT IN EITHER DOMAIN
+
+Two domains need it and §2.2.1 bans them from importing each other. `analysis` owns the tables the
+evidence is read from (`file_tree`, `file_contents`); `projects` owns the scoring engine that
+consumes it. Putting the type in either one forces the other to import across a domain boundary,
+which `scripts/check-chokepoint.sh` rejects by parsing the import graph — and rightly, because the
+ban is what keeps a domain replaceable. `src.core` is the sanctioned shared floor.
+
+The alternative considered and rejected was passing a plain `dict`. A dict would type-check
+everywhere and drift silently: the engine reads `paths` and `contents` with specific normalisation
+rules, and a caller that spelled a key differently would score every project as unindexed rather
+than fail. A frozen model makes the contract checkable at the boundary.
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import Mapping
+from typing import Final
+
+from pydantic import BaseModel, Field
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+#: The files whose BODIES the score depends on, as SQL LIKE patterns against a lowercased path.
+#:
+#: A path alone cannot answer "is this a multi-stage build" or "does this container run as non-root";
+#: only the body can. Loading every body to answer six questions would read the whole repository out
+#: of the database on every readiness request, so the set is explicit and small.
+CONTENT_PATTERNS: Final[tuple[str, ...]] = (
+    "%dockerfile%",
+    "%docker-compose%.yml",
+    "%docker-compose%.yaml",
+    "%.github/workflows/%",
+    "%k8s/%.yaml",
+    "%k8s/%.yml",
+    # Widened for FR-20. The three Kubernetes checks PARSE the manifest, so the body has to be loaded —
+    # and manifests live under more than one conventional directory. Without these the checks would read
+    # an empty body and report every repository as unbounded: the fail-closed direction, but not a true
+    # answer, and a readiness score that is wrong in the pessimistic direction is still wrong.
+    "%kubernetes/%.yaml",
+    "%kubernetes/%.yml",
+    "%manifests/%.yaml",
+    "%manifests/%.yml",
+    "%deploy/%.yaml",
+    "%deploy/%.yml",
+    "%deployment/%.yaml",
+    "%deployment/%.yml",
+    "%charts/%/templates/%.yaml",
+    # Widened for the cross-category checks. `env_example_matches_the_deployment` compares the NAMES in
+    # the committed example against the names the compose file and the container specs pass, so the
+    # example's body has to be loaded — a path alone cannot answer which variables it documents.
+    #
+    # Names only ever leave this file. §7.11 keeps values out of anything persisted, and a value in a
+    # committed example is a placeholder by definition, so comparing values would compare two things
+    # that are both deliberately not the truth.
+    "%.env.example",
+    "%.env.sample",
+    "%.env.template",
+    "%example.env",
+    # ── Widened again, for the two checks that stopped being presence checks ──────────────────────────
+    #
+    # `automated_tests_present` (35 points) passed on a PATH matching `tests/`, and
+    # `centralised_configuration` (25) on a DIRECTORY existing. Both are now answered by reading the
+    # source: a test file has to declare a case and assert something that can fail, and every
+    # environment read has to happen in the configuration module. Neither question can be answered from
+    # a path, so the bodies have to be here.
+    #
+    # THE COST IS REAL AND IS THE POINT OF THIS COMMENT. The set above was kept "explicit and small" so a
+    # readiness request would not read the whole repository out of the database. Source files are not a
+    # handful, and on a large repository this is the most expensive part of the request. It is here
+    # anyway because the alternative measured worse: without these bodies the strengthened checks see no
+    # test content and no environment reads, so `automated_tests_present` fails every project that has
+    # tests and `centralised_configuration` passes every project that scatters its configuration - the
+    # first wrong pessimistically, the second wrong in the direction that reopens the hole the
+    # strengthening closed.
+    #
+    # The right long-term answer is to have the agent count env reads during the scan, where the source
+    # already is, and persist the counts - the same shape as `redaction_count`. That is a protocol change
+    # and is not this.
+    "%test%.py",
+    "%test%.js",
+    "%test%.ts",
+    "%test%.jsx",
+    "%test%.tsx",
+    "%spec%.js",
+    "%spec%.ts",
+    "%_test.go",
+    "%.py",
+    "%.js",
+    "%.jsx",
+    "%.ts",
+    "%.tsx",
+    "%.mjs",
+    "%.cjs",
+    # Dependency manifests. The reconciliation reads the DECLARATIONS out of these, so a path alone
+    # cannot answer it — "package.json exists" and "package.json declares express" are different facts
+    # and only the second can be compared against what the code imports.
+    #
+    # Lockfiles are deliberately NOT here. They are large, and the only question asked of them is
+    # whether one exists, which a path answers.
+    "%requirements.txt",
+    "%pyproject.toml",
+    "%package.json",
+    "%go.mod",
+    "%cargo.toml",
+    "%gemfile",
+    "%composer.json",
+    # A3. `iac_remote_state_configured` calls `_content_of(..., _IAC_PATTERNS)` and searches the body for a
+    # `backend "` block — and NO `.tf` FILE WAS EVER CONTENT-INDEXED, so the body was empty for every
+    # project ever scored and the check failed for all of them. A project with a perfectly good S3 backend
+    # and a DynamoDB lock table was told its state was written locally.
+    #
+    # This is the same class of defect as `analysis_reports.inventory`: a reader written against data the
+    # writer never produced. The check was not wrong, and neither was its evidence — the two were never
+    # connected.
+    "%.tf",
+    "%.tofu",
+    "%.tfvars",
+    "%.bicep",
+)
+
+
+class IndexEvidence(BaseModel):
+    """The repository facts a score may be computed from.
+
+    Deliberately not a `Project` or a session: the engine is pure, so the same evidence always
+    produces the same score and the property test (Q-18) can construct evidence directly rather
+    than through a database.
+    """
+
+    #: Slash-separated repository-relative paths from `file_tree`.
+    paths: tuple[str, ...] = ()
+    #: `file_contents.content` (REDACTED text) keyed by lowercased path, for the decision-relevant
+    #: files only. Content is needed for multi-stage and non-root, which a path cannot answer.
+    contents: Mapping[str, str] = Field(default_factory=dict)
+    #: An explicit statement about test presence. `None` means "derive it from the paths", which is
+    #: the honest default — the field exists because a caller may know something the path list does
+    #: not, NOT so that it can be assumed true.
+    has_tests: bool | None = None
+    #: `file_contents.redaction_count` keyed by path, for files where it is above zero (FR-42).
+    #:
+    #: A redaction IS a secret finding: the agent's scanner matched something, and the body that reached
+    #: the database has a marker where the value was. That evidence has been persisted since revision
+    #: `0003` and nothing read it, so "secret scanning of the codebase" happened on every index and was
+    #: invisible afterwards — which is what made FR-42 partial.
+    #:
+    #: COUNTS, NEVER VALUES. §7.11 puts `file_contents` in the "redacted text only" class, and the whole
+    #: point of the redaction is that the value did not survive. A count and a path are enough to send an
+    #: operator to the line.
+    redaction_counts: Mapping[str, int] = Field(default_factory=dict)
+    #: `(source_path, raw_specifier, resolved)` from `file_dependencies`, for the reconciliation.
+    #:
+    #: This is what makes "the code imports a package no manifest declares" checkable. The rows have
+    #: existed since revision `0003` and the score never read them, so a build that worked only on the
+    #: machine where somebody had pip-installed the missing package was invisible to the report.
+    #:
+    #: `resolved` is the load-bearing member: True means the import pointed at another file in this
+    #: repository and is therefore not a dependency at all. Without it every relative import would be
+    #: reported as a missing package.
+    #:
+    #: THE SOURCE PATH IS CARRIED rather than the row's `kind`, and that is not cosmetic. Without it every
+    #: unresolved specifier is offered to every ecosystem, and `fastapi` is a perfectly valid npm package
+    #: name — so a pure Python project was reported as having undeclared Node dependencies. The importing
+    #: file's extension is the only thing that says which ecosystem an import belongs to.
+    #: `(path, kind, tool, status, error_count, detail, line)` from `scan_artifact_validations`.
+    #:
+    #: WHAT THIS CLOSES. Six real validators run on the agent and every one of them only ever judged
+    #: GENERATED files, because `validations` is keyed by `change_item_id` and had no rows. So a
+    #: hand-written `docker-compose.yml` was scored on whether its PATH existed while `docker compose
+    #: config` — installed, on the same machine, during the same scan — was never asked.
+    #:
+    #: AN EMPTY TUPLE MEANS NOT CHECKED, NEVER PASSED. An older agent reports no validations at all, and a
+    #: newer one reports `tool_missing` for a binary the developer has not installed. Both are "unknown",
+    #: and the checks built on this must emit nothing rather than a pass — the agent's own validator package
+    #: exists because the implementations it replaced fabricated passes for anything they did not
+    #: understand, and reproducing that here would move the same defect one layer up.
+    artifact_validations: tuple[tuple[str, str, str, str, int, str, int | None], ...] = ()
+
+    dependency_specifiers: tuple[tuple[str, str, bool], ...] = ()
+
+    model_config = {"frozen": True}
+
+
+async def load_index_evidence(session: AsyncSession, *, project_id: uuid.UUID) -> IndexEvidence:
+    """Read the project's indexed paths, plus the bodies the score depends on.
+
+    Two statements rather than one join: the path list is every row and the body list is a handful,
+    so a single join would carry every file's content for the sake of six of them.
+
+    An unindexed project yields empty evidence rather than an error. That is what makes the score
+    honest: `ReadinessEngine` reports `indexed=False` and a zero, instead of the caller having to
+    decide what an exception means.
+    """
+    path_rows = await session.execute(
+        text("SELECT path FROM file_tree WHERE project_id = :project_id ORDER BY path"),
+        {"project_id": project_id},
+    )
+    paths = [str(row[0]) for row in path_rows]
+
+    content_rows = await session.execute(
+        text(
+            "SELECT f.path, c.content FROM file_contents c JOIN file_tree f ON f.id = c.file_id "
+            "WHERE f.project_id = :project_id AND ("
+            + " OR ".join(f"lower(f.path) LIKE :p{i}" for i in range(len(CONTENT_PATTERNS)))
+            + ")"
+        ),
+        {"project_id": project_id, **{f"p{i}": pattern for i, pattern in enumerate(CONTENT_PATTERNS)}},
+    )
+    contents = {str(row[0]).replace("\\", "/").lower(): str(row[1]) for row in content_rows}
+
+    # A third statement, and a deliberately narrow one: only the files with a redaction, which in a clean
+    # repository is none. `WHERE c.redaction_count > 0` rather than reading every row and filtering here,
+    # because the interesting set is small and the whole table is not.
+    redaction_rows = await session.execute(
+        text(
+            "SELECT f.path, c.redaction_count FROM file_contents c JOIN file_tree f ON f.id = c.file_id "
+            "WHERE f.project_id = :project_id AND c.redaction_count > 0 ORDER BY c.redaction_count DESC, f.path"
+        ),
+        {"project_id": project_id},
+    )
+    redaction_counts = {str(row[0]).replace("\\", "/"): int(row[1]) for row in redaction_rows}
+
+    # A FOURTH statement, for the dependency graph.
+    #
+    # JOINED TO `file_tree` FOR THE PATH, not merely to scope by project. The importing file's extension
+    # is what says which ecosystem an import belongs to, and without it every unresolved specifier is
+    # offered to every ecosystem — `fastapi` is a legal npm package name, so a pure Python project was
+    # reported as having undeclared Node dependencies. No content is carried; the path, the specifier and
+    # the resolved flag are all the reconciliation needs.
+    dependency_rows = await session.execute(
+        text(
+            "SELECT f.path, d.raw_specifier, d.resolved FROM file_dependencies d "
+            "JOIN file_tree f ON f.id = d.from_file_id "
+            "WHERE d.project_id = :project_id ORDER BY f.path, d.raw_specifier"
+        ),
+        {"project_id": project_id},
+    )
+    specifiers = tuple((str(row[0]), str(row[1]), bool(row[2])) for row in dependency_rows)
+
+    # A FIFTH statement, for what the external tools said about the artifacts this repository already has.
+    validation_rows = await session.execute(
+        text(
+            "SELECT path, kind, tool, status, error_count, detail, line "
+            "FROM scan_artifact_validations WHERE project_id = :project_id "
+            "ORDER BY path, kind"
+        ),
+        {"project_id": project_id},
+    )
+    validations = tuple(
+        (
+            str(row[0]).replace("\\", "/"),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+            int(row[4] or 0),
+            str(row[5] or ""),
+            int(row[6]) if row[6] is not None else None,
+        )
+        for row in validation_rows
+    )
+
+    return IndexEvidence(
+        paths=tuple(paths),
+        contents=contents,
+        redaction_counts=redaction_counts,
+        dependency_specifiers=specifiers,
+        artifact_validations=validations,
+    )

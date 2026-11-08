@@ -1,0 +1,259 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+"use client";
+
+import { useState } from "react";
+import {
+  categoryLabel,
+  type ReadinessCheck,
+  type ReadinessReport,
+} from "@/features/projects/types";
+
+/**
+ * The six categories, each expanding into the checks behind its score — phases.md §1.4, PRD FR-19.
+ *
+ * The radar chart shows six numbers. A number with nothing behind it cannot be acted on: "Security
+ * 40" tells an operator they have a problem and not what it is, and worse, it is unfalsifiable — a
+ * category at 40 with no visible evidence is indistinguishable from a bug in the scorer.
+ *
+ * So each category expands into its individual checks, and each check carries three things the backend
+ * already computes and nothing rendered: whether it passed, the INDEXED PATH that satisfied it
+ * (`evidence`), and PRD FR-19's "why it matters". The evidence is what makes the score auditable, and
+ * the why is what makes it teach rather than merely grade.
+ *
+ * The grouping is derived from the checks themselves rather than from a list of category names held
+ * here. A category the engine scores but for which no check exists would otherwise be invisible, and
+ * a check in a category this file did not know about would be dropped — both silently.
+ */
+export function ReadinessBreakdown({ report }: { report: ReadinessReport }) {
+  // Which categories are open. A Set rather than one open-at-a-time, because comparing two weak
+  // categories is the normal reason to open them and an accordion that closes the first would make
+  // that impossible.
+  const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
+
+  /*
+   * THE TWO SIDES NAME THE SAME CATEGORY DIFFERENTLY, and this is where they are reconciled.
+   *
+   * `ReadinessBreakdown` on the backend is a model whose FIELDS are the scores, so its keys arrive as
+   * `containerization_score`. `ReadinessCheck.category` is the category itself, so it arrives as
+   * `containerization`. Grouping on the raw strings therefore produced TWO entries for every
+   * category — one carrying a score and "no checks recorded", one carrying the checks and no score —
+   * and expanding the first showed the "gap in the report" message for a report that had no gap.
+   *
+   * Found by running it: `e2e/onboarding.spec.ts` opened the panel against a real scored project and
+   * the breakdown had twelve rows for six categories. A unit test with a fixture cannot catch this,
+   * because the fixture is written by whoever holds the misconception.
+   *
+   * Normalising by stripping a trailing `_score` is the fix rather than renaming either side: the
+   * suffix is an artefact of the score living in a field name, and `categoryLabel` already strips it
+   * for display, so the normalised form is the one the UI has always shown.
+   */
+  const normalise = (key: string) => key.replace(/_score$/, "");
+
+  const byCategory = new Map<string, ReadinessCheck[]>();
+  // `?? []` rather than trusting the field to be present. It is non-optional in the response model,
+  // but a render-time `for...of` over `undefined` throws inside React's commit phase, and there is no
+  // error boundary between here and the page — so one older backend, or one field renamed on the
+  // wire, would blank the whole readiness screen rather than degrade this panel. An empty breakdown
+  // is a recoverable disappointment; a white page is not.
+  for (const check of report.checks ?? []) {
+    const key = normalise(check.category);
+    const existing = byCategory.get(key);
+    if (existing) existing.push(check);
+    else byCategory.set(key, [check]);
+  }
+
+  const scoreByCategory = new Map<string, number>(
+    Object.entries(report.categories).map(([key, score]) => [normalise(key), score]),
+  );
+
+  // Ordered by the engine's own category keys so the list matches the radar chart's order, with any
+  // category that has checks but no score appended rather than dropped.
+  const categories = [
+    ...scoreByCategory.keys(),
+    ...[...byCategory.keys()].filter((key) => !scoreByCategory.has(key)),
+  ];
+
+  if (!report.indexed) {
+    return (
+      <div
+        role="status"
+        className="rounded-lg border border-border bg-background p-4 text-sm text-muted-foreground"
+      >
+        There is nothing to break down: this project has no indexed files, so no check has been
+        evaluated. Every category reads zero because nothing was measured, not because everything
+        failed. Scan the project and the breakdown appears here.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2" data-testid="readiness-breakdown">
+      {categories.map((key) => {
+        const checks = byCategory.get(key) ?? [];
+        const score = scoreByCategory.get(key);
+        const isOpen = open.has(key);
+        const passed = checks.filter((c) => c.passed).length;
+        const panelId = `readiness-checks-${key}`;
+
+        return (
+          <div key={key} className="rounded-lg border border-border bg-background">
+            <h3>
+              <button
+                type="button"
+                // A real disclosure: `aria-expanded` on the trigger and `aria-controls` pointing at
+                // the region it reveals, so the relationship is announced rather than only visible.
+                aria-expanded={isOpen}
+                aria-controls={panelId}
+                data-testid={`category-toggle-${key}`}
+                onClick={() =>
+                  setOpen((current) => {
+                    const next = new Set(current);
+                    if (next.has(key)) next.delete(key);
+                    else next.add(key);
+                    return next;
+                  })
+                }
+                className="flex w-full items-center justify-between gap-4 p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <span className="flex items-baseline gap-3">
+                  <span className="text-sm font-semibold">{categoryLabel(key)}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {checks.length === 0
+                      ? "no checks recorded"
+                      : `${passed} of ${checks.length} check${checks.length === 1 ? "" : "s"} passing`}
+                  </span>
+                </span>
+                <span className="flex items-center gap-3">
+                  <span className="text-sm font-medium" data-testid={`category-score-${key}`}>
+                    {score === undefined ? "—" : `${score}/100`}
+                  </span>
+                  <span aria-hidden="true" className="text-xs text-muted-foreground">
+                    {isOpen ? "▲" : "▼"}
+                  </span>
+                </span>
+              </button>
+            </h3>
+
+            {isOpen ? (
+              <div id={panelId} className="border-t border-border p-4">
+                {checks.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">
+                    This category has a score but the report carried no individual checks for it, so
+                    there is nothing to show. That is a gap in the report rather than a passing
+                    category, and it is stated rather than filled in.
+                  </p>
+                ) : (
+                  <ul className="space-y-3">
+                    {checks.map((check) => (
+                      <li key={check.id} className="text-sm" data-testid={`check-${check.id}`}>
+                        <div className="flex flex-wrap items-baseline justify-between gap-2">
+                          <p className="font-medium">
+                            {/* The word, not only the colour — a red dot is invisible to a
+                                colour-blind reader and to a screen reader alike. */}
+                            <span className={check.passed ? "text-emerald-600" : "text-amber-600"}>
+                              {check.passed ? "Pass" : "Fail"}
+                            </span>{" "}
+                            <span>{check.id}</span>
+                          </p>
+                          <span className="text-xs text-muted-foreground">
+                            {check.points} of {check.max_points} points
+                          </span>
+                        </div>
+                        {/*
+                          A PASS AND A FAILURE NEED DIFFERENT THINGS SAID.
+
+                          A pass is fully described by the file that satisfied it. A failure used to
+                          render "Evidence:" followed by nothing — every call site blanked evidence on
+                          failure — and then a sentence of principle that said nothing about this
+                          repository. A reader who did not already know the answer had a red row and
+                          nowhere to go.
+                        */}
+                        {check.passed ? (
+                          <p className="mt-1 text-muted-foreground">
+                            <span className="font-medium">Evidence: </span>
+                            {check.evidence || "no path recorded"}
+                          </p>
+                        ) : (
+                          <dl className="mt-1 space-y-0.5 text-muted-foreground">
+                            <div>
+                              <dt className="inline font-medium">Looked for: </dt>
+                              <dd className="inline">{check.looked_for || "not stated"}</dd>
+                            </div>
+                            <div>
+                              <dt className="inline font-medium">Looked in: </dt>
+                              <dd className="inline">{check.looked_in || "not stated"}</dd>
+                            </div>
+                            <div>
+                              <dt className="inline font-medium">Found: </dt>
+                              <dd className="inline" data-testid={`found-${check.id}`}>
+                                {check.found || "not stated"}
+                                {/* Only when the check parsed something with lines. An absence has no
+                                    line, and a number here would send a reader to the wrong place. */}
+                                {typeof check.line === "number" ? (
+                                  <span className="ml-1 font-mono text-xs">
+                                    (line {check.line})
+                                  </span>
+                                ) : null}
+                              </dd>
+                            </div>
+                            {check.remedy ? (
+                              <div className="pt-1">
+                                <dt className="font-medium">
+                                  Fix{check.remedy_path ? ` in ${check.remedy_path}` : ""}:
+                                </dt>
+                                {/* Pre-formatted: a remedy carries a block of configuration to paste,
+                                    and collapsing its whitespace would make it unusable. */}
+                                <dd>
+                                  <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded bg-muted/50 p-2 text-xs">
+                                    {check.remedy}
+                                  </pre>
+                                </dd>
+                              </div>
+                            ) : null}
+                          </dl>
+                        )}
+                        <p className="mt-0.5 text-muted-foreground">
+                          <span className="font-medium">Why it matters: </span>
+                          {check.why_it_matters}
+                        </p>
+                        {/*
+                          THE PER-CHECK GENERATION POSITION, replacing a single blanket sentence that
+                          claimed generation could not raise the score at all. It said that while 22 of
+                          the 29 checks are in fact generatable, and gave no reason for the seven that
+                          are not.
+                        */}
+                        {!check.passed && check.generatable === false && check.blocked_because ? (
+                          <p
+                            className="mt-0.5 text-muted-foreground"
+                            data-testid={`blocked-${check.id}`}
+                          >
+                            <span className="font-medium">Generation cannot do this: </span>
+                            {check.blocked_because}
+                            {check.partial_offer
+                              ? ` It can still produce ${check.partial_offer}.`
+                              : ""}
+                          </p>
+                        ) : null}
+                        {!check.passed && check.generatable ? (
+                          <p
+                            className="mt-0.5 text-muted-foreground"
+                            data-testid={`generatable-${check.id}`}
+                          >
+                            <span className="font-medium">Generation can do this. </span>
+                            {check.partial_offer
+                              ? `With one caveat: ${check.partial_offer}.`
+                              : "It can produce the change in full."}
+                          </p>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}

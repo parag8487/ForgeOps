@@ -1,8 +1,14 @@
 # ForgeOps Architecture — Phase 0
 
+> **Update (2026-10-13):** The title and foundation sections describe **Phase 0**, with Phase 1 additions
+> detailed below. For the authoritative, comprehensive Phase 2 architecture—including the Autonomous
+> Deployment Engine, G1–G7 verification gates, G8 bounded self-healing, port authority hierarchy, and
+> multi-target deployment strategies (Docker, GitHub, Vercel)—refer to the master technical reference:
+> [FORGEOPS_PROJECT_MASTER_DOCUMENT.md](file:///C:/IMP/antigravity-cli/Major%20Project/Devops%20Automation/FORGEOPS_PROJECT_MASTER_DOCUMENT.md).
+
 Repository: `github.com/parag8487/ForgeOps`. This document describes what Phase 0
 actually builds, what it deliberately leaves out, and the cross-cutting contracts every
-later phase inherits. Authority: `.kiro/specs/phase-0-foundation/design.md` §1–§6.
+later phase inherits. Authority: `.antigravity/specs/phase-0-foundation/design.md` §1–§6.
 
 ## Scope boundary
 
@@ -98,11 +104,12 @@ exists only under the `tools` profile to carry OpenTofu for IaC integration test
 
 ## What runs after `docker compose up -d --wait`
 
-Compose project name is `forgeops`. The unprofiled default set is exactly five services:
-`postgres`, `redis`, `opa`, `backend`, `frontend`. Optional profiles are separate and are
-verified only after their owning implementation exists: `vault` (Infisical) and `tools`
-(`agent-dev` with OpenTofu). Every service loads the committed `.env.example` as required
-and an optional `.env` as an override, so a fresh clone starts without any manual step.
+Compose project name is `forgeops`. In the current implementation, **14 services are declared** in `docker-compose.yml`, with **10–14 active** in the default unprofiled set without requiring manual flags:
+
+- Core services: `postgres` (PostgreSQL 17 + pgvector), `redis` (Redis Stack 7.4), `opa` (OPA 1.4.2 policy server), `cerbos` (Cerbos 0.54.0 RBAC sidecar), `authentik-server` & `authentik-worker` (Authentik 2026.5.6 OIDC identity provider), `backend` (FastAPI REST API), `backend-agent` (mTLS listener on port 8443 / 18443 for paired agents), `worker` (ARQ distributed task runner), `frontend` (Next.js 16 App Router UI), `ollama` & `ollama-secondary` (local AI model cascade servers with shared weights), `inngest` (durable execution engine).
+- Optional profiles are separate: `vault` (`infisical`), `tools` (`agent-dev` with OpenTofu), and the OTel monitoring tier (`observability` profile: `otel-agent`, `otel-gateway`, `prometheus`, `mimir`, `loki`, `tempo`, `grafana`).
+
+Every service loads the committed `.env.example` as required and an optional `.env` as an override, so a fresh clone starts without any manual step. For Linux/Ubuntu systems, the automated 1-click `./setup.sh` master script installs prerequisites, Docker Engine, sets non-root docker group permissions, handles package locks, and provisions the entire stack.
 
 ## Health versus readiness
 
@@ -174,6 +181,111 @@ since the licence a change lands under depends on the directory it touches.
 | D-5      | `go-git/go-git/v5` for local Git operations, `google/go-github` for the PR REST API                                                                          |
 | D-14     | Project identity ForgeOps; module path `github.com/parag8487/ForgeOps/agent`                                                                                 |
 | D-19     | `FSL-1.1-ALv2` for the repository, `Apache-2.0` for the agent and CLI                                                                                        |
+
+## Phase 1 additions
+
+Everything above describes Phase 0. This section covers the Phase 1 structures that a reader
+of the current tree will otherwise not find documented anywhere. Authority:
+`.antigravity/specs/phase-1-mvp-core/design.md`.
+
+### The tiered semantic cache, L1 and L2
+
+`backend/src/ai/routing/cache.py` implements two tiers behind one `lookup`.
+
+| Tier | Key                                                                  | Admission                                  | `served_from` |
+| :--- | :------------------------------------------------------------------- | :----------------------------------------- | :------------ |
+| L1   | SHA-256 over canonical JSON of `{model, prompt, params}`             | exact match                                | `L1_exact`    |
+| L2   | cosine similarity against a per-model index of stored prompt vectors | `similarity >= threshold` (default `0.95`) | `L2_semantic` |
+
+`lookup` tries L1 first and returns immediately on a hit, so an exact repeat costs no
+embedding call. Only on an L1 miss does it embed the prompt and scan the L2 index.
+
+Four properties of the design are load-bearing rather than incidental:
+
+- **L2 is opt-in.** The embedder is injected as `embed=`. Omit it and the class behaves exactly
+  as the L1-only version did, against the same two-method `AsyncRedisLike` surface. That is what
+  lets `Q-13`'s property test drive the cache with a dict double instead of a mock.
+- **The extra Redis surface is a separate protocol.** L2 needs `hset`/`hgetall` for the vector
+  index, declared on `AsyncRedisWithHashes`. Passing `embed=` with a client that lacks them
+  raises at construction, not on the first miss — a cache that accepted an embedder and then
+  silently never used the index would look like a threshold problem.
+- **The threshold is inclusive.** The comparison is `score < threshold` → reject, so a score of
+  exactly `0.95` is admitted. A strict comparison would make the configured value itself
+  unreachable.
+- **The vector is computed from the `RedactedPrompt`, never from raw text** (D-44), so no
+  unredacted value reaches the embedding provider or the stored index. `Q-13` asserts the key
+  half of that and the same argument covers the vector, which is derived from the same input.
+
+`cosine_similarity` returns `0.0` for a zero-magnitude vector rather than raising: a zero vector
+has no direction, so it is not similar to anything, and `0.0` keeps it below every admissible
+threshold instead of producing a `NaN` whose comparison a reader has to reason about.
+
+**Wired into the running application, and it was not always.** `backend/src/main.py` constructs
+the cache with the embedder and reads the threshold from `settings.semantic_cache_threshold`, so
+a deployment's `SEMANTIC_CACHE_THRESHOLD` is what the cache admits on. That is recent: until
+commit `1ce7267` the factory built `TieredSemanticCache(redis=redis_client)` with no
+embedder, so L2 was unreachable at runtime and the threshold setting was read by nothing, while
+the record claimed criterion 14 met. The history is kept here deliberately — the gap between a
+tested capability and a constructed one is the lesson, and LEARNING-JOURNAL finding 79 carries it.
+
+L2 is enabled only when the embedder is **input-sensitive**. `EmbeddingOrchestrator` falls back to
+a fixed vector that ignores its argument on every path that is not Voyage-with-a-real-key,
+including `bge_m3`; over that fallback every prompt is a near-duplicate of every other and the
+cache would serve an arbitrary stored completion for any question. So an unconfigured or
+placeholder key yields L1 only, logged once at startup, rather than a silently poisoned L2. The
+construction is asserted by `TestTheSemanticCacheIsWiredForL2` in
+`backend/tests/integration/test_wiring_tier_config.py`, on the constructed object rather than on
+call arguments, so the wiring cannot quietly come undone.
+
+### The Phase 1 verification gates
+
+Two scripts decide whether Phase 1 may call itself finished. Both run in the `audit` job of
+`.github/workflows/ci.yml`, and the first also runs as the whole of
+`.github/workflows/mutation-ci.yml`.
+
+| Script                               | Question it answers                                                                                                                                                                                                       |
+| :----------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `scripts/check-mutation-manifest.py` | Does `backend/tests/mutation/mutations.toml` describe every property design Appendix B declares — with a real file behind each row — and do the counters in the root `mutations.toml` match the rows that actually exist? |
+| `scripts/check-progress.sh`          | Does `PROGRESS.md` describe Phase 1 — 14 criteria with non-empty evidence, deliverables 1.1–1.11, `Q-01`…`Q-31` each with a location **and** a control, decisions D-28…D-50 — and is the phase status defensible?         |
+
+Three details are worth knowing before trusting either:
+
+- **`check-progress.sh` used to read Phase 0 only.** Its status-vocabulary check for leaf rows greps
+  rows matching `0.x`, so 90 Phase 1 rows once carried a status the file's own header forbids and the
+  check passed. The Phase 1 block was added by leaf 20.15, which had named it as a deliverable.
+- **The control column rejects placeholders.** `absent`, `blocked`, `does not test`,
+  `imports no production code`, `unreachable` and `tautolog` are all refused, because the honest
+  wording used to _declare_ a missing control had otherwise satisfied the check that _measures_
+  it.
+- **The `completed` clause fails closed.** Before allowing the Phase 1 row to read `completed`
+  the script runs `check-mutation-manifest.py`, and if it cannot find an interpreter it FAILS
+  rather than skipping. An earlier version guarded that call with `command -v python3`, so on a
+  host where the interpreter is named `python` — Git Bash on Windows — the guard short-circuited
+  and the phase was certified on a check that never ran.
+
+Neither script is a formality: `scripts/mutation-harness.py` applies each declared mutation and
+reports a property that survives its own control as `VACUOUS`, and the manifest check is what
+stops a row being declared without one.
+
+## Phase 2 additions — Autonomous Deployment Engine
+
+Phase 2 adds the end-to-end Autonomous Deployment Engine on top of the Phase 0 foundation and Phase 1 MVP core, executing deployments across Docker, GitHub, and Vercel.
+
+Key architectural components implemented:
+
+- **Sequential Verification Gates (G1–G7)**:
+  - **G1 (Blueprint Baseline)**: Strategy constraints validation (`docker_github_vercel`, `docker_github`, `vercel_only`, `github_only`), required target config, workspace path resolution, and R0 baseline readiness assessment.
+  - **G2 (Synthesis & Template Library)**: Existing manifest evaluation or deterministic multi-stage Dockerfile synthesis for Vite, Node.js, Python, and Go with consolidated `ENV` declarations (`ENV NODE_ENV=production PORT=...`), stable tenant/project-scoped npm cache mounts (`id=npm-{clean_tenant}-{clean_proj}`), and R1 post-generation readiness assessment.
+  - **G3 (Cross-artifact Consistency)**: Static pre-execution consistency audit verifying port ranges (1–65535), immutability of reserved environment variables, and enforcement of browser-safe host ports (rejecting all 77 Chromium/WHATWG bad ports including 4045).
+  - **G4 (Build & Compile)**: Direct Docker Engine daemon integration via Unix Domain Socket (`/var/run/docker.sock`) utilizing native **BuildKit HTTP API** (`version=2`) with tar streaming, BuildKit trace streaming (`moby.buildkit.trace`), and protobuf decoding. Evaluates the build graph directly without intermediate container commits (saving 808s on Code Review Platform), with sensitive credential exclusion (`.env*`, `*.pem`, `*.key`), symlink boundary confinement, and automatic graceful fallback to the legacy Docker V1 builder if BuildKit negotiation fails.
+  - **G5 (Apply)**: Container launch via Docker Engine API over Unix Domain Socket with strict runtime port authority, conflict detection with immutable startup commands, and environment variable injection (`PORT`, `HOST=0.0.0.0`).
+  - **G6 (Workload Convergence)**: Real-time container inspect publication check and live HTTP readiness probing with fast-failure on connection refusal or non-200 responses.
+  - **G7 (Final Verification & Cryptographic Receipt)**: Comprehensive multi-target sign-off verifying exact physical container port bindings (`HostConfig.PortBindings`), live remote GitHub commit presence via Git Data API, and Vercel assigned production alias accessibility with SSO redirect bypass and synthetic placeholder rejection.
+- **Port Authority Hierarchy & Browser Safety**: User-configured container ports take absolute authority over inferred ports. Host ports are validated against a 77-entry browser-restricted port list (preventing `ERR_UNSAFE_PORT` blocks such as port 4045).
+- **G8 Bounded Self-Healing Engine**: Automated failure classification and bounded retries (maximum 3 iterations) without application source code mutation.
+- **Multi-Target Deployment Strategies**: Supports Docker (local daemon / UDS), GitHub (Git Data API low-level objects), and Vercel (REST API v13 deployment and v9 alias assignment).
+- **Active Topology**: 14 Compose services declared (10–14 active: `postgres`, `redis`, `opa`, `cerbos`, `authentik-server`, `authentik-worker`, `backend`, `backend-agent`, `worker`, `frontend`, `ollama`, `ollama-secondary`, `inngest`).
+- **Comprehensive Master Reference**: See [FORGEOPS_PROJECT_MASTER_DOCUMENT.md](file:///C:/IMP/antigravity-cli/Major%20Project/Devops%20Automation/FORGEOPS_PROJECT_MASTER_DOCUMENT.md).
 
 ## Reference documents
 

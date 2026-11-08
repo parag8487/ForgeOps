@@ -80,6 +80,12 @@ policies/mcp/gateway.rego'
 
 # Patterns .gitignore must carry: generated output, the local .env, caches and
 # IDE state (design §0.3).
+#
+# `scripts/_*` is here because 258 session scratch files -- `_s1.sh` through `_s21.sh`, `_probe1`
+# through `_probe8`, sixteen draft commit messages -- accumulated on disk during development. They
+# were never committed, because three extension-specific rules happened to cover them, but a
+# `_foo.ps1` or `_foo.mjs` would have gone straight in. The single prefix rule closes that, and
+# requiring it here stops the rule itself from being removed.
 REQUIRED_IGNORES='.env
 __pycache__/
 .pytest_cache/
@@ -88,7 +94,8 @@ node_modules/
 .next/
 dist/
 .terraform/
-.idea/'
+.idea/
+scripts/_*'
 
 if [ ! -f "$CONFIG" ]; then
 	fail "$CONFIG is missing"
@@ -213,16 +220,50 @@ if [ -f "$CONFIG" ]; then
 		done
 	}
 
-	# Only gitleaks may opt out of filename filtering.
-	awk -F'\t' '
-		$1=="hook" && ($3=="always_run" || $3=="pass_filenames") && $2!="gitleaks" {
+	# Hooks that may opt out of filename filtering.
+	#
+	# The rule exists because the top-level `exclude:` is what keeps the four
+	# authoritative root documents out of every MUTATING hook (design §0.3, §14.1),
+	# and a hook that takes no filenames is not subject to that exclusion. So the
+	# exemption is granted only to hooks that cannot rewrite anything:
+	#
+	#   gitleaks         reads staged content, reports, never writes
+	#   check-ci-jobs    reads ci.yml and design.md, compares job names, never writes
+	#   check-no-latest  greps tracked workflows/scripts/Dockerfiles, never writes
+#   check-gitleaks-config  greps .gitleaks.toml for widened allowlists, never writes
+	#   check-chokepoint reachability over both runtimes: parses backend/src/** and
+	#                    queries `go list -deps -json`. A whole-graph question cannot be
+	#                    answered file by file, and it writes nothing (design 2.2.1)
+	#   check-added-shapes  parses `git diff --cached` for credential shapes in ADDED lines
+	#                    (finding 64). The staged diff is one object, not a file list, and a
+	#                    deletion-only commit must still be scanned rather than skipped — so
+	#                    `always_run: true` here is the point of the hook rather than an
+	#                    exemption from filtering. It writes nothing.
+	#   check-phase-references  reads the phase plan for the set of phases and subsection ids that
+	#                    exist, then reads every tracked file for references to one that does not.
+	#                    Both halves make it a whole-tree question: a reference can go stale by an
+	#                    edit to the PLAN alone, with the referring file untouched, so a filename
+	#                    list would miss exactly the case the gate exists for. It writes nothing,
+	#                    and `backend/tests/meta/test_check_phase_references.py` drives it.
+	#
+	# Both Phase 1 additions take fixed arguments rather than a filename list, so
+	# `pass_filenames: true` would append paths and break them. Their read-only
+	# character is asserted mechanically, not just claimed here:
+	# backend/tests/meta/test_regime_end_to_end.py checks that neither hook's entry
+	# carries a rewriting flag, and that no regime check modifies a tracked file.
+	#
+	# Adding a name to this list without that evidence reopens the hole the rule
+	# closes, so the list is deliberately short and each entry is justified above.
+	NON_FILENAME_EXEMPT='gitleaks check-ci-jobs check-no-latest check-gitleaks-config check-chokepoint check-added-shapes check-phase-references'
+	awk -F'\t' -v exempt=" $NON_FILENAME_EXEMPT " '
+		$1=="hook" && ($3=="always_run" || $3=="pass_filenames") && index(exempt, " " $2 " ")==0 {
 			if (($3=="always_run" && $4=="true") || ($3=="pass_filenames" && $4=="false"))
 				print $2 " (" $3 ": " $4 ")"
 		}
 	' "$FACTS" | {
 		while IFS= read -r offender; do
 			[ -n "$offender" ] || continue
-			fail "only gitleaks may bypass filename filtering; offender: $offender"
+			fail "only a documented read-only hook may bypass filename filtering; offender: $offender"
 		done
 	}
 
@@ -298,6 +339,21 @@ fi
 
 # ── 5. .gitignore must ignore generated state and nothing tracked ───────────
 echo 'Checking .gitignore coverage (design §0.3)...'
+
+# An ignore rule stops a scratch file arriving by accident; it does nothing about one added with
+# `git add -f`, or added before the rule existed. This asserts the outcome rather than the
+# precaution: no session scratch file is tracked. The name `scripts/_*` is reserved for throwaway
+# work, so anything under it that is worth keeping should have been given a real name and a header
+# saying what it gates -- which is what happened to `_env.sh` (now `local-env.ps1`), `_gate.sh`
+# (now `leaf-gate.ps1`) and `_state.sh` (now `check-plan-agreement.sh`, wired into CI's audit job).
+TRACKED_SCRATCH=$(git ls-files 'scripts/_*' 2>/dev/null || true)
+if [ -n "$TRACKED_SCRATCH" ]; then
+	printf '%s\n' "$TRACKED_SCRATCH" | while IFS= read -r scratch; do
+		[ -n "$scratch" ] || continue
+		fail "session scratch file is tracked: $scratch (give it a real name and a header, or delete it)"
+	done
+fi
+
 if [ -f "$IGNORE" ]; then
 	printf '%s\n' "$REQUIRED_IGNORES" | {
 		while IFS= read -r pattern; do

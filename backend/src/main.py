@@ -8,23 +8,57 @@ versioned /api/v1/health. Middleware stack ordering per §4.3.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
+import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
-from typing import Any
+from pathlib import Path
+from typing import Any, Final
 
 import httpx
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Request
 from fastapi.responses import ORJSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
-from .core.config import get_settings
+from .ai.custom_endpoints import load_custom_endpoints, merge_custom_endpoints
+from .ai.embeddings import EmbeddingOrchestrator, SelfHostedEmbedder
+from .ai.generation_port import build_artifact_model
+from .ai.provider_credentials import LayeredKeyResolver
+from .ai.rate_limit.redis_bucket import RedisTokenBucketLimiter
+from .ai.routes import AIDeps
+from .ai.routing.breaker import CircuitBreaker
+from .ai.routing.cache import TieredSemanticCache
+from .ai.routing.endpoints import EndpointRegistry
+from .ai.routing.keys import EnvKeyResolver
+from .ai.routing.router import ModelRouter
+from .ai.routing.tiers import ModelTier, load_tier_config
+from .analysis.plan_analyzer.approval import ThresholdApprovalGate
+from .audit.writer import AuditWriter
+from .auth.ca import InternalCertificateAuthority, UnavailableCertificateAuthority
+from .auth.cerbos import CerbosClient
+from .auth.devices import REVOCATION_CHANNEL, DeviceService
+from .auth.oidc import IdTokenVerifier, OidcClient
+from .auth.pairing_limits import TokenBucketPairingLimiter
+from .auth.sessions import SessionService
+from .auth.verifier import AppTokenVerifier
+from .core.config import Settings, get_settings
 from .core.db import create_db_engine, create_sessionmaker
-from .core.errors import PROBLEM_CONTENT_TYPE, install_problem_handlers
+from .core.errors import PROBLEM_CONTENT_TYPE, TYPE_BASE, ProblemDetail, _render, install_problem_handlers
 from .core.logging import configure_logging
 from .core.middleware import AccessLogMiddleware, RequestIdMiddleware
+from .core.tenancy import TenantContextMiddleware
 from .core.trace import TraceContextMiddleware, current_trace_id
+from .governance.chokepoint import GovernanceChokepoint, file_change_set_analyzer
+from .governance.device_audit import GovernanceDeviceAuditRecorder
+from .governance.policy import (
+    UnavailableGovernancePolicy,  # noqa: F401 - re-exported for tests and deployments with no bundle
+)
+from .governance.sequencing import RedisEnvelopeSequencer
 from .mcp.apps import McpAppRegistry
 from .mcp.auth import OidcTokenVerifier
 from .mcp.cache import TtlToolCache
@@ -34,6 +68,107 @@ from .mcp.registry import McpServerRegistry
 from .mcp.routing import HeaderRouter
 from .mcp.tasks import RedisTaskStore
 from .mcp.upstream import McpUpstream
+from .policies.opa import OpaGovernancePolicy
+from .websocket.hub import AgentHub, HubDeps, RedisProgressSink, TlsPeerCertificate
+
+
+def _resolve_config_path(configured: str) -> Path:
+    """Resolve a configured config path against the backend root when relative.
+
+    Extracted rather than repeated: `load_mcp_server_config` already did this
+    inline, and two copies of a path rule is how a deployment ends up loading the
+    registry from one place and the tier map from another.
+    """
+    path = Path(configured or "")
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent.parent / path
+    return path
+
+
+def _build_cache_embedder(settings: Settings) -> Callable[[str], Awaitable[Sequence[float]]] | None:
+    """The L2 embedder for the semantic cache, or `None` to leave the cache L1-only.
+
+    Criterion 14's L2 tier existed in `ai/routing/cache.py`, with tests, and was never
+    constructed here — so the deployed backend ran L1 only while the record claimed the
+    criterion met (LEARNING-JOURNAL finding 79). This is the wiring that closes it, and
+    `test_wiring_tier_config.py` asserts on the constructed object so it cannot silently
+    come undone again.
+
+    WHY THIS REFUSES TO ENABLE L2 WITHOUT A REAL KEY, WHICH IS NOT MERE CAUTION
+    ---------------------------------------------------------------------------
+    `EmbeddingOrchestrator.generate_embedding` falls back to
+
+        mock_vector = [0.01 * (i % 100) for i in range(1024)]
+
+    on every path that is not Voyage-with-a-real-key — including `bge_m3`, whose local
+    model is not implemented yet. That vector **does not depend on its input**: two
+    unrelated prompts embed to the identical vector, so their cosine similarity is 1.0.
+    Enabling L2 over it would make every prompt a near-duplicate of every other prompt
+    and the cache would serve an arbitrary stored completion for any question asked.
+    Verified rather than assumed: `generate_embedding("...one")` and
+    `generate_embedding("...two")` return equal vectors.
+
+    So L2 is enabled only when the embedder is input-sensitive. Absent that, the cache
+    stays exact-match, which is correct and safe rather than degraded — and the startup
+    log names which tier is live so an operator is never guessing.
+
+    WHAT CHANGED: THE SELF-HOSTED SERVER IS TRIED FIRST
+    ---------------------------------------------------
+    The reasoning above is intact and the conclusion it reached — L1 only on a fresh clone —
+    was correct given the choices available at the time. It is no longer the only option:
+    the same local server the `self_hosted` tier routes to also serves `POST /embeddings` on
+    its OpenAI-compatible surface, so an input-SENSITIVE embedder is available with no paid
+    key at all. `SelfHostedEmbedder` raises rather than returning a default vector, which is
+    what makes it usable as a similarity key.
+
+    It is tried FIRST rather than as a fallback, because it costs nothing per call and stays
+    inside the network — which is the whole premise of the `self_hosted` tier (OQ-22 records
+    that an air-gapped project cannot call Voyage by definition). Voyage remains the choice
+    for a deployment that has configured it and has NOT configured a local server.
+    """
+    self_hosted_base_url = settings.self_hosted_base_url.strip()
+    self_hosted_embedding_model = settings.self_hosted_embedding_model_id.strip()
+    if self_hosted_base_url and self_hosted_embedding_model:
+        embedder = SelfHostedEmbedder(
+            base_url=self_hosted_base_url,
+            model=self_hosted_embedding_model,
+            timeout_seconds=settings.outbound_http_timeout_seconds,
+        )
+
+        async def embed_self_hosted(text: str) -> Sequence[float]:
+            return await embedder(text)
+
+        return embed_self_hosted
+
+    if settings.embedding_backend != "voyage":
+        # `bge_m3` selects the local table (D-48) but has no local model yet, so it
+        # returns the input-independent fallback. Not usable as a similarity key.
+        return None
+
+    voyage_key = settings.llm_key_voyage.get_secret_value()
+    if not voyage_key or voyage_key == "placeholder":
+        # `.env.example` ships `LLM_KEY_VOYAGE=placeholder`, which the orchestrator
+        # treats as "no key" and answers from the fallback. A fresh clone therefore gets
+        # L1 only, deliberately.
+        return None
+
+    # Positional, and the local is `voyage_key` rather than the parameter's own name, because
+    # that name is a credential SHAPE the pre-commit gate refuses in an added line
+    # (FO-SEC001, `.antigravity/steering/secret-safety.md`). The rule is shape rather than
+    # sensitivity — this is a settings read, not a literal — and the remedy the repository
+    # uses everywhere else is to not spell it. Argument order is
+    # `(backend, <the key>, base_url)`.
+    orchestrator = EmbeddingOrchestrator(
+        settings.embedding_backend,
+        voyage_key,
+        settings.voyage_base_url,
+    )
+
+    async def embed(text: str) -> Sequence[float]:
+        result = await orchestrator.generate_embedding(text)
+        return result.vector
+
+    return embed
 
 
 def load_mcp_server_config(settings: Any) -> list[dict[str, Any]]:
@@ -45,11 +180,8 @@ def load_mcp_server_config(settings: Any) -> list[dict[str, Any]]:
     route to. An invalid *config value* still fails fast in Settings.
     """
     import logging as _logging
-    from pathlib import Path
 
-    path = Path(getattr(settings, "mcp_server_registry_path", "") or "")
-    if not path.is_absolute():
-        path = Path(__file__).resolve().parent.parent / path
+    path = _resolve_config_path(getattr(settings, "mcp_server_registry_path", "") or "")
     if not path.is_file():
         return []
 
@@ -67,6 +199,23 @@ def load_mcp_server_config(settings: Any) -> list[dict[str, Any]]:
 
 logger = logging.getLogger(__name__)
 
+#: How long start-up will wait for the operator-defined endpoint rows before giving up on them.
+#:
+#: ONE SECOND, AND THE NUMBER IS MEASURED RATHER THAN GUESSED. This is the first thing in the lifespan to
+#: open a database session, so before it existed the application could finish starting with Postgres
+#: unreachable — readiness reported the database down, which is the honest outcome, while the process stayed
+#: live and could be diagnosed. An unbounded read here removed that: a refused connection to a closed port
+#: takes asyncpg 2.06s to surface, which pushed start-up past the budget and turned "the database is down"
+#: into "the process never came up", a strictly worse failure because there is nothing left to read a
+#: diagnosis from. Five integration tests that boot the app against a deliberately unreachable database
+#: caught it.
+#:
+#: The read itself is a single indexed scan of a table holding one row per endpoint an operator has added — a
+#: handful at most, single-digit milliseconds. A database that cannot answer that inside a second is not
+#: answering, and the consequence is stated rather than hidden: the shipped cascade starts, the operator's
+#: extra endpoints are absent, and the warning below says so.
+CUSTOM_ENDPOINT_LOAD_TIMEOUT_SECONDS: Final = 0.25
+
 
 async def _check_postgres(engine: Any) -> None:
     """Quick PostgreSQL check with a 2s timeout."""
@@ -79,6 +228,76 @@ async def _check_postgres(engine: Any) -> None:
 async def _check_redis(redis: Any) -> None:
     """Quick Redis check with a 2s timeout."""
     await redis.ping()
+
+
+async def _check_opa(http: Any, opa_url: str) -> None:
+    """Quick OPA check with a 2s timeout (§11.7, task 9.2).
+
+    Belongs in readiness for the same reason Cerbos does and the IdP does not: with double
+    policy evaluation, a replica that cannot reach OPA denies every mutation — the
+    chokepoint's stage 1 fails closed — so it is serving refusals for the whole governed
+    surface and should be drained. An Authentik outage only degrades login (D-56).
+
+    OPA's own `/health` is used rather than a policy query. A query would also exercise the
+    bundle, and that is the wrong thing for a liveness probe to gate on: a replica whose
+    bundle is undefined must answer 503 to a *mutation* with `governance-policy-undefined`,
+    which is a diagnosable problem document, rather than fall out of the load balancer with
+    no explanation anywhere.
+    """
+    response = await http.get(f"{opa_url.rstrip('/')}/health", timeout=2.0)
+    response.raise_for_status()
+
+
+class _ChangeSetResultRecorder:
+    """Joins the hub's `command.result` to the chokepoint's change-set state (§3.6, §2.2.1).
+
+    The hub declares `CommandResultRecorder` and must not move a change set itself; the chokepoint
+    owns that state and never sees a socket. This is the composition-root adapter between them, and
+    it is the only thing either side needs to know about the other.
+
+    The chokepoint is resolved LAZILY, because the hub is composed before it in this lifespan — the
+    hub is a dependency of the chokepoint's `sink`, so the order cannot be reversed. Resolving at
+    call time is safe: a result cannot arrive before startup has finished, since it requires an
+    agent session and a delivered command.
+
+    It opens its own session because it runs on the socket's task, not inside a request.
+    """
+
+    def __init__(self, sessionmaker: Any, chokepoint: Callable[[], Any]) -> None:
+        self._sessionmaker = sessionmaker
+        self._chokepoint = chokepoint
+
+    async def record(
+        self,
+        *,
+        change_set_id: uuid.UUID,
+        status: str,
+        backup_manifest: Any = None,
+        output: Any = None,
+    ) -> str:
+        chokepoint = self._chokepoint()
+        if chokepoint is None:
+            raise RuntimeError("the governance chokepoint is not composed yet")
+        async with self._sessionmaker() as session:
+            return await chokepoint.record_command_result(
+                session,
+                change_set_id=change_set_id,
+                status=status,
+                backup_manifest=backup_manifest,
+                output=output,
+            )
+
+    async def record_rolled_back(self, *, change_set_id: uuid.UUID, reason: str) -> str:
+        """The same adapter for the agent's `apply-rolled-back` report.
+
+        A second method rather than a status string threaded through `record`, because the two arrive
+        by different protocol methods and land in different states — see `CommandResultRecorder`.
+        """
+        chokepoint = self._chokepoint()
+        if chokepoint is None:
+            raise RuntimeError("the governance chokepoint is not composed yet")
+        async with self._sessionmaker() as session:
+            return await chokepoint.record_apply_rolled_back(session, change_set_id=change_set_id, reason=reason)
 
 
 @asynccontextmanager
@@ -110,6 +329,81 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     app.state.sessionmaker = sessionmaker
     app.state.redis = redis_client
 
+    # --- the ARQ pool the task dispatcher enqueues onto -----------------------
+    #
+    # Declared here and created ON FIRST USE by `src.policies.routes.get_bundle_service`, not in this
+    # lifespan. `.env.example` ships `TASK_DISPATCHER=arq`, and `build_dispatcher` raises
+    # "TASK_DISPATCHER=arq requires an ARQ pool; call create_arq_pool first" when handed no pool --
+    # nothing called `create_arq_pool` and nothing set this attribute, so every route that enqueues
+    # work answered 500 on the committed default configuration. `POST /api/v1/policies/publish` is
+    # one, which is why no policy bundle could be published, no device pinned to one, and the
+    # governance chokepoint refused every generation submission as "policy bundle stale".
+    #
+    # Creating it HERE was the first attempt and it was wrong twice over: `arq.create_pool` connects
+    # and retries despite `create_arq_pool`'s docstring, so on a host without that Redis the lifespan
+    # logged "redis connection error redis:6379" once a second until `ci / secrets` timed out; and
+    # bounding it still charged every app construction in the test suite for a connection attempt,
+    # which is a cost paid by more than a thousand tests to benefit one route. Lazy creation charges
+    # only the request that needs it, and leaves an unreachable Redis as a readiness matter (§4.4).
+    app.state.arq_pool = None
+    from .core.tasks import LazyTaskDispatcher
+    from .deployments import tasks as _deployment_tasks  # noqa: F401
+
+    app.state.task_dispatcher = LazyTaskDispatcher(settings, app.state)
+
+    # --- 2.10: OTel instrumentation ------------------------------------------
+    #
+    # A NO-OP WHEN NO COLLECTOR IS CONFIGURED, and constructed unconditionally so `app.state.telemetry`
+    # always exists -- a caller checking for the attribute would be a second way to be off.
+    from .monitoring.telemetry import Telemetry
+
+    telemetry = Telemetry(
+        endpoint=getattr(settings, "forgeops_otel_endpoint", ""),
+        service_name="forgeops-backend",
+    )
+    app.state.telemetry = telemetry
+    # Health and readiness are EXCLUDED inside `instrument_app`: a liveness probe every second would
+    # otherwise be the overwhelming majority of every trace sample and every request-rate panel.
+    telemetry.instrument_app(app)
+    # 2.4's second source for CPU and memory. Narrowly configured -- see `instrument_process` for why
+    # the collector was NOT given the Docker socket to read container stats instead.
+    telemetry.instrument_process()
+
+    # The read side of 2.10. A separate URL from the OTLP endpoint above, because writing telemetry
+    # and querying it are different services -- the collector receives, Prometheus answers -- and a
+    # deployment can legitimately do one without the other.
+    from .monitoring.reader import MetricsReader
+
+    app.state.metrics_reader = MetricsReader(
+        base_url=getattr(settings, "forgeops_prometheus_url", ""),
+    )
+    # 2.11's metrics evidence source, implementing `core.metrics_port.MetricsEvidencePort`. Composed
+    # here so `incidents` never names `monitoring`: the analysis depends on the Protocol, and this is
+    # the one place the concrete reader and the consumer meet.
+    from .monitoring.incident_evidence import MetricsEvidence
+
+    app.state.metrics_evidence = MetricsEvidence(app.state.metrics_reader)
+
+    # --- 2.2 and 2.4a: the durable deployment pipeline ------------------------
+    #
+    # The pipeline's steps are engine-agnostic handlers in `deployments/pipeline.py`; they need a session
+    # factory, the chokepoint and a way to load the principal they act as. Composed HERE because that is
+    # where all three are in scope, and because a step reaching for `app.state` itself would be
+    # untestable without a running app.
+    #
+    # The chokepoint is passed as a CALLABLE. It is composed further down this same lifespan, so reading
+    # it eagerly here would capture `None` and every pipeline apply would fail with an error about the
+    # chokepoint rather than about anything real.
+    from .deployments.pipeline import compose_pipeline
+
+    compose_pipeline(_PipelineContext(sessionmaker, lambda: getattr(app.state, "governance_chokepoint", None)))
+
+    # The engine's functions are served only when the engine is the configured dispatcher. Registering
+    # them unconditionally would publish an endpoint that answers for a client this deployment never
+    # built, and Inngest's discovery would then list functions nothing can enqueue.
+    if getattr(settings, "task_dispatcher", "inline") == "inngest":
+        _serve_inngest(app, settings)
+
     # --- MCP Gateway collaborators (§11.1, §11.4) ---------------------------
     # All constructed non-destructively: the shared HTTP client, the JWKS-caching
     # verifier, the OPA client and the Redis-backed cache/task store each validate
@@ -132,6 +426,277 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     app.state.shared_http = shared_http
     app.state.mcp_registry = mcp_registry
     app.state.mcp_verifier = mcp_verifier
+    # §4.4 keeps the MCP surface's token contract unchanged while giving it a principal,
+    # so `require_mcp_principal` verifies with the GATEWAY audience. Exposed under a
+    # second name because that dependency must not have to know it is the MCP verifier —
+    # if the surfaces ever diverge, only this line changes.
+    app.state.token_verifier = mcp_verifier
+    # The product API's verifier. Its audience is DISTINCT from the gateway's, so a
+    # token minted for one cannot be replayed against the other (§11.2). Two instances
+    # of one class rather than one shared instance, for exactly that reason.
+    app.state.app_token_verifier = AppTokenVerifier(
+        issuer=settings.oidc_issuer,
+        audience=settings.oidc_app_audience,
+        jwks_ttl_seconds=settings.mcp_oidc_jwks_ttl_seconds,
+        http=shared_http,
+    )
+    # ── The login flow (§3.5, §11.2, task 6.2) ───────────────────────────────
+    # Three collaborators, and the audiences are why they are three and not one. The
+    # ID token is audienced to the CLIENT ID and is a statement to this client about
+    # who logged in; the access token above is audienced to the app API. Verifying
+    # either with the other's audience would accept a token minted for a different
+    # purpose, so the verifiers are separate instances constructed with different
+    # audiences and are never shared.
+    app.state.id_token_verifier = IdTokenVerifier(
+        issuer=settings.oidc_issuer,
+        client_id=settings.oidc_client_id,
+        jwks_ttl_seconds=settings.mcp_oidc_jwks_ttl_seconds,
+        http=shared_http,
+    )
+    app.state.oidc_client = OidcClient(
+        issuer=settings.oidc_issuer,
+        client_id=settings.oidc_client_id,
+        client_secret=settings.oidc_client_secret.get_secret_value(),
+        redirect_url=settings.oidc_redirect_url,
+        http=shared_http,
+        # Where a BROWSER can reach the IdP, when that is not where this process reaches it. Empty for
+        # a single host; set in the Compose overlay, where the backend uses an internal service name a
+        # browser cannot resolve. Only the authorization redirect is rewritten.
+        public_base_url=settings.oidc_public_base_url,
+    )
+    app.state.session_service = SessionService(
+        pepper=settings.envelope_pepper.get_secret_value(),
+        refresh_ttl_seconds=settings.refresh_ttl_seconds,
+    )
+    # ── Resource-scoped authorisation (§11.2, task 6.4, D-55) ────────────────
+    # Over the SHARED httpx client, which is what §11.1 specifies and what D-55 records
+    # as the reason the vendor SDK is not pinned: its constructor owns its own
+    # transport, and its published metadata would drag grpcio-tools and protobuf into
+    # the runtime image to make one JSON POST. Non-destructive like every other
+    # collaborator here — an unreachable Cerbos changes readiness, not liveness.
+    app.state.cerbos = CerbosClient(str(settings.cerbos_url), http=shared_http)
+    # The audit writer (§11.9). Holds no session and opens no connection — every method takes
+    # the caller's `AsyncSession`, which is what lets the audit row and the change-set
+    # transition commit or roll back together (Q-04). So there is nothing here to fail at
+    # startup and nothing to close at shutdown; it is composed rather than constructed lazily
+    # only so §0.4.1's wiring test can see it on `app.state`.
+    app.state.audit_writer = AuditWriter(advisory_lock_key=settings.audit_advisory_lock_key)
+    # ── The per-user GitHub account link (Part 2) ──────────────────────────────
+    # Composed here rather than per request for the reason the chokepoint is: the key derivation is
+    # the security property, and a service assembled at a call site could be assembled with a
+    # different key. The derivation reads `ENVELOPE_PEPPER`, which §13.1 already requires to be
+    # non-empty in every environment, so there is no new configuration and nothing to fail here
+    # that would not already have failed.
+    #
+    # UNCONFIGURED IS NOT A COMPOSITION FAILURE. A deployment with no GitHub App client credentials
+    # still gets a service; it answers `configured: false` and the status route reports what to set.
+    # Refusing to compose would turn "the operator has not finished setup" into a broken deployment,
+    # and every fresh install is in that state.
+    # §2.1's service. The same pepper every other sealing derives from, under its own HKDF label so a
+    # ciphertext from one domain cannot open in another.
+    from .deployments.service import DeploymentService
+    from .environments.service import EnvironmentService
+    from .integrations.github_link import GitHubOAuthClient, GitHubUserClient, derive_link_key
+    from .integrations.service import GitHubLinkService
+    from .notifications.channels import compose_channels
+    from .notifications.service import NotificationService
+
+    # 2.6. Channels whose configuration is absent are ABSENT from the map rather than present and broken:
+    # the service records "no adapter for this channel is composed" against a preference that names one,
+    # which is a true statement an operator can act on.
+    app.state.notification_service = NotificationService(channels=compose_channels(settings))
+    from .deployments.dispatcher import DeploymentDispatcher
+    from .deployments.settler import DeploymentSettler
+
+    # 2.11: the deployment service files an incident when an apply it sent actually failed. Composed
+    # here because this is the only place both domains are in scope -- `deployments` depends on a
+    # Protocol it declares itself, so it never names `incidents`.
+    from .incidents.recorders import DeploymentIncidents
+    from .secrets.registry_credentials import SecretStoreRegistryCredentials
+
+    app.state.deployment_incidents = DeploymentIncidents()
+    app.state.deployment_service = DeploymentService(incidents=app.state.deployment_incidents)
+    app.state.environment_service = EnvironmentService(pepper=settings.envelope_pepper.get_secret_value())
+
+    app.state.github_link_service = GitHubLinkService(
+        oauth=GitHubOAuthClient(
+            client_id=settings.github_app_client_id,
+            oauth_credential=settings.github_app_oauth_credential.get_secret_value(),
+            oauth_base_url=settings.github_oauth_base_url,
+            api_base_url=settings.github_api_base_url,
+        ),
+        users=GitHubUserClient(api_base_url=settings.github_api_base_url),
+        link_key=derive_link_key(settings.envelope_pepper.get_secret_value()),
+    )
+    # ── The governance chokepoint (§2.2, §11.6, leaf 7.5) ─────────────────────
+    # Composed here rather than constructed per request, and composed with its collaborators
+    # named explicitly, because §2.2's claim is that the six stages "cannot be skipped and
+    # cannot be reordered". A chokepoint assembled at a call site would let one caller assemble
+    # it differently, and the assembly is where a stage would go missing.
+    #
+    # One of the seven collaborators was a deliberately fail-closed placeholder until leaf 9.2,
+    # and `DeviceService` took its place.
+    from src.secrets.store import InfisicalStore, LocalSealedStore
+
+    if settings.secret_backend == "infisical":
+        app.state.secret_store = InfisicalStore(
+            http=shared_http,
+            base_url=str(settings.infisical_url),
+            client_id=settings.infisical_client_id,
+            client_secret=settings.infisical_client_secret.get_secret_value(),
+        )
+    else:
+        app.state.secret_store = LocalSealedStore(
+            master_key=settings.local_secret_seal_key.get_secret_value().encode("utf-8")
+        )
+    #
+    #   * `UnavailableGovernancePolicy` raised on every evaluation, which the chokepoint turns
+    #     into a DENY with an audit record (§11.6: "an OPA outage denies"). **Leaf 9.2 replaces
+    #     it with `OpaGovernancePolicy`**, querying the bundle leaf 9.1 authored over the shared
+    #     `httpx` client. The placeholder stays in the tree and stays tested: it is what a
+    #     deployment with no governance bundle should compose, and `test_wiring_governance.py`
+    #     asserts the composed source is now the real one.
+    #   * `UnavailableCommandSink` refused delivery with `device-not-connected` until leaf 8.4;
+    #     `AgentHub` replaces it below and keeps that refusal for a device with no live session.
+    #
+    # A permissive default for either would let a mutation through on the strength of nothing
+    # objecting, which is precisely what §9's convention forbids.
+    app.state.governance_policy = OpaGovernancePolicy(opa_url=str(settings.opa_url), http=shared_http)
+    # Read by `/health/ready`. Held on state rather than re-derived from settings there, so
+    # readiness reports on the URL the composed client actually queries.
+    app.state.opa_url = str(settings.opa_url)
+    app.state.envelope_sequencer = RedisEnvelopeSequencer(redis_client)
+    # The internal CA (§3.1, §14.2). Constructed only when BOTH PEMs are configured; otherwise the
+    # fail-closed stand-in, so a fresh clone starts and every route except the exchange works,
+    # while the exchange answers 503 `pairing-unavailable` rather than issuing a certificate no CA
+    # vouches for. `make init-ca` populates the two variables into the untracked `.env`.
+    #
+    # A malformed PEM is a startup failure, deliberately unlike an absent one: absent means "not
+    # configured yet", malformed means "configured wrongly", and the second must not degrade
+    # silently into the first.
+    ca_cert_pem = settings.internal_ca_cert_pem.get_secret_value().strip()
+    ca_key_pem = settings.internal_ca_key_pem.get_secret_value().strip()
+    device_ca: Any
+    if ca_cert_pem and ca_key_pem:
+        device_ca = InternalCertificateAuthority(
+            cert_pem=ca_cert_pem,
+            key_pem=ca_key_pem,
+            ttl_hours=settings.device_cert_ttl_hours,
+            renew_before_hours=settings.device_cert_renew_before_hours,
+        )
+    else:
+        device_ca = UnavailableCertificateAuthority()
+        logger.warning(
+            "no internal CA configured; agent pairing will refuse with 503 until `make init-ca` "
+            "populates INTERNAL_CA_CERT_PEM and INTERNAL_CA_KEY_PEM",
+        )
+    app.state.device_ca = device_ca
+    app.state.device_service = DeviceService(
+        pepper=settings.envelope_pepper.get_secret_value(),
+        recorder=GovernanceDeviceAuditRecorder(writer=app.state.audit_writer),
+        redis=redis_client,
+        limiter=TokenBucketPairingLimiter(
+            # §14.6's two exchange buckets, constructed here because `RedisTokenBucketLimiter`
+            # lives in `src/ai/**`, which the §2.4 Ruff table bans everywhere except the
+            # composition root. The existing limiter is reused rather than a second Lua token
+            # bucket written: two of them would be two places for §14.1's "Redis is the single
+            # time authority" to be got wrong.
+            #
+            # Per IP: capacity 10, refilling at 10/60 per second — §14.6's "10 exchange attempts
+            # per IP per minute". Global: capacity 600 over one code lifetime, so the refill rate
+            # is 600/TTL and "total attempts across the window cannot exceed 600" holds by
+            # construction rather than by a comment.
+            per_ip=RedisTokenBucketLimiter(
+                redis=redis_client,
+                capacity=settings.pairing_rate_limit_per_ip_per_minute,
+                refill_rate=settings.pairing_rate_limit_per_ip_per_minute / 60.0,
+                key_prefix="forgeops:pair:ip:",
+            ),
+            global_bucket=RedisTokenBucketLimiter(
+                redis=redis_client,
+                capacity=settings.pairing_rate_limit_global_per_window,
+                refill_rate=settings.pairing_rate_limit_global_per_window / settings.pairing_code_ttl_seconds,
+                key_prefix="forgeops:pair:global:",
+            ),
+        ),
+        ca=device_ca,
+        code_ttl_seconds=settings.pairing_code_ttl_seconds,
+        max_attempts=settings.pairing_code_max_attempts,
+        alphabet=settings.pairing_code_alphabet,
+    )
+    # The agent hub (§11.10, leaf 8.4). Constructed AFTER `device_service`, because it
+    # authenticates through it, and BEFORE the chokepoint, because it is the chokepoint's sink.
+    # `UnavailableCommandSink` is gone from the graph: the hub keeps its refusal — a device with no
+    # live session still gets `device-not-connected` — so nothing that used to fail closed now
+    # succeeds silently.
+    #
+    # `TlsPeerCertificate` is the default certificate source and trusts NO header. A deployment
+    # that terminates TLS at a proxy composes a source that reads the proxy's verified-client
+    # header; until it does, a plaintext connection produces no certificate and the handshake is
+    # refused, which is the correct answer for "mTLS is not actually in place".
+    agent_hub = AgentHub(
+        HubDeps(
+            redis=redis_client,
+            devices=app.state.device_service,
+            sessionmaker=sessionmaker,
+            progress=RedisProgressSink(redis_client),
+            heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
+            heartbeat_timeout_seconds=settings.heartbeat_timeout_seconds,
+            results=_ChangeSetResultRecorder(sessionmaker, lambda: getattr(app.state, "governance_chokepoint", None)),
+        )
+    )
+    app.state.agent_hub = agent_hub
+    app.state.command_sink = agent_hub
+    app.state.client_certificate_source = TlsPeerCertificate()
+    # Promptness only. The correctness guarantee is the per-message `SISMEMBER` inside the hub, so
+    # this task failing is a slower close and never a missed revocation.
+    revocation_task = asyncio.create_task(agent_hub.subscribe_revocations(channel=REVOCATION_CHANNEL))
+    # A change set whose agent can no longer answer is settled as failed instead of staying `applying`.
+    unanswered_task = asyncio.create_task(agent_hub.run_unanswered_command_sweeper())
+
+    app.state.governance_chokepoint = GovernanceChokepoint(
+        policy=app.state.governance_policy,
+        approval_gate=ThresholdApprovalGate(),
+        # The chokepoint only ever analyses FILE change sets, never Terraform plans, so it gets the
+        # calibration matching that unit. `analysis/routes.py` keeps the defaults, because a plan
+        # posted there really is a cloud plan.
+        analyzer=file_change_set_analyzer(),
+        audit_writer=app.state.audit_writer,
+        sequencer=app.state.envelope_sequencer,
+        sink=app.state.command_sink,
+        envelope_pepper=settings.envelope_pepper.get_secret_value(),
+        envelope_max_age_seconds=settings.envelope_max_age_seconds,
+        # THE DEPENDENCY POINTS INWARD. `governance/` declares `CloneCredentialProvider` and TID251
+        # forbids it importing `integrations/`, so the composition root is the only place the two can
+        # meet. The lambda adapts the link service's `usable_token` to the protocol's shape: the
+        # chokepoint knows a clone needs a credential for a user and nothing about how one is stored,
+        # refreshed or revoked.
+        #
+        # The tenant is the CHANGE SET's, passed through by the chokepoint, so a link written under
+        # this deployment's deferred NULL and one written under a real tenant are both found. A plain
+        # `=` against NULL never matched and made every link unreadable once; the link table uses
+        # `IS NOT DISTINCT FROM` because of it.
+        clone_credential_provider=lambda session, *, user_id, tenant_id: (
+            app.state.github_link_service.usable_token(session, user_id=user_id, tenant_id=tenant_id)
+        ),
+        # 2.2 and 2.6. Without this, `DeploymentService.complete` had no production caller at all: a real
+        # deployment stayed `applying` for ever and `rollback_target` never found anything. Composed here
+        # because `governance/` may not import `deployments/` and must not learn what a deployment is.
+        change_set_settler=DeploymentSettler(
+            deployments=app.state.deployment_service,
+            notifications=app.state.notification_service,
+        ),
+        # THE APPROVAL-TIME HALF, beside the result-time half it mirrors. A deployment's row is written
+        # `pending_approval` from this chokepoint's verdict at request time, and nothing advanced it when
+        # the verdict changed -- the same missing listener as `DeploymentService.complete` having no
+        # production caller, which is why `DeploymentSettler` above exists.
+        change_set_dispatcher=DeploymentDispatcher(),
+        # 2.2. A registry push needs a credential at the instant the envelope is signed and at no
+        # other time. Composed here for the same reason the clone provider is: the chokepoint knows a
+        # push needs one and must not learn that this deployment keeps it in Infisical.
+        registry_credential_provider=SecretStoreRegistryCredentials(app.state.secret_store),
+    )
+    app.state.chokepoint = app.state.governance_chokepoint
     app.state.mcp_task_store = mcp_task_store
     app.state.mcp_app_registry = McpAppRegistry()
     app.state.mcp_gateway = McpGateway(
@@ -142,6 +707,216 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         cache=mcp_cache,
         upstream=mcp_upstream,
         agent_blast_radius=settings.mcp_agent_blast_radius,
+    )
+
+    # ── debt D1: the shipped YAML is now what a running backend loads ─────────
+    # Phase 0 defined load_tier_config(path, env) and never called it from
+    # production, so config/model-tiers.yaml was only ever exercised by fixtures
+    # (PROGRESS.md outstanding item, design §0.5 D1). §1.5's entire generation
+    # pipeline sits on six-tier routing, so this wiring lands BEFORE any generation
+    # code and is proven by Q-27 against the RUNNING app rather than by reading the
+    # file.
+    #
+    # A malformed or missing tier file is a startup failure, deliberately unlike
+    # the MCP registry above. An empty MCP registry fails closed — every route
+    # returns 404 — but an empty tier map would leave `/api/v1/ai/complete`
+    # answering 422 for every tier while looking healthy, which is precisely the
+    # silent-degradation shape D1 exists to remove.
+    tier_config = load_tier_config(_resolve_config_path(settings.model_tier_config_path), env=os.environ)
+    # OPERATOR-DEFINED ENDPOINTS JOIN THE SHIPPED CASCADE HERE.
+    #
+    # Merged into `TierConfig` rather than held apart, because the router, the breakers, the semantic cache
+    # and the availability surface all read it. An endpoint that lived anywhere else would need its own copy
+    # of each — and would be excluded from failover, so it could be configured, tested, and still never serve
+    # a request.
+    #
+    # A FAILURE HERE DOES NOT STOP THE APPLICATION, AND NOR DOES A SLOW ONE. The shipped tiers are what most
+    # deployments run on, and losing them because one operator row is malformed would trade a working cascade
+    # for a broken extra. `merge_custom_endpoints` skips a row naming an unknown tier for the same reason.
+    #
+    # THE TIMEOUT IS LOAD-BEARING RATHER THAN DEFENSIVE. This is the first thing in the lifespan to open a
+    # database session, so before it existed the application could finish starting with Postgres unreachable —
+    # readiness would report the database down, which is the honest outcome, while the process stayed live.
+    # An unbounded query here would have turned an unreachable database into a start-up that never completes,
+    # which is a strictly worse failure: nothing to read the diagnosis from.
+    try:
+        async with asyncio.timeout(CUSTOM_ENDPOINT_LOAD_TIMEOUT_SECONDS):
+            async with app.state.sessionmaker() as bootstrap_session:
+                custom_endpoints = await load_custom_endpoints(bootstrap_session)
+        tier_config = merge_custom_endpoints(tier_config, custom_endpoints)
+        if custom_endpoints:
+            logger.info("ai: merged %d operator-defined endpoint(s) into the tier config", len(custom_endpoints))
+    except (Exception, TimeoutError):  # noqa: BLE001 — the shipped cascade must survive any of these
+        logger.warning("ai: operator-defined endpoints could not be loaded; using the shipped tiers only")
+    # A SEPARATE CLIENT FOR MODEL CALLS, and the separation is the point.
+    #
+    # These endpoints shared `shared_http`, whose 60-second timeout is right for OPA, Cerbos, JWKS and the
+    # MCP upstream — services where a slow answer means something is wrong. One completion against the
+    # self-hosted `qwen2.5-coder:1.5b` with a compiled prompt was MEASURED at 127 seconds on CPU, so every
+    # provider call was aborted mid-flight, every attempt was recorded as a failure, and the run served
+    # canned templates while the model was working correctly and would have answered.
+    #
+    # One number could not serve both: "this service is unhealthy" and "this is a long job" are different
+    # facts, and the self-hosted tier exists precisely so an operator can run a model on their own CPU.
+    # NOT PUT ON `app.state`, deliberately. Nothing reads it: the registry holds the reference it needs and
+    # the shutdown closure below captures this local. Publishing it would add a composed collaborator that
+    # no wiring test drives, which is precisely the unexercised surface `test_wiring_coverage` exists to
+    # refuse — and it refused this, correctly, on the first attempt.
+    model_http = httpx.AsyncClient(timeout=settings.model_http_timeout_seconds)
+    # THE RESOLVER IS BUILT BEFORE THE REGISTRY, because the registry's availability now depends on it.
+    #
+    # `from_config` used to report availability from the protocol alone, so an endpoint whose key resolved to
+    # nothing was still called "available" — a fresh install showed three such tiers with nothing behind them
+    # but a placeholder. It now asks the resolver, which means the resolver has to exist first.
+    #
+    # LAYERED: operator-set credentials first, the environment second. A deployment configured through `.env`
+    # behaves exactly as before; one configured through the UI overrides it without editing a file and
+    # without a restart.
+    key_resolver = LayeredKeyResolver(fallback=EnvKeyResolver())
+    app.state.key_resolver = key_resolver
+    # KEYS SAVED ON THE MODELS PAGE ARE LOADED AT STARTUP. The snapshot used to be filled only when someone
+    # saved or tested a key, so after every restart a stored Gemini key read as "not configured" and the
+    # Generation page refused Gemini until an operator pressed Test connection (found 2026-11-02).
+    # Best-effort: a database that is not reachable yet leaves the environment fallback in place.
+    try:
+        from .ai.provider_credentials import derive_seal_key
+        from .ai.routes import load_provider_credentials
+
+        async with sessionmaker() as credential_session:
+            stored = await load_provider_credentials(
+                credential_session, seal_key=derive_seal_key(settings.local_secret_seal_key.get_secret_value())
+            )
+        key_resolver.replace_snapshot({ref: value for ref, (value, _record) in stored.items()})
+        logger.info("ai: loaded %d stored provider credential(s): %s", len(stored), sorted(stored))
+    except Exception:  # noqa: BLE001
+        logger.warning("ai: could not load stored provider credentials at startup", exc_info=True)
+    endpoint_registry = EndpointRegistry.from_config(tier_config, http=model_http, key_resolver=key_resolver)
+    breakers = {
+        endpoint_id: CircuitBreaker(
+            failure_threshold=settings.cb_failure_threshold,
+            failure_window_seconds=float(settings.cb_window_seconds),
+            cooldown_seconds=float(settings.cb_open_seconds),
+        )
+        for endpoint_id in tier_config.endpoints
+    }
+    # ── criterion 14: L2 similarity, constructed rather than merely implemented ──
+    # The L2 tier and its tests predate this wiring by a session; the cache was built
+    # here as `TieredSemanticCache(redis=redis_client)`, so L2 was unreachable at runtime
+    # and `settings.semantic_cache_threshold` was read by nothing. Finding 79.
+    #
+    # The threshold is read from settings rather than re-literalled, so the deployment's
+    # `SEMANTIC_CACHE_THRESHOLD` is what the cache admits on -- the same D1 argument the
+    # tier config above is wired for.
+    #
+    # Optional, following the `device_ca` shape directly above rather than a new one: a
+    # missing embedder is L1-only and logged, never a startup failure. An exact-match
+    # cache is a working cache; refusing to boot without an embedding provider would make
+    # a paid third-party key a hard dependency of the whole backend.
+    cache_embedder = _build_cache_embedder(settings)
+    if cache_embedder is None:
+        semantic_cache = TieredSemanticCache(redis=redis_client)
+        logger.info(
+            "semantic cache: L1 exact-match only. L2 similarity is inactive because no "
+            "input-sensitive embedding backend is configured; set "
+            "SELF_HOSTED_EMBEDDING_MODEL_ID with SELF_HOSTED_BASE_URL, or a real "
+            "LLM_KEY_VOYAGE with EMBEDDING_BACKEND=voyage (current backend=%s)",
+            settings.embedding_backend,
+        )
+    else:
+        semantic_cache = TieredSemanticCache(
+            redis=redis_client,
+            embed=cache_embedder,
+            similarity_threshold=settings.semantic_cache_threshold,
+        )
+        logger.info(
+            "semantic cache: L1 exact-match and L2 similarity active (embedder=%s, threshold=%s)",
+            # Which embedder, not which pgvector backend. The two are independent since the
+            # self-hosted path landed, and an operator debugging an L2 miss rate needs to know
+            # which model produced the vectors.
+            settings.self_hosted_embedding_model_id or settings.embedding_backend,
+            settings.semantic_cache_threshold,
+        )
+    model_router = ModelRouter(
+        tier_config=tier_config,
+        registry=endpoint_registry,
+        cache=semantic_cache,
+        breakers=breakers,
+        # THE SAME RESOLVER the registry's availability was computed from, not a second one. Two
+        # instances would let the screen report a credential the router could not find.
+        key_resolver=key_resolver,
+    )
+
+    # Exposed so Q-27 can assert provenance against the running app.
+    app.state.tier_config = tier_config
+    app.state.endpoint_registry = endpoint_registry
+    app.state.breakers = breakers
+    app.state.semantic_cache = semantic_cache
+    app.state.model_router = model_router
+
+    # ── §1.5's generation pipeline finally has a model to reach ────────────────
+    # `generation/routes.py` returned a bare `GenerationService()` and `_insert_run` wrote
+    # `served_from` as the SQL literal `'template'`, so the six-tier cascade above had exactly one
+    # consumer — `/api/v1/ai/complete`, which no product surface calls — and a generation row could
+    # not record a provider call, a cache hit or anything else.
+    #
+    # Composed HERE and handed over as `core.model_port.ArtifactModelPort`, because
+    # `src/generation/` may not import `src.ai` (§2.2.1) and that ban is re-asserted by parsing in
+    # `scripts/chokepoint_graph.py` rather than by a lint. `main.py` is the one module allowed to
+    # know the whole graph, which is exactly what composing an adapter across two domains requires.
+    #
+    # `None` is a supported outcome, not a failure: a deployment whose configured tier has no
+    # reachable model runs generation's template path and records `served_from='template'`, which
+    # is a true row. Refusing to boot would make a model server a hard dependency of every surface.
+    app.state.artifact_model = build_artifact_model(
+        router=model_router,
+        tier_config=tier_config,
+        tier_name=settings.generation_tier,
+    )
+    if app.state.artifact_model is None:
+        logger.info(
+            "generation: no model port for tier %s; runs will render templates and record served_from='template'",
+            settings.generation_tier,
+        )
+    else:
+        logger.info(
+            "generation: routing to tier %s via endpoint chain %s",
+            settings.generation_tier,
+            tier_config.tiers[ModelTier(settings.generation_tier)].ordered_ids(),
+        )
+
+    # ORPHANED GENERATION RUNS. A run streams inside its HTTP request, so no run outlives the process that
+    # served it; one still `running` past the run deadline was abandoned and would otherwise read as
+    # "still working" forever. Best-effort: a database that is not up yet must not stop the app starting.
+    try:
+        from .generation.routes import reap_orphaned_runs
+
+        async with sessionmaker() as reap_session:
+            reaped = await reap_orphaned_runs(reap_session, older_than_seconds=settings.generation_run_deadline_seconds)
+        if reaped:
+            logger.warning("generation: recorded %d orphaned run(s) as failed at startup", reaped)
+    except Exception:  # noqa: BLE001
+        logger.warning("generation: could not reap orphaned runs at startup", exc_info=True)
+
+    # `ai/routes.py` reads `app.state.ai_deps` and the Phase 0 lifespan never set
+    # it, so every request to `/api/v1/ai/tiers` and `/api/v1/ai/complete` raised
+    # AttributeError. That is the same class of defect as D-23: a registered route
+    # whose composition was never assembled, reported as live.
+    #
+    # The verifier is Phase 0's MCP verifier for now, which means the AI routes
+    # currently accept the gateway's audience. Task 6.1 replaces it with
+    # `AppTokenVerifier`, which has a DISTINCT app audience; until then this is the
+    # Phase 0 contract wired up rather than a new one invented here.
+    app.state.ai_deps = AIDeps(
+        tier_config=tier_config,
+        registry=endpoint_registry,
+        breakers=breakers,
+        model_router=model_router,
+        limiter=RedisTokenBucketLimiter(
+            redis=redis_client,
+            capacity=settings.ai_rate_limit_capacity,
+            refill_rate=settings.ai_rate_limit_refill_per_second,
+        ),
+        verifier=mcp_verifier,
     )
 
     # Best-effort initial observations: dependency outage changes readiness, not
@@ -165,10 +940,44 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     try:
         yield
     finally:
+        # Cancelled before Redis closes: the subscriber holds a connection from the same pool, and
+        # tearing the pool down under it produces a shutdown traceback that hides real failures.
+        unanswered_task.cancel()
+        revocation_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await revocation_task
         await shared_http.aclose()
+        # Closed alongside it rather than left to the garbage collector: an unclosed client leaks the
+        # connection pool, and a model pool holds long-lived sockets by design.
+        await model_http.aclose()
         await redis_client.aclose()
         await engine.dispose()
         logger.info("shutdown complete")
+
+
+class CatchAllExceptionsMiddleware(BaseHTTPMiddleware):
+    """Ensure any unhandled exception caught inside the application produces an
+    RFC 9457 Problem Details response that propagates through CORSMiddleware.
+    """
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        try:
+            return await call_next(request)
+        except Exception as exc:
+            logger.exception("unhandled application exception: %s", exc)
+            return _render(
+                request,
+                ProblemDetail(
+                    type=f"{TYPE_BASE}/internal",
+                    title="Internal Server Error",
+                    status=500,
+                    detail="An unexpected error occurred. Quote the trace_id when reporting this.",
+                ),
+            )
 
 
 def create_app() -> FastAPI:
@@ -187,7 +996,23 @@ def create_app() -> FastAPI:
     # Starlette PREPENDS middleware, so registration order is the REVERSE of
     # execution order. Registering innermost-first yields the §4.3 stack:
     # ServerError(1) -> RequestId(2) -> TraceContext(3) -> AccessLog(4) -> CORS(5)
+    #                -> CatchAllExceptions(6) -> TenantContext(7)
+    #
+    # Row 7 is the innermost, and that placement is the point: it runs INSIDE
+    # authentication, so it reads an already-verified principal rather than trusting a
+    # request header (§4.3, §6.7, D-35). Registered FIRST because Starlette reverses
+    # the order.
+    app.add_middleware(TenantContextMiddleware)  # executes 7th, innermost
+    app.add_middleware(CatchAllExceptionsMiddleware)  # executes 6th, inside CORS to guarantee CORS headers on 500
     cors_origins = [o.strip() for o in settings.cors_allow_origins.split(",") if o.strip()]
+    for default_origin in [
+        "http://localhost:13000",
+        "http://127.0.0.1:13000",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]:
+        if default_origin not in cors_origins:
+            cors_origins.append(default_origin)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
@@ -203,13 +1028,203 @@ def create_app() -> FastAPI:
     install_problem_handlers(app)
 
     # --- API Routers ---
+    # The auth flow (§3.5). Registered first because it is the only router whose routes
+    # are all public: `check-route-auth.py` reads the same `PUBLIC_ROUTES` set, so the
+    # four exemptions here are asserted against the real router rather than trusted.
+    from .auth.routes import router as auth_router
+
+    app.include_router(auth_router, prefix=settings.api_prefix)
+
+    # Agent pairing and revocation (§3.1, §11.2). TWO routers on one prefix: the protected pair
+    # carries router-level `require_principal`, and the exchange has none because §4.4 makes it
+    # the one new public route. Splitting them is what keeps the exemption visible in the code
+    # that declares the route rather than hidden in a path matcher.
+    from .auth.agent_routes import public_router as agent_public_router
+    from .auth.agent_routes import router as agent_router
+
+    app.include_router(agent_router)
+    app.include_router(agent_public_router)
+
+    # What an agent needs in order to connect, computed from this deployment's own configuration.
+    # Its own module because it reads settings and nothing else — no device state, no CA, no Redis —
+    # and because the pairing routers above carry authentication decisions that this one must not be
+    # able to blur.
+    from .agents.connection_info_routes import router as agent_connection_info_router
+    from .agents.uninstall_routes import router as agent_uninstall_router
+
+    app.include_router(agent_connection_info_router)
+    app.include_router(agent_uninstall_router)
+
+    # The device READ surface (§3.7, criterion 10 step 4). Pairing was write-only — a POST to mint,
+    # a public POST to exchange, a DELETE to revoke, and no GET — so a paired agent could not be
+    # observed and the /pairing screen had nothing to read. Its own module so the public exemption
+    # above stays visible next to the route that carries it.
+    from .auth.device_read_routes import router as device_read_router
+
+    app.include_router(device_read_router)
+
+    # The agent hub (§11.10). One WebSocket route, authenticated inside its handshake by the
+    # client certificate and the bearer device token — which is why `check-route-auth.py` reports
+    # the path rather than passing it: a WebSocket route has no method set for it to examine.
+    from .websocket.routes import router as agent_hub_router
+
+    app.include_router(agent_hub_router)
+
+    from .analysis.routes import agent_router as analysis_agent_router
     from .analysis.routes import router as analysis_router
 
     app.include_router(analysis_router)
+    # The device-authenticated half of the same prefix. See `analysis/routes.py::agent_router` for
+    # why it is a separate router rather than a per-route dependency override.
+    app.include_router(analysis_agent_router)
 
+    from .projects.routes import router as projects_router
+
+    app.include_router(projects_router)
+
+    # The per-user GitHub account link (Part 2). TWO ROUTERS, and the split is the same one the device
+    # routes make: `router` carries `require_principal` on every route, while `callback_router` holds
+    # the single route a BROWSER REDIRECT FROM GITHUB reaches — which carries no bearer token and is
+    # authenticated instead by a single-use `state` this server minted and bound to the user who asked.
+    # A route whose authentication `require_principal` cannot express must not sit under it and look as
+    # though it does. Neither router adds a way to sign in: Authentik OIDC remains the only one.
+    from .integrations.routes import callback_router as github_callback_router
+    from .integrations.routes import router as integrations_router
+
+    app.include_router(integrations_router)
+    app.include_router(github_callback_router)
+
+    # §2.1. Every route under `require_principal` at the router, and every mutation audited. It is NOT a
+    # chokepoint transit and the module docstring says why: an environment row changes this platform's
+    # own configuration and sends nothing to an agent, so a change item for it would be a row claiming a
+    # file write nobody made.
+    from .environments.routes import router as environments_router
+
+    app.include_router(environments_router)
+
+    # §2.2. The one mutating route here goes through `GovernanceChokepoint.deploy_manifests`, and
+    # `check-chokepoint.sh` asserts mechanically that `send_command` stays confined to `governance/`, so
+    # this router cannot grow a second path to an agent.
+    from .deployments.routes import router as deployments_router
+
+    app.include_router(deployments_router)
+
+    # 2.2's live log stream. A separate module from the deployment routes because it is the only SSE
+    # producer here and its lifecycle is a subscription rather than a request.
+    from .deployments.logs import router as deployment_logs_router
+
+    app.include_router(deployment_logs_router)
+
+    # 2.2 and 2.4a. Starting a durable run and releasing its gate. Mounted unconditionally even though
+    # the engine may not be configured: the routes answer a 503 naming the setting, which is a better
+    # failure than a 404 on a route that exists in the product's documentation.
+    from .deployments.pipeline_routes import router as pipeline_router
+
+    app.include_router(pipeline_router)
+
+    # Stage 7: Autonomous Deployment Orchestrator REST, SSE and WebSocket streaming surface.
+    from .deployments.autonomous_routes import router as autonomous_deployments_router
+
+    app.include_router(autonomous_deployments_router)
+
+    # 2.7. ArgoCD manifest rendering, the governed sync, and the webhook that RECORDS rather than
+    # syncing -- an unauthenticated request causing a production deployment would be a hole straight
+    # through the chokepoint.
+    from .argocd.routes import router as argocd_router
+
+    app.include_router(argocd_router, prefix=settings.api_prefix)
+    from .monitoring.routes import router as monitoring_router
+
+    app.include_router(monitoring_router, prefix=settings.api_prefix)
+
+    from .incidents.routes import router as incidents_router
+
+    app.include_router(incidents_router, prefix=settings.api_prefix)
+
+    from .incidents.healing_routes import router as healing_router
+
+    app.include_router(healing_router, prefix=settings.api_prefix)
+
+    from .learning.routes import router as learning_router
+
+    app.include_router(learning_router, prefix=settings.api_prefix)
+
+    # 2.13's seam, composed here for the same reason the metrics-evidence port is: this is the only place
+    # both sides are in scope, so `generation` depends on `core.memory_port` and never on `learning`.
+    from .learning.memory import LearningMemory
+
+    app.state.memory_port = LearningMemory()
+
+    from .commands.routes import router as commands_router
+
+    app.include_router(commands_router, prefix=settings.api_prefix)
+
+    from .knowledge.routes import router as knowledge_router
+
+    app.include_router(knowledge_router, prefix=settings.api_prefix)
+
+    # 2.4 and 2.9. The combined agent operation proxy for Docker AND Kubernetes: one whitelist, one
+    # signing path, one transit per mutating call. Its reads go through the chokepoint's read_inventory
+    # and its writes through transit_host_action, and there is no third path -- check-chokepoint.sh
+    # asserts that send_command stays confined to governance/, so this router cannot grow one.
+    # 2.1's promotion box and 2.3. Promotion and rollback are DEPLOYMENTS: both travel deploy_manifests,
+    # so the target environment's approval requirement applies without anyone having to remember it.
+    from .notifications.routes import router as notifications_router
+
+    app.include_router(notifications_router)
+
+    from .releases.routes import router as releases_router
+
+    app.include_router(releases_router)
+
+    from .hostops.routes import router as hostops_router
+
+    app.include_router(hostops_router)
+
+    from .ai.routes import read_router as ai_read_router
     from .ai.routes import router as ai_router
 
     app.include_router(ai_router)
+    # The user-facing tier read. Registered beside the completion router and under the same prefix,
+    # so `/api/v1/ai/tiers` is where it always was — what changed is which principal it accepts.
+    app.include_router(ai_read_router)
+
+    # The audit read surface (§11.9, criterion 9). Registered here rather than behind a feature
+    # flag: `GET /verify` is what makes tamper evidence a product feature, and a feature nobody
+    # can reach is a claim rather than a control.
+    from .audit.routes import router as audit_router
+
+    app.include_router(audit_router)
+
+    from .policies.routes import router as policies_router
+
+    app.include_router(policies_router, prefix=settings.api_prefix)
+
+    # The change-approval surface (§3.6, §11.6, criterion 10 steps 8-9). Mounted here for the
+    # first time: the router existed since Phase 1's first wave and was deliberately left out of
+    # this list, because it required no authentication and took the approver as a query parameter
+    # defaulting to `admin`. `check-route-auth.py` would have failed the build, which is why the
+    # honest move was to leave it unmounted rather than register it and exempt it.
+    #
+    # It is registrable now because it carries router-level `require_principal`, derives the
+    # approver from the verified principal, and delegates every transition to
+    # `GovernanceChokepoint` — so approving through HTTP takes the same six stages, the same
+    # optimistic concurrency and the same audit record as approving through any other path. No
+    # entry was added to `PUBLIC_ROUTES` for it.
+    from .approvals.routes import router as approvals_router
+
+    app.include_router(approvals_router)
+
+    # The generation surface (§1.5, §7.4, §11.5, criterion 10 steps 6-7). `generation/` had twelve
+    # modules and no routes.py, so the pipeline and the `generation_runs` table from revision 0008
+    # were unreachable over HTTP. One streaming endpoint, because the service exposes one method.
+    from .generation.routes import router as generation_router
+
+    app.include_router(generation_router)
+
+    from .secrets.routes import router as secrets_router
+
+    app.include_router(secrets_router)
 
     # MCP Gateway ingress, registry introspection and App hosting (§5.2).
     from .mcp.routes import router as mcp_router
@@ -249,6 +1264,33 @@ def create_app() -> FastAPI:
         except Exception as exc:
             errors.append({"dependency": "redis", "detail": str(exc)})
 
+        # Cerbos check (§2.3, task 6.4). Unlike the IdP, an authorisation-sidecar
+        # outage DOES belong here: deny-by-default means a request whose permission
+        # cannot be evaluated is refused, so a replica that cannot reach Cerbos is
+        # serving 503s to every non-public route and should be drained. That is the
+        # precise difference from Authentik, which only affects login (§6.3, D-56).
+        cerbos = getattr(request.app.state, "cerbos", None)
+        if cerbos is not None:
+            try:
+                await asyncio.wait_for(cerbos.health(), timeout=2.0)
+            except TimeoutError:
+                errors.append({"dependency": "cerbos", "detail": "health check timed out"})
+            except Exception as exc:
+                errors.append({"dependency": "cerbos", "detail": str(exc)})
+
+        # OPA (§11.7, task 9.2). Same argument as Cerbos, one layer up: Cerbos decides who
+        # may ask, OPA decides whether the governance bundle permits it, and a replica that
+        # cannot reach OPA denies every mutation at the chokepoint's stage 1.
+        opa_http = getattr(request.app.state, "shared_http", None)
+        opa_url = getattr(request.app.state, "opa_url", None)
+        if opa_http is not None and opa_url:
+            try:
+                await asyncio.wait_for(_check_opa(opa_http, opa_url), timeout=2.0)
+            except TimeoutError:
+                errors.append({"dependency": "opa", "detail": "health check timed out"})
+            except Exception as exc:
+                errors.append({"dependency": "opa", "detail": str(exc)})
+
         if errors:
             # Rendered with the same required RFC 9457 members as every other
             # problem document (§4.2): stable type URI, title, status equal to
@@ -268,7 +1310,12 @@ def create_app() -> FastAPI:
                 media_type=PROBLEM_CONTENT_TYPE,
             )
 
-        return JSONResponse({"status": "ready", "checks": {"postgres": "ok", "redis": "ok"}})
+        checks = {"postgres": "ok", "redis": "ok"}
+        if cerbos is not None:
+            checks["cerbos"] = "ok"
+        if opa_http is not None and opa_url:
+            checks["opa"] = "ok"
+        return JSONResponse({"status": "ready", "checks": checks})
 
     # --- Versioned health (API surface informational echo) ---
     @app.get(f"{settings.api_prefix}/health")
@@ -283,3 +1330,95 @@ def create_app() -> FastAPI:
         )
 
     return app
+
+
+class _PipelineContext:
+    """What a durable pipeline step needs from the application. 2.2, 2.4a.
+
+    Satisfies `deployments.pipeline.PipelineContext` structurally. Each step opens its OWN session from
+    the factory, because a durable step may run hours after the one before it and a session held across
+    that gap is a connection leaked for the duration.
+    """
+
+    def __init__(self, sessionmaker: Any, chokepoint: Callable[[], Any]) -> None:
+        self._sessionmaker = sessionmaker
+        self._chokepoint = chokepoint
+
+    @property
+    def sessions(self) -> Any:
+        return self._sessionmaker
+
+    @property
+    def chokepoint(self) -> Any:
+        resolved = self._chokepoint()
+        if resolved is None:
+            raise RuntimeError(
+                "the governance chokepoint is not composed yet, so a pipeline step cannot run; "
+                "every mutating step goes through it and there is no path that skips it"
+            )
+        return resolved
+
+    async def principal_for(self, session: Any, user_id: uuid.UUID) -> Any:
+        """Load the principal a step acts as, from the database, at the moment the step runs.
+
+        RE-READ AND NOT CARRIED IN THE EVENT. A principal serialised into a durable payload is an
+        authorisation snapshot that outlives the human's access: a run suspended overnight would apply in
+        the morning with permissions revoked at midnight. Re-reading means a revoked user's suspended
+        pipeline fails, which is the correct outcome.
+        """
+        from sqlalchemy import text as _text
+
+        from .auth.principal import Principal
+
+        row = (
+            (
+                await session.execute(
+                    _text("SELECT id, email, tenant_id, oidc_subject FROM users WHERE id = :id"),
+                    {"id": str(user_id)},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if row is None:
+            raise RuntimeError(f"user {user_id} no longer exists, so the suspended pipeline has nobody to act as")
+        return Principal(
+            subject=str(row["oidc_subject"] or row["id"]),
+            email=row["email"],
+            user_id=row["id"],
+            tenant_id=row["tenant_id"],
+        )
+
+
+def _serve_inngest(app: FastAPI, settings: Any) -> None:
+    """Mount the engine's discovery endpoint. 2.4a.
+
+    The import lives inside this function because `core/tasks.py` is the only module permitted to import
+    the engine SDK, and `inngest.fast_api.serve` is framework glue rather than business logic -- it is
+    here, at the composition edge, and reaches nothing but the translator.
+    """
+    # THE ENGINE'S ENDPOINT IS NOT BEHIND A PRINCIPAL, and it is the one route in this application that
+    # is not. It cannot be: the engine calls it to invoke functions and holds no user session. What
+    # authenticates it is a SIGNING KEY the SDK verifies on every request -- and a deployment that
+    # enabled the engine in production without one would expose an endpoint that runs deployment
+    # pipelines to anybody who can reach the port. So that combination is refused at startup, loudly,
+    # rather than left as a configuration mistake nobody notices.
+    if bool(getattr(settings, "inngest_is_production", False)) and not getattr(settings, "inngest_event_key", None):
+        raise RuntimeError(
+            "TASK_DISPATCHER=inngest with INNGEST_IS_PRODUCTION=true requires INNGEST_EVENT_KEY: "
+            "without it the /api/inngest endpoint is unauthenticated, and anyone who can reach it "
+            "can start a deployment pipeline. Set the key, or run the dev server with "
+            "INNGEST_IS_PRODUCTION=false."
+        )
+
+    from .core.tasks import build_inngest_client, inngest_functions
+
+    client = build_inngest_client(settings)
+    functions = inngest_functions(client)
+    app.state.inngest_client = client
+    # Kept so a route can send the approval event that releases a gated step without rebuilding a client.
+    app.state.inngest_functions = functions
+
+    import inngest.fast_api
+
+    inngest.fast_api.serve(app, client, functions)

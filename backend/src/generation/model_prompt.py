@@ -1,0 +1,441 @@
+# SPDX-License-Identifier: FSL-1.1-ALv2
+"""The prompt a generation run sends to a model, and the parse of what comes back.
+
+WHY THIS MODULE EXISTS
+----------------------
+`GenerationService` had no model call at all. It rendered four artifacts from string
+concatenation and streamed them in 120-character slices, and its own docstring said so:
+"the Phase 1 template path ... not a live model call", "Not real tokenisation, and named so".
+`generation_runs.served_from` was the SQL literal `'template'` in the INSERT, so the column
+could not have recorded anything else even if a model had been called.
+
+Routing to a real model needs two things the template path never needed: a prompt that states
+the contract precisely enough that a small local model can satisfy it, and a parse that turns
+free-form model output back into `(path, content)` pairs. Both are here rather than in
+`service.py` so the streaming state machine stays readable and so each can be tested against
+fixture text without a model.
+
+WHY THE FORMAT IS THIS STRICT
+-----------------------------
+The `self_hosted` tier's whole point is a model small enough to run on a developer machine, and
+a 1.5B-class model does not reliably produce well-formed JSON of any depth. A line-oriented
+marker followed by a fenced block is the form such models emit most reliably, and — more
+importantly — it is the form whose FAILURES are detectable: a missing marker is a missing file,
+not a plausible-looking object with a silently empty member. An artifact set that does not parse
+is treated as a failed provider attempt and retried, which is exactly what §11.5's bounded
+feedback loop is for.
+
+WHAT IS NOT HERE
+----------------
+No default content, no partial fill-in, no "if the model omitted the Service, synthesise one".
+A parse either yields every required artifact or reports what is missing. Filling a gap with a
+template while `served_from` said `provider` is precisely the fabrication this work removes; the
+template path is a separate, LABELLED outcome in `service.py`.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+#: The artifacts §12.6 step 6 names. Ordered, because the change set the governance chokepoint
+#: receives is built from this sequence and a stable order makes two runs comparable.
+#:
+#: MANDATORY, AND THAT WORD IS LOAD-BEARING. Every path here must come back or the whole attempt is
+#: discarded, so a path belongs in this tuple only when an attempt without it is genuinely unusable.
+#: `docker-compose.yml` is OFFERED rather than required (see `OPTIONAL_ARTIFACTS`): a Kubernetes
+#: deployment is complete without it, and requiring it discarded four correct files on every run whose
+#: model chose not to write a compose stack — strictly worse than the partial result it replaced.
+REQUIRED_ARTIFACTS: tuple[str, ...] = (
+    "Dockerfile",
+    "k8s/deployment.yaml",
+    "k8s/service.yaml",
+    "k8s/ingress.yaml",
+)
+
+#: Artifacts the run asks for and accepts, without treating their absence as a failed attempt.
+OPTIONAL_ARTIFACTS: tuple[str, ...] = ("docker-compose.yml",)
+
+#: `### FILE: <path>`, tolerating any number of leading hashes and surrounding whitespace.
+#:
+#: Deliberately lenient about the marker and strict about the path. Models vary the heading
+#: level freely and that variance carries no information, whereas a path this does not recognise
+#: is a file that will be reported missing — so leniency where it costs nothing, and no guessing
+#: where it would matter.
+_FILE_MARKER = re.compile(r"^\s*#{0,6}\s*FILE:\s*[`\"']?([^`\"'\s]+)[`\"']?\s*$", re.IGNORECASE)
+
+#: A fenced code block delimiter, with or without a language tag.
+_FENCE = re.compile(r"^\s*```[A-Za-z0-9_+-]*\s*$")
+
+
+class ArtifactParseError(ValueError):
+    """The model's output did not contain the artifact set the contract asks for.
+
+    Carries `missing` so `service.py` can put the specific gap into the retry prompt. A bare
+    "parse failed" would make the second attempt identical to the first, which turns a bounded
+    feedback loop into three copies of the same request.
+    """
+
+    def __init__(self, *, missing: Sequence[str], found: Sequence[str]) -> None:
+        self.missing = tuple(missing)
+        self.found = tuple(found)
+        super().__init__(f"model output is missing {list(self.missing)}; it contained {list(self.found)}")
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectFacts:
+    """What the prompt is allowed to assert about the application.
+
+    A dataclass rather than the raw `projects` row, because the prompt must not become a place
+    where arbitrary operator-supplied settings are interpolated into model input. Every member
+    here is read by `service.py` from the row and named, so adding a fact is a deliberate act.
+    """
+
+    app_name: str
+    runtime: str
+    port: int
+    base_image: str
+    start_command: tuple[str, ...]
+
+
+def output_format_section(paths: Sequence[str]) -> list[str]:
+    """The OUTPUT FORMAT block, in the exact shape `parse_artifacts` reads.
+
+    SHARED BECAUSE ONE CALLER FORGOT IT ENTIRELY. `prompt_compiler.compile_prompt` described WHAT to write
+    across five carefully derived sections and never said HOW to format the answer — no `### FILE:` marker,
+    no fences. The model complied with everything it was actually told: it returned 2783 characters of
+    plausible artifacts and ZERO markers, so `parse_artifacts` found nothing, every attempt was recorded as
+    a failure, and the run fell back to canned templates.
+
+    Measured directly, same service and same model back to back: `accepted` with four files when no
+    compiled prompt is passed, `template_fallback` when one is. Nothing in the failure named the cause —
+    the row said `template_fallback`, the end-to-end journey reported an SSE assertion three layers away,
+    and the defect was a missing paragraph.
+
+    One function, called by both prompt builders, so a prompt cannot again omit the contract its own parser
+    depends on.
+    """
+    lines = [
+        "",
+        "OUTPUT FORMAT. This is parsed mechanically. Output that does not follow it exactly is",
+        "discarded in full, however good the file contents are:",
+        "",
+        "- Precede every file with a line that is exactly `### FILE: <path>`, using the path exactly as",
+        "  given above. No leading dash, no bold, no numbering, no backticks around the path.",
+        "- Put the file's complete contents inside a fenced block on the lines that follow.",
+        "- Emit nothing else: no explanation before the first marker, no summary after the last block,",
+        "  and no file that was not asked for.",
+        "",
+        "Emit exactly these files, in this order:",
+        "",
+    ]
+    for path in paths:
+        lines.append(f"### FILE: {path}")
+        lines.append("```")
+        lines.append("<the complete contents of this file>")
+        lines.append("```")
+    return lines
+
+
+def build_generation_prompt(
+    *,
+    operator_prompt: str,
+    facts: ProjectFacts,
+    previous_findings: Sequence[str] = (),
+    attempt: int = 1,
+    context_lines: Sequence[str] = (),
+) -> str:
+    """The full model prompt for one attempt.
+
+    `context_lines` are FR-13's retrieval excerpts, produced by `retrieval.render_context_section` and
+    passed in rather than fetched here: this module builds a string and must not acquire a database
+    session, which is what keeps it unit-testable and keeps the retrieval decision in one place.
+
+    They are EMPTY, not a placeholder, when a project has never been scanned. A heading with nothing under
+    it invites a model to fill the gap, which is the opposite of grounding it.
+
+    `previous_findings` are the deterministic gate's verdict on the PREVIOUS attempt, quoted back
+    verbatim. That is what makes retry #2 a repair rather than a repeat, and it is also what
+    makes the retry reach the provider at all: the cache key is computed over the prompt, so an
+    identical retry prompt would be served from L1 with the same rejected content and the loop
+    would spend all three attempts on one bad answer.
+
+    `attempt` is in the prompt for the same reason, one step further along. Findings are often
+    IDENTICAL across retries — a model that ignored `USER 1001` once frequently ignores it twice —
+    so quoting the findings alone leaves attempts 2 and 3 with the same prompt, the same cache key,
+    and an L1 hit that serves the rejected content without the provider ever being asked again.
+    `test_the_retry_prompt_differs_so_the_cache_cannot_serve_the_rejection` caught exactly that:
+    three attempts, two provider calls. The attempt number is also a true statement about the
+    request rather than a nonce added to defeat the cache.
+    """
+    start = " ".join(facts.start_command) if facts.start_command else ""
+    lines = [
+        "You are a DevOps engineer. Produce deployment artifacts for the application described below.",
+        "",
+        "APPLICATION FACTS (these are authoritative; do not contradict them):",
+        f"- name: {facts.app_name}",
+        f"- runtime: {facts.runtime}",
+        f"- container base image: {facts.base_image}",
+        f"- listening port: {facts.port}",
+    ]
+    if start:
+        lines.append(f"- start command: {start}")
+    # FR-13's excerpts sit AFTER the facts and BEFORE the operator's request, deliberately. The facts are
+    # authoritative and short; the excerpts are evidence the model should prefer over its assumptions but
+    # not over the facts, and the section says so. Putting them last would bury the operator's request
+    # under a page of code.
+    lines += list(context_lines)
+    lines += [
+        "",
+        "OPERATOR REQUEST:",
+        operator_prompt.strip(),
+        "",
+        "HARD REQUIREMENTS. These are checked mechanically and output that breaks any of them is",
+        "rejected automatically, so follow them literally:",
+        f"- The Dockerfile's FIRST LINE is exactly `FROM {facts.base_image}`. Do not put a comment,",
+        "  a blank line or anything else above it.",
+        "- The Dockerfile contains a line that is exactly `USER 1001`, placed after the RUN",
+        "  instructions and before CMD, so the container does not run as root.",
+        f"- The Dockerfile EXPOSEs port {facts.port}.",
+        "- All application source files are at the root of the repository. Do NOT invent "
+        "subdirectories like `frontend/`, `frontent/`, `backend/`, or `server/` when copying files.",
+        "- In Dockerfile, copy files directly from the root context: `COPY package*.json ./` "
+        "followed by `RUN npm install`, then `COPY . .`. Do NOT invent `COPY frontent/...` "
+        "or `COPY backend/...`.",
+        f"- The docker-compose.yml defines a top-level name '{facts.app_name}' and a services "
+        f"mapping with at least one service mapping host port {facts.port} to container port "
+        f"{facts.port}, with build context set to `.`.",
+        "- Every Kubernetes manifest has top-level `apiVersion:`, `kind:`, `metadata:` and `spec:` keys.",
+        f"- The Deployment labels its pods `app: {facts.app_name}` and the Service selects on that label.",
+        f"- The Service is named `{facts.app_name}`, is type ClusterIP, publishes port 80 and targets",
+        f"  containerPort {facts.port}.",
+        f"- The Ingress backend names service `{facts.app_name}` on port number 80.",
+        f"- Use the real name `{facts.app_name}` everywhere. Never emit a placeholder such as",
+        "  `<your-username>` or `example.com`: these files are applied as written.",
+        "",
+        "OUTPUT FORMAT. Emit exactly these files, in this order, and nothing else -",
+        "no explanation, no summary, no extra files:",
+    ]
+    for path in (*REQUIRED_ARTIFACTS, *OPTIONAL_ARTIFACTS):
+        lines.append(f"### FILE: {path}")
+        lines.append("```")
+        lines.append("<the file's complete contents>")
+        lines.append("```")
+
+    if previous_findings:
+        lines += [
+            "",
+            f"ATTEMPT {attempt}. YOUR PREVIOUS ATTEMPT WAS REJECTED. Fix exactly these findings and",
+            "re-emit all files:",
+        ]
+        lines += [f"- {finding}" for finding in previous_findings]
+
+    return "\n".join(lines)
+
+
+def parse_artifacts(
+    raw: str,
+    *,
+    required: Sequence[str] = REQUIRED_ARTIFACTS,
+    requested: Sequence[str] | None = None,
+) -> dict[str, str]:
+    """Split model output into `{path: content}`, or raise `ArtifactParseError`.
+
+    Content is taken verbatim between the fences. Nothing is normalised except the removal of the
+    fence lines themselves and a trailing newline guarantee, because a Dockerfile or a manifest is
+    whitespace-significant and "helpfully" reformatting model output would mean the bytes the
+    deterministic gate judged are not the bytes that get written.
+
+    REQUESTED AND REQUIRED ARE DIFFERENT QUESTIONS, and conflating them cost a real regression.
+
+    `required` is the set that must ALL be present or the attempt has failed. `requested` is the set
+    the run asked for, of which any subset is acceptable. When a compiled prompt drives a run it may
+    ask for a dozen files, and treating that whole list as mandatory means one omission discards
+    eleven correct files and substitutes canned template output — which is strictly worse than the
+    partial result it replaced. The end-to-end journey caught exactly that: a run that produced most
+    of what it was asked for was recorded as `template_fallback`.
+
+    A file OUTSIDE `requested` is still dropped. That part of the original contract stands: an
+    unrequested file in a change set is a write nobody asked for, and it should be discarded here
+    rather than at the governance chokepoint.
+
+    With `requested` given, the failure condition is that NOTHING usable came back. A model that
+    produced none of the files asked for has not partially succeeded, and the caller must be able to
+    tell that apart from a shortfall.
+    """
+    files: dict[str, list[str]] = {}
+    current: str | None = None
+    in_fence = False
+
+    for line in raw.splitlines():
+        marker = _FILE_MARKER.match(line)
+        if marker and not in_fence:
+            current = marker.group(1).strip().lstrip("./")
+            files.setdefault(current, [])
+            continue
+        if current is None:
+            # Preamble the model emitted before the first marker. Discarded rather than treated as
+            # an error: a chatty model is not a broken one, and the contract is about what IS
+            # present, not about what precedes it.
+            continue
+        if _FENCE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            files[current].append(line)
+
+    contents = {path: _join(body) for path, body in files.items() if _join(body).strip()}
+
+    missing = [path for path in required if path not in contents]
+    if missing:
+        raise ArtifactParseError(missing=missing, found=sorted(contents))
+
+    if requested is not None:
+        accepted = {path: contents[path] for path in requested if path in contents}
+        if not accepted:
+            # Nothing that was asked for came back. Reported as every requested path missing, because
+            # that is what happened, and the retry prompt is built from this list.
+            raise ArtifactParseError(missing=list(requested), found=sorted(contents))
+        return accepted
+
+    # Only the required set is returned. A model that invented `README.md` gets it dropped here
+    # rather than at the governance chokepoint, because an unrequested file in a change set is a
+    # write nobody asked for.
+    return {path: contents[path] for path in required}
+
+
+def _join(body: Sequence[str]) -> str:
+    """Re-join a captured block, guaranteeing the trailing newline a text file should have."""
+    if not body:
+        return ""
+    text = "\n".join(body)
+    return text if text.endswith("\n") else text + "\n"
+
+
+#: A manifest file names its ecosystem more reliably than any language statistic: GitHub calls a Vite site
+#: "CSS", and an index can be empty on a project's first run. Checked in this order, by file name.
+_MANIFEST_RUNTIMES: tuple[tuple[str, str], ...] = (
+    ("package.json", "node"),
+    ("go.mod", "go"),
+    ("cargo.toml", "rust"),
+    ("pyproject.toml", "python"),
+    ("requirements.txt", "python"),
+    ("pipfile", "python"),
+    ("setup.py", "python"),
+)
+_LANGUAGE_RUNTIMES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("typescript", "javascript", "tsx", "jsx", "node"), "node"),
+    (("python", "py"), "python"),
+    (("go",), "go"),
+    (("rust",), "rust"),
+)
+_FRONTEND_FRAMEWORKS = ("next", "vite", "react", "vue", "nuxt", "svelte", "remix", "astro", "angular")
+
+
+def infer_runtime(
+    *, settings: Mapping[str, Any], inventory: Mapping[str, Any], paths: Iterable[str] = (), prompt: str = ""
+) -> str:
+    """The project's runtime, from the strongest evidence available.
+
+    Operator setting, then manifest files present in the project, then indexed languages, then the
+    operator's own words. ONE derivation for the model prompt and the template fallback, so they cannot
+    describe different applications.
+
+    THE OLD DEFAULT WAS PYTHON. With no indexed languages -- a project's first run, before its index exists
+    -- every project became Python, and a Vite site with a `package.json` got `pip install -r
+    requirements.txt` and `CMD ["python", "main.py"]` (2026-11-02).
+    """
+    configured = str(settings.get("runtime") or "").strip().lower()
+    if configured:
+        return configured
+    names = [str(m).replace("\\", "/").rsplit("/", 1)[-1].lower() for m in (inventory.get("manifests") or [])]
+    names += [str(m).replace("\\", "/").rsplit("/", 1)[-1].lower() for m in paths]
+    # The SHALLOWEST manifest wins, so a root `package.json` outranks a nested tool's `requirements.txt`.
+    ranked = sorted(
+        (str(m).replace("\\", "/").count("/"), order, runtime)
+        for m in [*(inventory.get("manifests") or []), *paths]
+        for order, (name, runtime) in enumerate(_MANIFEST_RUNTIMES)
+        if str(m).replace("\\", "/").rsplit("/", 1)[-1].lower() == name
+    )
+    if ranked:
+        return ranked[0][2]
+    languages = [str(lang).lower() for lang in (inventory.get("languages") or [])]
+    for aliases, runtime in _LANGUAGE_RUNTIMES:
+        if any(lang in aliases for lang in languages):
+            return runtime
+    lowered = prompt.lower()
+    for word, runtime in (("node", "node"), ("express", "node"), ("react", "node"), ("golang", "go"), ("rust", "rust")):
+        if word in lowered:
+            return runtime
+    return "python" if names or languages or "python" in lowered else "unknown"
+
+
+def is_frontend_project(*, inventory: Mapping[str, Any], prompt: str = "") -> bool:
+    """A build-then-serve frontend, from declared frameworks first and the operator's words second."""
+    frameworks = [
+        str(f.get("name") if isinstance(f, Mapping) else f).lower() for f in (inventory.get("frameworks") or [])
+    ]
+    if any(any(name in fw for name in _FRONTEND_FRAMEWORKS) for fw in frameworks):
+        return True
+    return any(k in prompt.lower() for k in ("vite", "react", "vue", "frontend", "spa", "static"))
+
+
+def facts_from_project(
+    *,
+    project: Mapping[str, Any] | None,
+    operator_prompt: str,
+    default_app_name: str,
+) -> ProjectFacts:
+    """Derive the prompt's authoritative facts from the `projects` row.
+
+    Deliberately the SAME derivation `GenerationService._render` applies for the template path,
+    so a model run and a template run describe the same application. If the two disagreed, a
+    template fallback would silently produce different infrastructure than the provider attempt it
+    replaced — the operator would see the port change and have no way to know why.
+    """
+    settings: Mapping[str, Any] = {}
+    if project is not None:
+        raw_settings = project.get("settings")
+        if isinstance(raw_settings, Mapping):
+            settings = raw_settings
+
+    inventory: Mapping[str, Any] = {}
+    if project is not None and isinstance(project.get("inventory"), Mapping):
+        inventory = project["inventory"]
+    runtime = infer_runtime(settings=settings, inventory=inventory, prompt=operator_prompt)
+
+    is_spa = is_frontend_project(inventory=inventory, prompt=operator_prompt)
+    if runtime.startswith("node"):
+        if is_spa:
+            base_image, start, port = "node:22-alpine", ("npx", "serve", "-s", ".", "-l", "3000"), 3000
+        else:
+            base_image, start, port = "node:20-alpine", ("node", "server.js"), 3000
+    else:
+        base_image, start, port = "python:3.11-slim", ("python", "main.py"), 8000
+
+    if str(settings.get("base_image") or "").strip():
+        base_image = str(settings["base_image"]).strip()
+    try:
+        if settings.get("port") is not None:
+            configured = int(settings["port"])
+            if 1 <= configured <= 65535:
+                port = configured
+    except (TypeError, ValueError):
+        # A non-numeric port in operator-entered settings is not a reason to fail a run; the
+        # runtime default is a better answer than a stack trace.
+        pass
+    configured_start = settings.get("start_command")
+    if isinstance(configured_start, list | tuple) and configured_start:
+        start = tuple(str(part) for part in configured_start)
+    elif isinstance(configured_start, str) and configured_start.strip():
+        start = tuple(configured_start.split())
+
+    return ProjectFacts(
+        app_name=default_app_name,
+        runtime=runtime,
+        port=port,
+        base_image=base_image,
+        start_command=start,
+    )

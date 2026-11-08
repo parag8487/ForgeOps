@@ -16,8 +16,6 @@ Proves:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
-
 import httpx
 import pytest
 from src.ai.routing.breaker import CircuitBreaker
@@ -26,9 +24,10 @@ from src.ai.routing.endpoints import (
     CompletionRequest,
     EndpointAvailability,
     EndpointRegistry,
+    GoogleNativeEndpoint,
     OpenAICompatibleEndpoint,
 )
-from src.ai.routing.keys import SecretValue
+from src.ai.routing.keys import KeyResolver, SecretValue
 from src.ai.routing.router import ModelRouter, RoutingOutcome
 from src.ai.routing.tiers import (
     EndpointDescriptor,
@@ -37,6 +36,9 @@ from src.ai.routing.tiers import (
     TierChain,
     TierConfig,
 )
+from src.secrets.redaction import create_redacted_chunk
+
+from tests import synthetic_secrets
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -95,24 +97,73 @@ def _make_tier_config(
     )
 
 
-def _fake_redis() -> AsyncMock:
-    """Returns a mock Redis that always misses on get (no cache)."""
-    redis = AsyncMock()
-    redis.get = AsyncMock(return_value=None)
-    redis.set = AsyncMock(return_value=True)
-    return redis
+class _CacheMissRedis:
+    """A real in-memory stand-in for the Redis client, not a Mock.
+
+    design.md 0.4.1 lets an integration test substitute a *transport* — an
+    external-service client is one — but forbids substituting a collaborator
+    object, and `scripts/check-test-doubles.py` rule FO-TD004 makes that
+    mechanical by failing on any Mock under `tests/integration/**`. A Mock here
+    would also be signature-free: `redis.get = AsyncMock(...)` accepts any call at
+    all, which is the D-23 hole in miniature.
+
+    This class implements only what `TieredSemanticCache` actually calls, so a
+    cache that started calling something else fails loudly with AttributeError
+    instead of silently receiving a permissive Mock.
+    """
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+        self.set_calls: list[tuple[str, str]] = []
+
+    async def get(self, key: str) -> str | None:
+        self.get_calls.append(key)
+        return None  # always a miss: these tests exercise routing, not caching
+
+    async def set(self, key: str, value: str, *args: object, **kwargs: object) -> bool:
+        self.set_calls.append((key, value))
+        return True
 
 
-def _fake_key_resolver(keys: dict[str, str] | None = None) -> MagicMock:
-    """Returns a key resolver that resolves from a dict."""
-    resolver = MagicMock()
-    keys = keys or {"openai": "sk-test-key-12345", "anthropic": "ak-test-key"}
+def _fake_redis() -> _CacheMissRedis:
+    """A Redis stand-in that always misses on get, so no cache short-circuits."""
+    return _CacheMissRedis()
 
-    def resolve(key_ref: str):
-        val = keys.get(key_ref)
-        return SecretValue(val) if val else None
 
-    resolver.resolve = resolve
+class _DictKeyResolver:
+    """A real `KeyResolver` implementation backed by a dict.
+
+    Explicitly conforms to the `KeyResolver` Protocol rather than being a
+    MagicMock, so the double cannot drift from the interface the router consumes.
+    The `isinstance` assertion below is the Python analogue of the Go
+    `var _ Iface = (*Impl)(nil)` assertion §0.4.2 requires.
+    """
+
+    def __init__(self, keys: dict[str, str]) -> None:
+        self._keys = dict(keys)
+
+    def resolve(self, key_ref: str) -> SecretValue | None:
+        value = self._keys.get(key_ref)
+        return SecretValue(value) if value else None
+
+
+def _fake_key_resolver(keys: dict[str, str] | None = None) -> _DictKeyResolver:
+    """A key resolver over a dict of synthetic, self-labelling values.
+
+    The values carry no provider-shaped prefix on purpose: a literal shaped like a
+    real vendor API key makes every secret scanner fire on this repository, and a
+    blocked scan everyone learns to wave through is worse than no scan
+    (.antigravity/steering/secret-safety.md). The prefix is deliberately not spelled out
+    here either — a comment explaining the problem should not reproduce it.
+    """
+    resolver = _DictKeyResolver(
+        keys
+        or {
+            "openai": "test-only-not-a-real-secret-openai",
+            "anthropic": "test-only-not-a-real-secret-anthropic",
+        }
+    )
+    assert isinstance(resolver, KeyResolver), "_DictKeyResolver no longer satisfies KeyResolver"
     return resolver
 
 
@@ -193,7 +244,9 @@ class TestPrimaryTimeoutTriggersSubcascade:
 
     async def test_timeout_cascades(self, setup):
         router, call_count = setup
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=_make_request())
+        result = await router.complete(
+            tier=ModelTier.HIGH_CODING, request=_make_request(), prompt=create_redacted_chunk("foo")
+        )
 
         assert result.outcome == RoutingOutcome.OK
         assert result.content == "From secondary"
@@ -252,6 +305,7 @@ class TestMalformedResponseTriggersCascade:
         result = await router.complete(
             tier=ModelTier.HIGH_CODING,
             request=CompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}]),
+            prompt=create_redacted_chunk("foo"),
         )
 
         # A 2xx body with no choices[] is NOT a usable answer. The adapter must
@@ -303,7 +357,9 @@ class TestMalformedResponseTriggersCascade:
             key_resolver=_fake_key_resolver(),
         )
 
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=_make_request())
+        result = await router.complete(
+            tier=ModelTier.HIGH_CODING, request=_make_request(), prompt=create_redacted_chunk("foo")
+        )
         assert result.outcome == RoutingOutcome.OK
         assert result.content == "Recovered"
         assert result.endpoint_id == "ep-b"
@@ -347,10 +403,14 @@ class TestCrossProviderFallback:
             registry=registry,
             cache=cache,
             breakers={},
-            key_resolver=_fake_key_resolver({"openai": "sk-openai", "xai": "sk-xai"}),
+            key_resolver=_fake_key_resolver(
+                {"openai": "test-only-not-a-real-secret-openai", "xai": "test-only-not-a-real-secret-xai"}
+            ),
         )
 
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=_make_request())
+        result = await router.complete(
+            tier=ModelTier.HIGH_CODING, request=_make_request(), prompt=create_redacted_chunk("foo")
+        )
         assert result.outcome == RoutingOutcome.OK
         assert result.content == "XAI response"
         assert result.endpoint_id == "ep-xai"
@@ -402,7 +462,9 @@ class TestSelfHostedSuccessAtEndOfChain:
             key_resolver=_fake_key_resolver(),
         )
 
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=_make_request())
+        result = await router.complete(
+            tier=ModelTier.HIGH_CODING, request=_make_request(), prompt=create_redacted_chunk("foo")
+        )
         assert result.outcome == RoutingOutcome.OK
         assert result.content == "Self-hosted OK"
         assert result.endpoint_id == "ep-self"
@@ -437,15 +499,17 @@ class TestTraceHeaderInjection:
             registry=registry,
             cache=cache,
             breakers={},
-            key_resolver=_fake_key_resolver({"openai": "sk-secret-key"}),
+            key_resolver=_fake_key_resolver({"openai": "test-only-not-a-real-secret-hdr"}),
         )
 
-        await router.complete(tier=ModelTier.HIGH_CODING, request=_make_request())
+        await router.complete(tier=ModelTier.HIGH_CODING, request=_make_request(), prompt=create_redacted_chunk("foo"))
 
         # Verify request was made with Authorization header
         assert len(transport.requests) == 1
         req = transport.requests[0]
-        assert req.headers.get("authorization") == "Bearer sk-secret-key"
+        assert req.headers.get("authorization") == synthetic_secrets.bearer_with(
+            synthetic_secrets.SYNTHETIC_MARKER + "-hdr"
+        )
         assert req.headers.get("content-type") == "application/json"
 
 
@@ -454,7 +518,7 @@ class TestErrorRedaction:
 
     async def test_no_api_key_in_error(self):
         """API keys and prompts are not exposed in error reasons."""
-        secret_key = "sk-super-secret-key-12345"
+        secret_key = "test-only-not-a-real-secret-redaction"
 
         def error_handler(request: httpx.Request) -> httpx.Response:
             # Simulate an error that might include the key in error text
@@ -482,7 +546,9 @@ class TestErrorRedaction:
             key_resolver=_fake_key_resolver({"openai": secret_key}),
         )
 
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=_make_request())
+        result = await router.complete(
+            tier=ModelTier.HIGH_CODING, request=_make_request(), prompt=create_redacted_chunk("foo")
+        )
         assert result.outcome == RoutingOutcome.EXHAUSTED
 
         # The error reason is truncated to 200 chars — verify the key is not
@@ -523,7 +589,7 @@ class TestErrorRedaction:
         )
 
         request = CompletionRequest(model="test", messages=[{"role": "user", "content": prompt}])
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request)
+        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request, prompt=create_redacted_chunk("foo"))
         assert result.outcome == RoutingOutcome.EXHAUSTED
 
         # Error reasons should not contain user prompt content
@@ -553,6 +619,13 @@ class TestUnsupportedNativeProtocolSkip:
         }
 
         # Build registry from config — native protocols should be unavailable
+        #
+        # THE REGISTRY GETS THE SAME RESOLVER THE ROUTER DOES, which is how `main.py` wires it.
+        # Availability is now a conjunction that includes "is a credential resolvable", and the router
+        # SKIPS an unavailable endpoint. A registry built without the resolver reports every endpoint's
+        # credential as missing, so `ep-fallback` was skipped too and the cascade exhausted, which would
+        # have turned this into a test asserting that a SUPPORTED protocol is unreachable.
+        resolver = _fake_key_resolver()
         ok_http = httpx.AsyncClient(transport=MockTransport())
         registry = EndpointRegistry.from_config(
             TierConfig(
@@ -566,6 +639,7 @@ class TestUnsupportedNativeProtocolSkip:
                 endpoints=descs,
             ),
             http=ok_http,
+            key_resolver=resolver,
         )
 
         chain = TierChain(primary="ep-anthropic", secondary="ep-google", cross_vendor=("ep-fallback",))
@@ -577,17 +651,21 @@ class TestUnsupportedNativeProtocolSkip:
             registry=registry,
             cache=cache,
             breakers={},
-            key_resolver=_fake_key_resolver(),
+            key_resolver=resolver,
         )
 
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=_make_request())
+        result = await router.complete(
+            tier=ModelTier.HIGH_CODING, request=_make_request(), prompt=create_redacted_chunk("foo")
+        )
         assert result.outcome == RoutingOutcome.OK
 
-        # Anthropic and Google should be skipped with unsupported_protocol reason
+        # Anthropic and Google are skipped, and the reason NAMES THE PROTOCOL that has no adapter.
+        # It was previously the one string `unsupported_protocol_phase_0` for every failure, so a gap in
+        # ForgeOps and a gap in the operator's configuration were indistinguishable.
         skipped = [a for a in result.attempts if a.result == "skipped"]
-        assert len(skipped) == 2
-        assert "unsupported_protocol" in skipped[0].reason
-        assert "unsupported_protocol" in skipped[1].reason
+        assert len(skipped) == 1
+        assert "no adapter exists" in skipped[0].reason
+        assert "anthropic_native" in skipped[0].reason
 
         # Fallback should succeed
         assert result.endpoint_id == "ep-fallback"
@@ -633,7 +711,9 @@ class TestFullExhaustionReturnsExhausted:
             key_resolver=_fake_key_resolver(),
         )
 
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=_make_request())
+        result = await router.complete(
+            tier=ModelTier.HIGH_CODING, request=_make_request(), prompt=create_redacted_chunk("foo")
+        )
         assert result.outcome == RoutingOutcome.EXHAUSTED
         assert result.content is None
         assert result.degraded is True
@@ -664,23 +744,26 @@ class TestOpenAICompatibleIsOnlyProductionAdapter:
 
         registry = EndpointRegistry.from_config(config)
 
-        # Only ep-oai should have an endpoint adapter
+        # ep-oai and ep-goog should have endpoint adapters
         assert registry.endpoint("ep-oai") is not None
         assert isinstance(registry.endpoint("ep-oai"), OpenAICompatibleEndpoint)
+        assert registry.endpoint("ep-goog") is not None
+        assert isinstance(registry.endpoint("ep-goog"), GoogleNativeEndpoint)
 
-        # Native protocol endpoints have no adapter
+        # Native protocol endpoints without adapter
         assert registry.endpoint("ep-anth") is None
-        assert registry.endpoint("ep-goog") is None
 
         # But they have availability entries with reason
         avail_anth = registry.get_availability("ep-anth")
         assert avail_anth is not None
         assert avail_anth.available is False
-        assert "unsupported_protocol" in avail_anth.reason
+        assert "no adapter exists" in avail_anth.reason
+        assert "anthropic_native" in avail_anth.reason, "the reason names the protocol, not a generic code"
 
     def test_model_endpoint_protocol_only_openai_impl(self):
         """Verify only OpenAICompatibleEndpoint implements ModelEndpoint in production."""
         import inspect
+        import typing
 
         from src.ai.routing import endpoints as ep_module
 
@@ -688,7 +771,12 @@ class TestOpenAICompatibleIsOnlyProductionAdapter:
         # (endpoint_id, provider_kind properties and async complete method)
         classes_with_complete = []
         for name, obj in inspect.getmembers(ep_module, inspect.isclass):
-            if name == "ModelEndpoint":
+            # PROTOCOLS are excluded by what they ARE, not by name. This read `if name ==
+            # "ModelEndpoint": continue`, so the first `Protocol` added beside it — the streaming
+            # variant `ModelRouter` checks with `isinstance` — was counted as a second production
+            # adapter and failed a test about CONCRETE implementations. Naming one protocol also
+            # meant a renamed protocol would silently start being counted.
+            if getattr(obj, "_is_protocol", False) or obj is typing.Protocol:
                 continue
             # Check for the three required interface members
             has_endpoint_id = isinstance(getattr(obj, "endpoint_id", None), property) or "endpoint_id" in getattr(
@@ -702,4 +790,4 @@ class TestOpenAICompatibleIsOnlyProductionAdapter:
             if has_endpoint_id and has_provider_kind and has_complete:
                 classes_with_complete.append(name)
 
-        assert classes_with_complete == ["OpenAICompatibleEndpoint"]
+        assert set(classes_with_complete) == {"OpenAICompatibleEndpoint", "GoogleNativeEndpoint"}

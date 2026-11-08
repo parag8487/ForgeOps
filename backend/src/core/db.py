@@ -5,7 +5,7 @@
   pool_pre_ping, pool_recycle=1800. Construction does NOT require a live database.
 - create_sessionmaker: expire_on_commit=False, autoflush=False.
 - MetaData naming_convention for deterministic constraint names.
-- get_session: request-scoped, commits on success, rolls back on exception.
+- get_session: connection-scoped (HTTP or WebSocket), commits on success, rolls back on exception.
 - with_ef_search: SET LOCAL hnsw.ef_search for transaction-scoped HNSW tuning.
 
 PgBouncer transaction-mode constraint:
@@ -26,7 +26,9 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from starlette.requests import Request
+from starlette.requests import HTTPConnection
+
+from .tenancy import current_tenant_id
 
 # Deterministic naming convention so Alembic never emits database-generated
 # constraint names — otherwise Phase 1's migrations become environment-dependent.
@@ -39,6 +41,27 @@ NAMING_CONVENTION: dict[str, str] = {
 }
 
 metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+
+def pooler_connect_args(pooler_mode: str) -> dict[str, Any]:
+    """asyncpg connect args implied by `DATABASE_POOLER_MODE` (§6.7, §7.12).
+
+    Split out from `create_db_engine` so the decision is assertable directly. Reading
+    it back off a constructed `AsyncEngine` means poking at dialect internals, which
+    makes the test a statement about SQLAlchemy's private attributes rather than about
+    our rule.
+
+    In `transaction` mode a pooler such as PgBouncer hands out a different backend
+    connection per transaction. asyncpg's prepared-statement cache assumes the
+    connection it prepared against is the one it will execute against, so the first
+    query after a rebind fails with `prepared statement "__asyncpg_stmt_N__" does not
+    exist` — intermittently, under load, and never in a single-connection test. Both
+    caches are disabled: asyncpg's own and the SQLAlchemy dialect's, because leaving
+    one on still hands the new backend a name it has never seen.
+    """
+    if pooler_mode == "transaction":
+        return {"statement_cache_size": 0, "prepared_statement_cache_size": 0}
+    return {}
 
 
 def create_db_engine(settings: Any) -> AsyncEngine:
@@ -54,8 +77,7 @@ def create_db_engine(settings: Any) -> AsyncEngine:
         pool_pre_ping=True,
         pool_recycle=1800,
         echo=False,
-        # Phase 1 note: behind PgBouncer in transaction mode this needs
-        # connect_args={"statement_cache_size": 0} (§6.5).
+        connect_args=pooler_connect_args(getattr(settings, "database_pooler_mode", "session")),
     )
 
 
@@ -74,11 +96,37 @@ def create_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]
     )
 
 
-async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
-    """Request-scoped session. Commits on success, rolls back on any exception."""
-    factory: async_sessionmaker[AsyncSession] = request.app.state.sessionmaker
+async def get_session(connection: HTTPConnection) -> AsyncIterator[AsyncSession]:
+    """Connection-scoped session. Commits on success, rolls back on any exception.
+
+    Also issues `SET LOCAL app.tenant_id` when a tenant is in context (§6.7, D-35), so
+    the value is scoped to THIS transaction and reverts at COMMIT or ROLLBACK. See
+    `core.tenancy` for why `SET` would be a cross-tenant leak on a pooled connection.
+
+    THE PARAMETER IS `HTTPConnection` AND NOT `Request`, and that is what makes the agent
+    WebSocket work at all. `Request` is the HTTP-only subclass; a WebSocket scope produces a
+    `WebSocket`, and FastAPI cannot supply one for a parameter annotated `Request`. So
+    `/api/v1/ws/agent` — which depends on this — failed dependency resolution before its body
+    ever ran:
+
+        TypeError: get_session() missing 1 required positional argument: 'request'
+
+    Uvicorn reported it as `Exception in ASGI application`, then logged `connection open` and
+    `connection closed`, so from the agent's side the socket was accepted and dropped with no
+    close reason. The agent read that as a session that ended, backed off, and retried forever;
+    an approved change set therefore stayed `approved` because the command could never be
+    delivered. Nothing had noticed because until the session manager was wired the agent never
+    dialled, so this route had no client.
+
+    `HTTPConnection` is the common base of both and carries `.app`, which is the only thing this
+    function ever needed — it reads `app.state.sessionmaker` and nothing request-specific. So
+    widening the annotation removes a restriction that was never load-bearing rather than
+    special-casing the WebSocket path, and one session factory continues to serve every route.
+    """
+    factory: async_sessionmaker[AsyncSession] = connection.app.state.sessionmaker
     async with factory() as session:
         try:
+            await apply_tenant_context(session)
             yield session
             await session.commit()
         except Exception:
@@ -86,11 +134,46 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
             raise
 
 
+async def apply_tenant_context(session: AsyncSession) -> str | None:
+    """Set `app.tenant_id` for the current transaction, if a tenant is in context.
+
+    Returns the tenant that was applied, or None when there was none.
+
+    The value is bound as a parameter through `set_config` rather than interpolated
+    into a `SET LOCAL` statement. `SET LOCAL app.tenant_id = :v` is not
+    parameterisable in PostgreSQL — `SET` takes a literal — so the alternative would be
+    string interpolation of a value that, once task 6.1 lands, comes from a token
+    claim. `set_config(name, value, true)` is the parameterisable equivalent, with
+    `true` meaning transaction-local, and it removes the injection surface entirely.
+    """
+    tenant = current_tenant_id()
+    if tenant is None:
+        return None
+    await session.execute(
+        text("SELECT set_config('app.tenant_id', :tenant, true)"),
+        {"tenant": tenant},
+    )
+    return tenant
+
+
 async def with_ef_search(session: AsyncSession, ef_search: int) -> None:
     """Tune HNSW recall for the current transaction only (Research §A0a).
 
-    Uses SET LOCAL so the setting is scoped to the current transaction and
-    automatically reverts at the end of it. This is the correct pattern for
-    PgBouncer transaction-mode pooling (§6.5).
+    Uses `set_config(..., is_local => true)` — `SET LOCAL` semantics: the value is
+    scoped to the current transaction and reverts at the end of it, which is the
+    correct pattern for PgBouncer transaction-mode pooling (§6.5).
+
+    Not literally `SET LOCAL`, and the reason matters. `SET` is utility syntax and
+    accepts no bind parameters, so `SET LOCAL hnsw.ef_search = :v` fails with
+    `syntax error at or near "$1"` on every call — this function had never worked.
+    It also had no test that executed it: Phase 0's clause issued the raw SQL itself
+    and never called the production function, so the defect was invisible until
+    `test_0003_index.py` bound the assertion to this function instead. Interpolating
+    the value into the statement text would be the other way to make `SET` work, and
+    was rejected: it turns a tuning knob into a SQL-injection surface for no benefit,
+    since `set_config` is exactly equivalent and parameterised.
     """
-    await session.execute(text("SET LOCAL hnsw.ef_search = :v"), {"v": ef_search})
+    await session.execute(
+        text("SELECT set_config('hnsw.ef_search', :value, true)"),
+        {"value": str(int(ef_search))},
+    )

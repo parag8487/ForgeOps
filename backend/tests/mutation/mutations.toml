@@ -1,0 +1,1704 @@
+# SPDX-License-Identifier: FSL-1.1-ALv2
+#
+# Negative controls for every correctness property (design.md §0.4.5, Appendix B).
+#
+# WHY THIS FILE EXISTS
+# `REVIEW-PHASE-0.md` Pass 8 emptied BOTH of P-09's redaction pattern lists and all
+# thirteen of its tests stayed green. The clause was decorative and nothing in CI
+# could tell. Every property in Phase 1 therefore ships with the specific mutation
+# that must make it fail, and `scripts/mutation-harness.py` runs them as a CI job.
+# A property that survives its own control is reported VACUOUS and fails the build.
+#
+# SCHEMA
+#   runtime     "python" (default) or "go"
+#   property    path to the property test file, from the repository root
+#   target      dotted path (python) or symbol (go) being mutated - documentation
+#   mutation    the control EXACTLY as Appendix B words it, so a reviewer can
+#               compare the two without reading code
+#   description why that mutation must break the property
+#   patch       [python] statements that install the mutation, executed by a
+#               generated pytest plugin in a temp dir OUTSIDE the repository
+#   original    [go] the tracked file the overlay replaces
+#   overlay     [go] the replacement file, applied via `go build -overlay`
+#   package     [go] package pattern to test
+#   test_run    [go] -run regex
+#
+# Both `mutation` and `patch` are required for a python row. A prose-only control is
+# precisely what made P-09 look tested.
+#
+# GROWTH
+# This file gains exactly one row per property leaf, and the harness checks it
+# against Appendix B's table read out of design.md - not against a list restated
+# here, so the two cannot drift. Until every property has landed, the `mutation` CI
+# job passes `--allow-incomplete`; task 19.2 removes that flag, at which point all
+# thirty-one rows must exist. `--allow-incomplete` never suppresses a VACUOUS row
+# or a dirty working tree.
+#
+# CURRENT STATE
+# Not restated here as a number, because it rotted: this block said "one `Q-` row: Q-27"
+# for four leaves after Q-01, Q-03, Q-04 and Q-05 had landed, and nothing could tell.
+# `scripts/mutation-harness.py` prints the live figure on every run - "Appendix B defines
+# N properties; mutations.toml carries M rows" - and names every id that has no control.
+# Read it from there. The harness's own behaviour - that it reports VACUOUS, that its temp
+# directory is outside the tree, and that it leaves `git status --porcelain` empty - is
+# proven by `backend/tests/meta/test_mutation_harness.py` against fixture manifests.
+
+[Q-27]
+runtime     = "python"
+property    = "backend/tests/property/test_q27_tier_provenance.py"
+target      = "src.main.load_tier_config"
+mutation    = "Hard-code the tier map in the lifespan and ignore the path"
+description = """
+Freezes the tier configuration at whatever the committed config/model-tiers.yaml says
+and returns it for every path, which is precisely the Phase 0 state debt D1 describes:
+the shipped YAML is not what a running backend loads. Q-27 quantifies over GENERATED
+documents, so no fixed map can agree with them and the property must fail.
+"""
+patch = """
+import os
+from pathlib import Path
+
+import src.main as main_module
+from src.ai.routing.tiers import load_tier_config as _real_load_tier_config
+
+_committed = Path(main_module.__file__).resolve().parent.parent / "config" / "model-tiers.yaml"
+
+# FROZEN ON FIRST CALL, not at import. The committed YAML interpolates environment variables, so
+# loading it while this plugin is being imported ran before the test environment was in place and
+# raised
+#
+#     ValueError: Endpoint gpt-5.6-sol: base_url references unset variable(s): OPENAI_BASE_URL
+#
+# out of the plugin itself. pytest exited 3, the property never ran, and the harness scored the
+# non-zero exit as a kill -- so this control certified Q-27 while proving nothing about it. Deferring
+# the load to the first call keeps the mutation exactly as Appendix B words it (the configured path is
+# ignored) and lets the application's own environment satisfy the interpolation.
+#
+# A DICT rather than a module global. The harness indents every patch into
+# `def pytest_sessionstart(session):`, so this whole body runs inside a function: a `global _frozen`
+# would bind to a module attribute that no statement here creates, and the first call would raise
+# NameError. That still fails the property, so it still looks like a kill -- for a reason that has
+# nothing to do with the mutation. Mutating a dict captured by closure needs no declaration.
+_frozen = {}
+
+
+def _ignores_the_configured_path(path, env=None):
+    if "tiers" not in _frozen:
+        _frozen["tiers"] = _real_load_tier_config(_committed, env=env if env is not None else os.environ)
+    return _frozen["tiers"]
+
+
+main_module.load_tier_config = _ignores_the_configured_path
+"""
+
+[Q-01]
+runtime     = "go"
+module_dir  = "agent"
+package     = "./internal/executor/internal/mutate"
+test_run    = "TestProperty_Q01|TestProperty_P08"
+original    = "agent/internal/executor/internal/mutate/rollback.go"
+overlay     = "backend/tests/mutation/overlays/q01_rollback_removed.go"
+property    = "agent/internal/executor/internal/mutate/q01_property_test.go"
+mutation    = "Remove the rollback loop from the `CATCH` branch"
+description = """
+Replaces `rollback.go` with a version whose loop is gone. `ApplyVerified` still calls
+`rollback` on every error path and the call now does nothing, so a change-set that fails
+part-way stays half-applied — some targets holding new content, others their pre-image, and
+backups left orphaned. That is precisely the state Appendix A.9's `CATCH` branch exists to
+prevent and the state Q-01's disjunction forbids.
+
+`TestProperty_Q01_AnInjectedFailureLeavesEveryTargetAtItsPreImage` must then fail: it
+generates a change-set, injects a failure at a generated position (an entry creates a plain
+file `collide`, a later entry targets `collide/child.txt`, and `MkdirAll` refuses because the
+parent is a regular file) and asserts every target is back at its pre-image. P-08's relocated
+`TestProperty_P08_AtomicChangeSets` is in `test_run` too, because it asserts the same
+disjunction from Phase 0 and should also object.
+
+WHY `rollback` LIVES IN ITS OWN FILE. `go build -overlay` replaces a whole file. With this
+function inside `apply.go` the overlay would have carried a copy of nearly six hundred lines,
+rotting on the first unrelated edit and making the mutation unreadable. Extracting it is what
+keeps the reviewable diff to four lines, and the overlay keeps `backupInfo` and the signature
+identical so a change to either stops the mutated build compiling rather than silently
+ceasing to mutate anything.
+
+The harness passes `-rapid.nofailfile`, because a failing rapid property writes a
+reproduction file under `testdata/rapid/` and every Go row here is EXPECTED to fail — left on,
+the harness would dirty the tree it asserts is clean, for a reason unrelated to the mutation.
+"""
+
+[Q-02]
+runtime     = "go"
+module_dir  = "agent"
+package     = "./internal/executor/internal/mutate"
+test_run    = "TestProperty_Q02|TestRevert_"
+original    = "agent/internal/executor/internal/mutate/revert_entry.go"
+overlay     = "backend/tests/mutation/overlays/q02_norevert_noprevious.go"
+property    = "agent/internal/executor/internal/mutate/q02_property_test.go"
+mutation    = "Make `Revert` skip entries marked `NO_PREVIOUS`"
+description = """
+Replaces `revert_entry.go` with a version whose `NoPrevious()` branch removes nothing. `Revert`
+still walks every entry, still restores every pre-image, still writes the consumption marker and
+still returns success — but every file the apply CREATED survives the revert. The user's tree is
+then neither the pre-image nor the post-image, which is exactly what Appendix B's
+"including deleting files that did not previously exist" clause forbids.
+
+`TestProperty_Q02_AFileThatDidNotExistIsDeleted` must then fail. It seeds a GUARANTEED create on
+top of the generated set rather than waiting for the generator to draw one, so the control bites
+on the first example instead of on whichever example happens to contain a create — a control
+whose bite depends on the draw is one a future reader cannot trust.
+`TestProperty_Q02_RevertRestoresEveryFileByteForByte` objects independently, because it compares
+the WHOLE tree before the apply against the whole tree after the revert and the surviving file is
+a path that did not exist in the first snapshot.
+
+`TestRevert_` is in `test_run` too. Those five example tests in `apply_test.go` are Phase 1's
+hand-written cases, and two of them assert the same removal from a fixed change-set
+(`TestRevert_RestoresPreImagesByteForByte`'s `fresh.txt`, and all three files in
+`TestRevert_RestoresInReverseOrder`). Including them means the row proves the control is visible
+to an example test as well as to a generated one — the same arrangement Q-01 has with P-08.
+
+WHY `revertOne` LIVES IN ITS OWN FILE. `go build -overlay` replaces a whole file. With the
+per-entry step inline in `Revert`, the overlay would have carried a copy of nearly six hundred
+lines of `apply.go`, rotting on the first unrelated edit and making the mutation unreadable.
+Extracting it keeps the reviewable diff to three lines, and the overlay keeps `revertOne`'s
+signature identical so a change to it stops the mutated build compiling rather than silently
+ceasing to mutate anything.
+
+WHY THE OVERLAY STILL APPENDS TO `report.Removed`. The skip is of the filesystem effect only, so
+the mutated `Revert` still CLAIMS to have removed the file. The property therefore has to fail on
+ground truth — a `stat` of the path — rather than on a report that conveniently confesses. A
+control that also stopped reporting would be caught by the weaker of the two assertions and would
+not prove the on-disk one was doing any work.
+
+The harness passes `-rapid.nofailfile` for the reason recorded in Q-01's row.
+"""
+
+[Q-03]
+runtime     = "python"
+property    = "backend/tests/property/test_q03_chokepoint_unbypassable.py"
+target      = "src.governance.authority.MutationAuthority.__post_init__"
+mutation    = "Delete the `_MINT_SENTINEL` check in `__post_init__`"
+description = """
+Removes the identity comparison that makes `MutationAuthority` unforgeable, so any caller
+anywhere can construct one and every mutation primitive's capability argument becomes a
+formality. This is §2.2.1 mechanism 1 switched off, and it is the mechanism the other two
+rest on: the banned-api rule exists to stop the sentinel being NAMED, and the reachability
+check accepts a call that "receives a MutationAuthority" — both are worthless if anybody can
+produce one.
+
+Q-03's clause B quantifies construction over every value hypothesis can produce — None,
+booleans, integers, text, bytes, a fresh `object()`, containers — so no single replacement
+sentinel can satisfy it and the property must fail on the first generated example.
+
+The patch replaces `__post_init__` with a no-op rather than editing the tracked file, and
+asserts the mutation is OBSERVABLE before the property runs: it constructs an authority with
+a plain `object()` sentinel, which the real class refuses. A control that installed itself
+and changed nothing would report the property healthy, which is what this whole file exists
+to prevent.
+"""
+patch = """
+import uuid
+
+import src.governance.authority as authority_module
+
+
+def _no_sentinel_check(self, _sentinel):
+    return None
+
+
+authority_module.MutationAuthority.__post_init__ = _no_sentinel_check
+
+# The mutation must be observable, or the control proves nothing.
+_forged = authority_module.MutationAuthority(
+    change_set_id=uuid.uuid4(),
+    approval_id=uuid.uuid4(),
+    policy_bundle_digest="sha256:" + "00" * 32,
+    blast_radius="infrastructure",
+    audit_seq=1,
+    envelope_digest="d" * 64,
+    _sentinel=object(),
+)
+assert _forged.blast_radius == "infrastructure", (
+    "the mutation did not take effect; MutationAuthority still refuses a foreign sentinel and "
+    "the control would be a no-op"
+)
+"""
+
+[Q-04]
+runtime     = "python"
+property    = "backend/tests/property/test_q04_audit_completeness.py"
+target      = "src.audit.writer.AuditWriter.append"
+mutation    = "Move the audit write outside the transaction"
+description = """
+Makes `append` COMMIT as soon as it has written its record, instead of leaving the commit to
+the caller. That is the arrangement §11.9 exists to forbid: the audit row stops being atomic
+with the change-set state transition, so a transit that aborts after auditing leaves a record
+describing a state change that never happened, and a rolled-back transaction leaves the record
+behind.
+
+Q-04 must then fail on its rollback clause — the record and the state change both survive a
+`session.rollback()` the property requires to leave neither.
+
+Why committing rather than opening a second connection. The first version of this control built
+a detached `AsyncSession` from `session.get_bind()`, which returns the SYNC engine, so it raised
+`ArgumentError` and the property "failed" for a reason that had nothing to do with the mutation
+— a control that is broken rather than a control that bites. Committing early is the minimal
+edit that produces exactly the semantics Appendix B words: after `append` returns, the row is
+outside the caller's transaction and the caller can no longer undo it.
+
+Everything else about `append` is preserved: the chain arithmetic, the advisory lock, the flush
+that assigns `seq`.
+"""
+patch = """
+import src.audit.writer as writer_module
+
+_real_append = writer_module.AuditWriter.append
+
+
+async def _append_and_commit_immediately(self, session, draft):
+    event = await _real_append(self, session, draft)
+    # The mutation: the record leaves the caller's transaction here, so a later rollback in the
+    # caller cannot remove it and a failed state change no longer un-writes its audit row.
+    await session.commit()
+    return event
+
+
+writer_module.AuditWriter.append = _append_and_commit_immediately
+
+assert writer_module.AuditWriter.append is _append_and_commit_immediately, (
+    "the mutation did not install; the control would be a no-op"
+)
+assert writer_module.AuditWriter.append is not _real_append
+"""
+
+[Q-05]
+runtime     = "python"
+property    = "backend/tests/property/test_q05_audit_immutability.py"
+target      = "src.audit.writer.AuditWriter.append + verify_chain hashing"
+mutation    = "Drop `prev_hash` from the hashed payload"
+description = """
+Removes the `|| prev_hash` concatenation from the digest on BOTH sides — the writer and the
+verifier — so each row's hash covers only its own semantic fields. The rows keep their
+`prev_hash` column and the chain still looks like a chain, but nothing links a row's hash to
+its predecessor (§6.4, A.8).
+
+Both sides are mutated together, and that is the point rather than a convenience. Mutating only
+the writer would make every row fail verification immediately, which is a *different* failure —
+"the writer and verifier disagree" — and would let the control pass for a property that never
+checked linkage at all. Mutating both leaves a self-consistent non-chain, which is exactly the
+artifact Appendix B's control describes.
+
+WHICH CLAUSE THIS BREAKS, and why the obvious answer is wrong. It does **not** break the
+`prev_hash` clause: D-61 added an explicit comparison of each row's stored `prev_hash` against
+its predecessor's `hash`, and that catches a rewritten column whatever the digest covers. The
+first version of Q-05 therefore PASSED under this control — observed directly — because every
+clause it had was still satisfied.
+
+What the concatenation is the only defence against is a **splice**: delete a middle row and
+re-link the next one to the row before it. Afterwards every `prev_hash` really does equal its
+new predecessor's `hash`, so the column comparison agrees; the sole remaining objection is that
+the surviving row's own hash was computed over `payload || hash(the row that is now gone)`.
+`TestASplicedChainIsDetected` is that clause, and it is the one that fails here — with
+`kind == "hash"`, not `"prev_hash"`, which is itself the evidence that the two comparisons are
+distinguishable.
+
+The patch asserts its own observability in both directions: a chain digest drops its 32-byte
+prev term, and a lock-key digest does not — because `_lock_key` also calls `sha256` and silently
+mutating the advisory lock would make the run fail for a reason Appendix B does not describe.
+"""
+patch = """
+import hashlib
+
+import src.audit.writer as writer_module
+
+_real_canonical_bytes = writer_module.canonical_bytes
+
+# Prove the concatenation matters before removing it, or this control could install itself over
+# an implementation that never used prev_hash and still report the property healthy.
+_probe = _real_canonical_bytes({"a": 1})
+assert hashlib.sha256(_probe + bytes(32)).digest() != hashlib.sha256(_probe).digest()
+
+
+def _is_a_chain_digest(data):
+    # The discriminator, and it has to be precise. `append` and `verify_chain` both compute
+    # sha256(canonical_bytes(payload) + prev), where the payload is a JSON object and `prev` is
+    # exactly 32 bytes. `_lock_key` ALSO calls sha256, on a tenant UUID string or the configured
+    # lock name — 36 and 14 bytes, never starting with `{`. Stripping a 32-byte suffix from those
+    # would change the advisory lock as well, which is a side effect Appendix B's control does not
+    # describe and would make the mutated run fail for the wrong reason.
+    return isinstance(data, bytes | bytearray) and len(data) > 32 and bytes(data[:1]) == b"{"
+
+
+class _PayloadOnlyDigest:
+    \"\"\"sha256 over the canonical payload alone, with the concatenated prev term dropped.\"\"\"
+
+    __slots__ = ("_payload",)
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def digest(self):
+        return hashlib.sha256(self._payload).digest()
+
+    def hexdigest(self):
+        return hashlib.sha256(self._payload).hexdigest()
+
+
+class _PatchedHashlib:
+    \"\"\"`hashlib`, except that a chain digest ignores its prev term. Everything else is real.\"\"\"
+
+    def __getattr__(self, name):
+        return getattr(hashlib, name)
+
+    @staticmethod
+    def sha256(data=b""):
+        if _is_a_chain_digest(data):
+            return _PayloadOnlyDigest(bytes(data[:-32]))
+        return hashlib.sha256(data)
+
+
+writer_module.hashlib = _PatchedHashlib()
+
+# Observability, both directions: a chain digest drops its suffix, and a lock key does not.
+_chain = _real_canonical_bytes({"reason": "x"}) + bytes(32)
+assert writer_module.hashlib.sha256(_chain).digest() == hashlib.sha256(_chain[:-32]).digest(), (
+    "the mutation did not install; the control would be a no-op"
+)
+_lock_input = b"00000000-0000-4000-8000-000000000000"
+assert writer_module.hashlib.sha256(_lock_input).digest() == hashlib.sha256(_lock_input).digest(), (
+    "the mutation leaked into the advisory lock key, which Appendix B's control does not describe"
+)
+"""
+
+[Q-19]
+runtime     = "python"
+property    = "backend/tests/property/test_q19_route_coverage.py"
+target      = "src.main.create_app route dependencies"
+mutation    = "Drop the `require_principal` dependency from `GET /api/v1/projects` without adding that path to `PUBLIC_ROUTES`"
+description = """
+Removes the per-route auth dependency from one protected route while leaving the public
+allowlist alone, which is exactly the drift deny-by-default exists to prevent: the route
+still looks protected in the router listing and answers whatever its handler returns.
+Q-19 must then fail twice over — structurally, because the route is classified protected
+and carries no auth dependency; and behaviourally, because an unauthenticated request no
+longer gets 401 and the handler body executes.
+
+Appendix B names `GET /api/v1/projects`, which task 11.3 adds. Until it exists the patch
+targets the first `app`-family protected route the real router serves, and asserts it
+stripped exactly one — so the control can never quietly become a no-op, and it starts
+hitting the path Appendix B names as soon as that path exists. Wording left as Appendix B
+words it so the two can be compared without reading code.
+"""
+patch = """
+import src.main as main_module
+
+_real_create_app = main_module.create_app
+
+#: Appendix B's route first; otherwise whichever protected route the router does serve.
+_PREFERRED = "/api/v1/projects"
+
+
+def _strip_one_auth_dependency():
+    from src.auth.dependencies import AUTH_DEPENDENCY_QUALNAMES, route_requires_principal
+
+    app = _real_create_app()
+
+    def _names(dependant):
+        call = getattr(dependant, "call", None)
+        return {
+            getattr(call, "__qualname__", "") or getattr(call, "__name__", ""),
+            f"{getattr(call, '__module__', '')}.{getattr(call, '__qualname__', '')}",
+        }
+
+    def _guards(dependant):
+        for name in _names(dependant):
+            for accepted in AUTH_DEPENDENCY_QUALNAMES:
+                if name == accepted or name.endswith("." + accepted):
+                    return True
+        return False
+
+    def _flatten(routes, prefix=""):
+        for route in routes:
+            included = getattr(route, "original_router", None)
+            if included is not None:
+                context = getattr(route, "include_context", None)
+                yield from _flatten(getattr(included, "routes", []), prefix + (getattr(context, "prefix", "") or ""))
+                continue
+            yield prefix, route
+
+    candidates = []
+    for prefix, route in _flatten(app.routes):
+        raw_path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None)
+        dependant = getattr(route, "dependant", None)
+        if raw_path is None or methods is None or dependant is None:
+            continue
+        path = prefix + raw_path
+        if not route_requires_principal(path, set(methods)):
+            continue
+        # `app` family only: the MCP surface keeps Phase 0's contract (design 4.4), and
+        # stripping its dependency would exercise a different clause.
+        if any("require_mcp_principal" in name for child in dependant.dependencies for name in _names(child)):
+            continue
+        if any(_guards(child) for child in dependant.dependencies):
+            candidates.append((path, dependant))
+
+    assert candidates, "the mutation found no protected route to strip; the control would be a no-op"
+    chosen = next((entry for entry in candidates if entry[0] == _PREFERRED), candidates[0])
+    path, dependant = chosen
+    before = len(dependant.dependencies)
+    dependant.dependencies = [child for child in dependant.dependencies if not _guards(child)]
+    assert len(dependant.dependencies) < before, f"nothing was stripped from {path}"
+    return app
+
+
+main_module.create_app = _strip_one_auth_dependency
+"""
+
+[Q-20]
+runtime     = "python"
+property    = "backend/tests/property/test_q20_rbac_confinement.py"
+target      = "policies/cerbos/secret.yaml (viewer rules)"
+mutation    = "Add `read_value` to the viewer's Cerbos policy"
+description = """
+Grants the viewer the one permission §11.2 says no role may have, and removes the viewer
+from the blanket `read_value` deny so the grant actually takes effect. Q-20 must then fail
+on the clause that says NO role can read a secret value — asked of the real sidecar, so a
+policy edit is what the property is reading rather than a Python reimplementation of it.
+
+The tracked policy set is never touched. The mutation writes a COPY into a temp directory
+outside the repository and starts a second, digest-pinned Cerbos against it, then points
+`FORGEOPS_TEST_CERBOS_URL` at that container for the duration of the run — which is exactly
+what §0.4.5's outside-the-tree requirement makes possible. The container is removed on exit,
+and the image reference is read out of docker-compose.yml rather than restated so it cannot
+drift from the pin the compose checks police.
+
+The patch asserts that both edits actually applied. A control that silently matched nothing
+would report the property healthy while mutating an unchanged policy set, which is the
+failure mode this whole file exists to prevent.
+"""
+patch = """
+import atexit
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+_REPO = Path.cwd().resolve()
+# NOT `Path(__file__)`. §0.4.5 requires this plugin to be written OUTSIDE the repository tree, and
+# the harness honours that by putting it in a temp directory -- so walking up from the plugin's own
+# location never finds docker-compose.yml. It climbed to the filesystem root instead and the guard
+# fired as `assert WindowsPath('C:/') != WindowsPath('C:/')`, an INTERNALERROR that made pytest exit
+# 3 before the property ran. The harness read that as a kill. The working directory is `backend/`,
+# inside the tree, so the walk terminates there.
+while not (_REPO / "docker-compose.yml").exists():
+    assert _REPO != _REPO.parent, f"could not locate the repository root from {Path.cwd()}"
+    _REPO = _REPO.parent
+
+_compose = (_REPO / "docker-compose.yml").read_text(encoding="utf-8")
+_image = re.search(r"ghcr\\.io/cerbos/cerbos:[^ \\n]+@sha256:[0-9a-f]{64}", _compose)
+assert _image, "no digest-pinned cerbos image found in docker-compose.yml"
+_image = _image.group(0)
+
+_tmp = Path(tempfile.mkdtemp(prefix="forgeops-q20-mutation-")).resolve()
+assert _REPO.resolve() not in _tmp.parents and _tmp != _REPO.resolve(), _tmp
+shutil.copytree(_REPO / "policies" / "cerbos", _tmp / "policies")
+shutil.copytree(_REPO / "config" / "cerbos", _tmp / "config")
+
+_secret = _tmp / "policies" / "secret.yaml"
+
+# EDITED THROUGH THE PARSER, not by matching text. The previous version asserted on two exact
+# snippets including their leading whitespace, and failed with
+#
+#     AssertionError: the blanket read_value deny is not where the control expects it
+#
+# because those snippets carried four spaces before `- actions:` and six before the keys under it,
+# while the policy file uses six and eight. That is not a discrepancy anyone could see by reading:
+# the harness indents every patch into `pytest_sessionstart` and strips the COMMON leading indent as
+# it does so, which dedents the first line of a multi-line string relative to its continuations. Any
+# edit to the policy's comments or indentation would break it again. Working on the parsed document
+# expresses what the control actually means -- take `viewer` off the blanket deny, and add
+# `read_value` to what the viewer may do -- and formatting cannot break it.
+import yaml  # noqa: E402
+
+_doc = yaml.safe_load(_secret.read_text(encoding="utf-8"))
+_rules = _doc["resourcePolicy"]["rules"]
+
+_denies = [
+    rule
+    for rule in _rules
+    if rule.get("effect") == "EFFECT_DENY" and "read_value" in rule.get("actions", [])
+]
+assert _denies, "no blanket read_value deny in the copied policy, so the control has nothing to relax"
+for rule in _denies:
+    rule["roles"] = [role for role in rule.get("roles", []) if role != "viewer"]
+
+_allows = [
+    rule
+    for rule in _rules
+    if rule.get("effect") == "EFFECT_ALLOW" and rule.get("roles") == ["viewer"]
+]
+assert _allows, "no viewer allow rule in the copied policy, so the grant has nowhere to go"
+for rule in _allows:
+    if "read_value" not in rule["actions"]:
+        rule["actions"].append("read_value")
+
+_secret.write_text(yaml.safe_dump(_doc, sort_keys=False), encoding="utf-8")
+
+_name = "forgeops-q20-mutation-cerbos"
+subprocess.run(["docker", "rm", "-f", _name], capture_output=True, check=False)
+_started = subprocess.run(
+    [
+        "docker", "run", "-d", "--name", _name,
+        "-p", "127.0.0.1:0:3592",
+        "-v", f"{_tmp / 'policies'}:/policies:ro",
+        "-v", f"{_tmp / 'config'}:/config:ro",
+        _image, "server", "--config=/config/cerbos.yaml",
+    ],
+    capture_output=True, text=True, check=False,
+)
+assert _started.returncode == 0, f"could not start the mutated Cerbos: {_started.stderr[:400]}"
+
+
+def _teardown():
+    subprocess.run(["docker", "rm", "-f", _name], capture_output=True, check=False)
+    shutil.rmtree(_tmp, ignore_errors=True)
+
+
+atexit.register(_teardown)
+
+_mapped = subprocess.run(
+    ["docker", "port", _name, "3592/tcp"], capture_output=True, text=True, check=True
+).stdout.splitlines()[0]
+_port = _mapped.rsplit(":", 1)[-1].strip()
+_url = f"http://127.0.0.1:{_port}"
+
+_deadline = time.time() + 90
+while True:
+    try:
+        with urllib.request.urlopen(f"{_url}/_cerbos/health", timeout=5) as response:
+            if response.status == 200:
+                break
+    except (urllib.error.URLError, OSError):
+        pass
+    assert time.time() < _deadline, "the mutated Cerbos never became healthy"
+    time.sleep(2)
+
+# The mutation must be OBSERVABLE before the property runs. A container serving the
+# unmutated set would make this control report a healthy property for the wrong reason.
+_probe = json.dumps({
+    "requestId": "q20-mutation-probe",
+    "principal": {"id": "33333333-3333-3333-3333-333333333333", "roles": ["viewer"], "attr": {}},
+    "resources": [{"resource": {"kind": "secret", "id": "probe", "attr": {}}, "actions": ["read_value"]}],
+}).encode()
+_request = urllib.request.Request(
+    f"{_url}/api/check/resources", data=_probe, headers={"Content-Type": "application/json"}
+)
+with urllib.request.urlopen(_request, timeout=10) as response:
+    _answer = json.load(response)
+_effect = _answer["results"][0]["actions"]["read_value"]
+assert _effect == "EFFECT_ALLOW", f"the mutated policy set did not take effect: read_value={_effect}"
+
+os.environ["FORGEOPS_TEST_CERBOS_URL"] = _url
+os.environ["FORGEOPS_REQUIRE_INTEGRATION"] = "1"
+"""
+
+[Q-30]
+runtime     = "python"
+property    = "backend/tests/property/test_q30_blast_radius.py"
+target      = "src.auth.principal.blast_radius_for_role"
+mutation    = "Read the env var in the gateway when a principal is present"
+description = """
+Makes an authenticated caller's blast radius the WIDEST of its identity-derived radius and
+`MCP_AGENT_BLAST_RADIUS`, which is the Phase 0 behaviour D-39 removed: the authority of a
+request becomes a property of the server's configuration rather than of the caller, so
+widening it for one caller widens it for all. Q-30 must then fail on both non-widening
+clauses — the one that says the derived radius ignores the variable, and the sharp one where
+the variable is set wider than the identity permits.
+
+Appendix B words the control as "in the gateway". The patch installs it at
+`blast_radius_for_role`, because that is the single function through which an authenticated
+caller's radius could actually be widened — `Principal.for_user` has no `blast_radius`
+parameter, so there is no other route in. A gateway-only edit would leave every principal's
+radius correct and the property would rightly still pass, which would make the control a
+no-op rather than a stronger test. Wording left as Appendix B words it so the two can be
+compared without reading code.
+
+The patch asserts the env var is set and that the mutated function actually widens, so a
+control that installed itself and changed nothing cannot report the property healthy.
+"""
+patch = """
+import os
+
+import src.auth.principal as principal_module
+
+# The variable is a DEV default in D-39's design, so a run that did not set it would make
+# this control a no-op. Setting it here is what the mutation is *about*.
+os.environ["MCP_AGENT_BLAST_RADIUS"] = "infrastructure"
+
+_real_blast_radius_for_role = principal_module.blast_radius_for_role
+
+
+def _widened_by_the_environment(role):
+    identity = _real_blast_radius_for_role(role)
+    from_env = os.environ.get("MCP_AGENT_BLAST_RADIUS", "").strip()
+    if from_env not in principal_module.BLAST_RADIUS_ORDER:
+        return identity
+    return principal_module.widest(identity, from_env)
+
+
+principal_module.blast_radius_for_role = _widened_by_the_environment
+
+# The mutation must be observable, or the control proves nothing.
+from src.auth.models import UserRole  # noqa: E402
+
+assert principal_module.blast_radius_for_role(UserRole.VIEWER) == "infrastructure", (
+    "the mutation did not widen a viewer's radius; the control would be a no-op"
+)
+"""
+
+[Q-14]
+runtime     = "go"
+module_dir  = "agent"
+package     = "./internal/envelope"
+test_run    = "TestProperty_Q14|TestCorpus_"
+original    = "agent/internal/envelope/domain.go"
+overlay     = "backend/tests/mutation/overlays/q14_domain_prefix_removed.go"
+property    = "agent/internal/envelope/q14_property_test.go"
+mutation    = "Remove the domain-separation prefix on one side only"
+description = """
+Replaces `domain.go` with a version whose `DomainPrefix` is the empty string, so the Go
+signing input becomes `0x00 || CanonicalBytes(e)` instead of
+`"forgeops-envelope-v1" || 0x00 || CanonicalBytes(e)`. The mutated build stays perfectly
+self-consistent: it signs and verifies with the same (missing) prefix, so a test that only
+round-trips through one runtime would still pass. That self-consistency is the whole
+difficulty of this class of bug and the reason Appendix B words the control as "on one side
+only".
+
+Three things must then fail, and they fail for three different reasons, which is what makes
+the control worth having rather than one assertion repeated.
+
+`TestProperty_Q14_TheSigningInputCarriesThePrefixAndSeparator` fails immediately: it asserts
+`DomainPrefix` is non-empty and that the signing input begins with it. A property that only
+checked "signing input = prefix ‖ NUL ‖ canonical" would still hold with an empty prefix, which
+is why the non-emptiness is asserted separately.
+
+`TestProperty_Q14_VerificationAcceptsExactlyTheCorrectlySignedEnvelope` fails on the
+domain-separation clause: with the envelope prefix empty, `Sign("", env)` and
+`Sign(DomainPrefix, env)` produce the SAME MAC, and the test requires them to differ. That is
+the clause that says an approval response cannot be replayed as a command — the mutation
+collapses the two domains into one.
+
+`TestCorpus_VerifyAcceptsTheCommittedSignature` fails because `agent/testdata/envelopes/*.json`
+carries signatures computed WITH the prefix by both runtimes. This is the cross-runtime half of
+Q-14 biting: the mutated Go verifier rejects bytes the Python signer produced. It is included in
+`test_run` deliberately, because it is the only assertion in the repository that can observe a
+one-sided divergence at all.
+
+WHY `domain.go` EXISTS. `go build -overlay` replaces a whole file. With these two constants and
+`SigningInput` inside `envelope.go` the overlay would have carried a copy of four hundred and
+fifty lines, rotting on the first unrelated edit. Extracting them keeps the reviewable diff to
+one string, and the overlay keeps `SigningInput`'s signature identical so a change to it stops
+the mutated build compiling rather than silently ceasing to mutate anything. Q-01's row records
+the same reasoning for `rollback.go`.
+
+The Python half of Q-14 lives in `backend/tests/property/test_q14_envelope_canonicalisation.py`
+and is NOT in this row's `test_run`, because a Go overlay cannot affect it. Its own
+domain-separation clause asserts something stronger and different: `signing_input` REFUSES an
+empty prefix, so on that side this mutation cannot be expressed through the public function at
+all.
+"""
+
+[Q-15]
+runtime     = "go"
+module_dir  = "agent"
+package     = "./internal/envelope"
+test_run    = "TestProperty_Q15|TestVerify_"
+original    = "agent/internal/envelope/order.go"
+overlay     = "backend/tests/mutation/overlays/q15_ordering_before_signature.go"
+property    = "agent/internal/envelope/q15_property_test.go"
+mutation    = "Update `last_seq` before the signature check"
+description = """
+Replaces `order.go` with a version whose ordering check runs AHEAD of the signature check.
+Appendix A.2 states the constraint the other way round and explains why in one sentence; this
+control is that sentence turned into a failing test.
+
+Stated as an attack rather than as a diff: `AdvanceSeq` is a compare-and-set, so running it
+first lets an UNAUTHENTICATED caller — anyone able to put bytes on the socket — push a device's
+`seq` high-water mark arbitrarily high before any signature is examined. Every envelope the real
+backend then mints carries a `seq` at or below that mark and is refused as replayed. The device
+is locked out by the very check that exists to protect it, and nothing in the logs looks like an
+attack: it looks like a replay.
+
+`TestProperty_Q15_NoRejectedEnvelopeAdvancesACounter` must then fail. It drives a GENERATED
+stream of events against one verifier and one guard — fresh, replayed nonce, reordered seq,
+expired, too far ahead, forged signature, tampered body, stale bundle — and checks after EVERY
+event that a rejection changed neither the mark nor the nonce set. Under the mutation the forged
+and tampered events advance the mark, which is the clause that fails first.
+
+`TestVerify_` is in `test_run` too, and deliberately: `TestVerify_ABadSignatureDoesNotAdvanceSeq`
+asserts the same thing as a single example, and `rejection_test.go`'s eleven-row table asserts it
+for every reachable refusal. Three independent objections to one mutation, which is what makes
+this control informative rather than merely red.
+
+ONE HONEST EXCEPTION, encoded in the property rather than hidden by it. An AUTHENTICATED
+envelope carrying a fresh `seq` and a REUSED nonce does advance the mark, because ordering
+precedes uniqueness and the set is the check (D-84). The property asserts that case advances the
+mark and asserts every other rejection does not, so a future change in either direction is a
+failing test rather than a quietly weaker guarantee.
+
+WHY `order.go` EXISTS. `go build -overlay` replaces a whole file. With `Verify` inside
+`verify.go` the overlay would have carried a copy of three hundred lines including every check
+helper, rotting on the first unrelated edit. Extracting the ORDER — which is the thing the
+property is about — keeps the reviewable diff to two moved statements. Q-01's row records the
+same reasoning for `rollback.go`, and Q-14's for `domain.go`.
+"""
+
+[Q-16]
+runtime     = "python"
+property    = "backend/tests/property/test_q16_immediate_revocation.py"
+target      = "src.websocket.hub.AgentHub._live"
+mutation    = "Check revocation once per connection instead of per message"
+description = """
+Wraps the hub's per-frame revocation check in a per-connection cache, so the first frame's answer
+is reused for every later frame on the same socket. §3.1 is explicit that the per-message
+`SISMEMBER` is the GUARANTEE and the pub/sub close is only an optimisation; this control turns the
+guarantee back into the optimisation and nothing else changes — the check still runs, still reads
+real Redis, still fails closed. It just stops being asked again.
+
+That is the whole difficulty of the bug: a cached check is indistinguishable from a correct one
+for every test that revokes before the first frame arrives. `test_q16_immediate_revocation.py`
+therefore generates the POSITION of the revocation inside the stream (0 to 4 frames answered
+first), the METHOD the next frame carries, and how many frames queue behind it. Under the mutation
+the clause fails for every generated position except zero, which is exactly the range a
+hand-written example is least likely to cover.
+
+The assertion that bites is on the COUNT of results — the hub must answer exactly the frames that
+preceded the revocation and stop — rather than on "the last frame produced no result", because a
+cached check answers every frame in the stream and a count is what shows it.
+`::test_a_replica_that_never_subscribed_still_refuses` fails for the same reason with no subscriber
+present at all, and `::test_the_control_shows_an_unrevoked_device_is_answered_every_time` keeps the
+whole file from passing for a hub that closes 4403 unconditionally.
+
+Leaf 8.4's `tests/integration/test_agent_hub.py::TestRevocationTakesEffectOnTheNextMessage` also
+objects, and its doubles are imported by the property rather than copied: two definitions of "a
+directory whose `is_revoked` reads the real Redis set" is how a property comes to quantify over a
+shape the integration tests never exercise.
+"""
+patch = """
+import src.websocket.hub as hub_module
+
+# THE GUARD IS LOAD-BEARING. pytest can import a `-p` plugin more than once in a session, and a
+# second import used to re-read `AgentHub._live` -- by then already `_once_per_connection` -- and wrap
+# the wrapper. `_real_live` then pointed at itself, so the first frame recursed until Python raised
+# RecursionError, which is an `Exception`, which `_live`'s own fail-closed handler caught, which
+# called `self._reject` on a duck-typed probe that has no such attribute. The visible result was
+#
+#     INTERNALERROR> AttributeError: 'types.SimpleNamespace' object has no attribute '_reject'
+#
+# and pytest exited 3. The harness read any non-zero exit as "the property failed", so this control
+# was recorded as a kill while the property had never run at all.
+if not getattr(hub_module.AgentHub._live, "_q16_mutation_installed", False):
+    _real_live = hub_module.AgentHub._live
+    _answered: dict[tuple[int, str], bool] = {}
+
+    async def _once_per_connection(self, ws, device_id):
+        key = (id(ws), str(device_id))
+        if key not in _answered:
+            _answered[key] = await _real_live(self, ws, device_id)
+        return _answered[key]
+
+    _once_per_connection._q16_mutation_installed = True
+    hub_module.AgentHub._live = _once_per_connection
+
+# The mutation must be OBSERVABLE before the property runs, or the control proves nothing. A
+# duck-typed self is enough: `_live` reads `self._deps.devices.is_revoked` and, for an unrevoked
+# device, returns True without touching the socket.
+#
+# A LIST rather than a module global, and that is the whole reason this control never worked. The
+# harness indents every patch into `def pytest_sessionstart(session):`, so this body runs inside a
+# function: `_calls = 0` was a local, `global _calls` in the probe bound to a module attribute nothing
+# created, and `_calls += 1` raised NameError. That happened inside `_live`'s `try`, whose fail-closed
+# handler catches any Exception and calls `self._reject` -- which a SimpleNamespace does not have. So
+# the visible failure was
+#
+#     INTERNALERROR> AttributeError: 'types.SimpleNamespace' object has no attribute '_reject'
+#
+# pytest exited 3, no test ran, and the old harness counted the non-zero exit as a kill. Appending to
+# a list captured by closure needs no declaration and cannot fail this way.
+import asyncio  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+_calls = []
+
+
+async def _is_revoked(device_id):
+    _calls.append(device_id)
+    return False
+
+
+_probe = SimpleNamespace(_deps=SimpleNamespace(devices=SimpleNamespace(is_revoked=_is_revoked)))
+_socket = object()
+
+
+async def _observe():
+    await hub_module.AgentHub._live(_probe, _socket, "11111111-1111-4111-8111-111111111111")
+    await hub_module.AgentHub._live(_probe, _socket, "11111111-1111-4111-8111-111111111111")
+
+
+asyncio.run(_observe())
+assert len(_calls) == 1, (
+    f"the underlying revocation check ran {len(_calls)} times for two frames; the cache did not "
+    "install and the control would be a no-op"
+)
+"""
+
+[Q-17]
+runtime     = "python"
+property    = "backend/tests/property/test_q17_pairing_code_safety.py"
+target      = "src.auth.devices.CONSUME_SCRIPT"
+mutation    = "Make the consume script non-atomic (read then delete)"
+description = """
+Splits the single `EVAL` into a read followed by a separate delete, which is what the docstring
+above `CONSUME_SCRIPT` says must never happen. Redis executes one script to completion before the
+next command on that key, so of N concurrent attempts on one code exactly one can observe the key
+and delete it. Two round trips lose that: two callers can both read the key before either deletes
+it, and both are issued credentials for one pairing code.
+
+The mutation is delivered as a script that returns the fields WITHOUT deleting, plus an
+application-level delete after the read — so the window is real rather than simulated, and the
+timing is the operating system's rather than the test's.
+
+`test_q17_pairing_code_safety.py::test_over_generated_concurrency` must then fail. It generates the
+NUMBER of concurrent attempts between two and eight, because a read-then-delete pair is atomic
+*enough* at two attempts on a fast machine and visibly wrong at eight — a fixed concurrency of two
+is a coin toss against this mutation, and the generated count is not. It asserts the count of
+SUCCESSES equals one, so "everything failed" cannot pass, and then reads the database: exactly one
+device row is `active` and its `pairing_token_hmac` is `NULL`, which is Appendix A.1's "the code
+cannot be reused, even in the DB".
+
+Leaf 8.1's `::test_concurrent_attempts_yield_at_most_one_success` objects too, at its fixed
+concurrency of six. Both are in scope; the property is what makes the clause hold at every
+concurrency rather than at one.
+"""
+patch = """
+import src.auth.devices as devices_module
+
+#: The read half only. `HMGET` and the attempt counter stay, so every non-concurrent test still
+#: passes and the ONLY behaviour that changes is the serialisation point.
+_NON_ATOMIC_READ = \"\"\"
+local key = KEYS[1]
+local max_attempts = tonumber(ARGV[1])
+if redis.call('EXISTS', key) == 0 then
+    return {'missing'}
+end
+local attempts = tonumber(redis.call('HINCRBY', key, 'attempts', 1))
+if attempts > max_attempts then
+    redis.call('DEL', key)
+    return {'burned'}
+end
+local fields = redis.call('HMGET', key, 'project', 'tenant', 'issuer', 'device')
+return {'ok', fields[1], fields[2], fields[3], fields[4], tostring(attempts)}
+\"\"\"
+
+_real_eval = None
+
+devices_module.CONSUME_SCRIPT = _NON_ATOMIC_READ
+
+_real_exchange = devices_module.DeviceService.exchange
+
+
+async def _exchange_then_delete(self, session, *, code, csr_pem, meta, client_ip):
+    digest = self._pairing_digest(code)
+    key = devices_module.PAIRING_KEY_PREFIX + digest.hex()
+    try:
+        return await _real_exchange(self, session, code=code, csr_pem=csr_pem, meta=meta, client_ip=client_ip)
+    finally:
+        # The delete the script no longer performs, moved into the application: the window between
+        # the read and this line is the mutation.
+        await self._redis.delete(key)
+
+
+devices_module.DeviceService.exchange = _exchange_then_delete
+
+assert \"DEL\" not in devices_module.CONSUME_SCRIPT.split(\"HMGET\")[-1], (
+    \"the consume script still deletes the key inside the EVAL; the control would be a no-op\"
+)
+"""
+
+[Q-31]
+runtime     = "go"
+module_dir  = "agent"
+package     = "./internal/session"
+test_run    = "TestProperty_Q31|TestJournal"
+original    = "agent/internal/session/journal_kinds.go"
+overlay     = "backend/tests/mutation/overlays/q31_envelope_kind_admitted.go"
+property    = "agent/internal/session/q31_property_test.go"
+mutation    = "Admit a `KindEnvelope` record kind, so the journal can persist an authorisation"
+description = """
+Replaces `journal_kinds.go` with a version that adds `KindEnvelope` and admits it in `validKinds`,
+so `Append` will persist a record carrying a signed command envelope.
+
+THIS DEVIATES FROM APPENDIX B'S WORDING, DELIBERATELY, AND APPENDIX B HAS BEEN AMENDED TO MATCH
+(D-87). Appendix B originally said "add a `KindEnvelope` case to `Drain` that hands the stored
+envelope straight to `executor.Execute`". That case cannot be written as a small, honest overlay,
+because there is nothing for it to consume: D-41's whole argument is that no record kind can carry
+an authorisation, so a `Drain` branch reading one has no input. Writing the branch would mean
+shipping production code whose only purpose is to be broken — a real, reachable path from a
+persisted envelope to the executor, guarded by a test. That is precisely the hole D-41 exists to
+prevent, and Q-01's row warns against controls of that shape.
+
+So the control breaks the fact the property rests on, which is the vocabulary. It bites EARLIER
+than Appendix B's version rather than later: with an envelope kind admitted, the journal can hold
+an authorisation before any drain runs, and the guarantee has already failed at `Append`.
+
+`TestProperty_Q31_TheVocabularyCannotRepresentAnAuthorisation` fails on two clauses — the kind's
+name contains `envelope`, and the set has seven members where D-41 fixes six.
+`TestProperty_Q31_AppendRefusesEveryKindOutsideTheVocabulary` fails because `command.envelope` is
+one of the names it generates and `Append` now accepts it, leaving a record on disk that the same
+test asserts is not there. `TestJournal` is in `test_run` too: leaf 8.5's example tests assert the
+same closed set from the other direction.
+
+WHY `journal_kinds.go` EXISTS. Two reasons. The mechanical one is the overlay: `go build -overlay`
+replaces a whole file, and the table lived inside a four-hundred-and-forty-line `journal.go`.
+The substantive one is that this table IS D-41's guarantee, so a reader checking the claim should
+be able to check it by reading one short file — and a control that breaks it should be a one-line
+diff against that file. `rollback.go` (Q-01), `domain.go` (Q-14) and `order.go` (Q-15) were
+separated for the mechanical reason alone; this one has both.
+"""
+
+[Q-08]
+runtime     = "python"
+property    = "backend/tests/property/test_q08_iteration_bound.py"
+target      = "src.generation.feedback_loop.BoundedFeedbackLoop.execute_loop"
+mutation    = "Let the loop run one iteration past its bound, as if the counter were never decremented"
+description = """
+Appendix B's control is "make `_next` return `Continue` without decrementing". The design
+sketched the loop as a decrementing state machine with `_next` and `attempts_remaining`;
+leaf 13.6 implemented it as a bounded `for` over `range(1, max_iterations + 1)`, so there is
+no `_next` to mutate. The mutation is the same defect against the shape that exists: the
+bound is off by one, exactly as it would be if a `Continue` were returned without
+decrementing, so the loop performs one model call more than `max_iterations` allows.
+
+Q-08 quantifies over generated bounds from 1 to 10 and asserts `iterations_used <=
+max_iters`, so no value of the bound escapes: the mutation exceeds it for every one of them.
+"""
+patch = """
+from src.generation import feedback_loop
+
+
+async def _one_past_the_bound(self, generator_fn, validator_fn):
+    errors = []
+    output = ""
+    # `+ 2` rather than `+ 1`: one iteration past the bound, which is what failing to
+    # decrement buys you.
+    for iter_num in range(1, self.max_iterations + 2):
+        output = generator_fn(errors)
+        valid, errs = validator_fn(output)
+        if valid:
+            return feedback_loop.LoopResult(
+                success=True, iterations_used=iter_num, final_output=output, errors=[]
+            )
+        errors = errs
+    return feedback_loop.LoopResult(
+        success=False,
+        iterations_used=self.max_iterations + 1,
+        final_output=output,
+        errors=errors,
+    )
+
+
+feedback_loop.BoundedFeedbackLoop.execute_loop = _one_past_the_bound
+"""
+
+
+[Q-09]
+runtime     = "python"
+property    = "backend/tests/property/test_q09_rubric_non_interference.py"
+target      = "src.generation.rubric.BlockingGate.evaluate"
+mutation    = "Let the advisory rubric's low score block the gate"
+description = """
+Appendix B's control is "add a `rubric` parameter to `decide` and let a low score block".
+Leaf 13.5 implemented the split as two stateless classes, `BlockingGate.evaluate` and
+`AdvisoryRubric.evaluate`, rather than a `decide` with parameters, so there is no signature
+to widen. The mutation delivers the same defect through the shape that exists: the rubric
+records its score and the gate consults it, so an advisory score below 100 adds a blocking
+violation. That is precisely "advisory output overrides a blocking decision", which is the
+isolation Q-09 exists to defend.
+
+Determinism matters here and is deliberate. The gate CONSUMES the recorded score rather than
+leaving it, so each Hypothesis example starts from the same empty state: `gate.evaluate`
+before the rubric passes, and the same call after it blocks. Left un-consumed, the leftover
+score from the previous example would make both of one example's gate calls agree and the
+property would pass for the wrong reason -- a mutation that hides itself every second
+example is not a control.
+
+The rubric lowers its score for content carrying neither `#` nor `//`, which random
+generated text almost never does, so the interference is reachable on essentially every
+example rather than on a rare one.
+"""
+patch = """
+from src.generation import rubric as rubric_module
+
+_recorded: list[float] = []
+
+_original_rubric_evaluate = rubric_module.AdvisoryRubric.evaluate
+
+
+def _recording_rubric_evaluate(self, content):
+    result = _original_rubric_evaluate(self, content)
+    _recorded.append(result.advisory_score)
+    return result
+
+
+def _gate_consults_the_rubric(self, content):
+    violations = []
+    if "eval(" in content or "exec(" in content:
+        violations.append("Forbidden unsafe call detected")
+    if "rm -rf /" in content:
+        violations.append("Forbidden destructive shell command")
+
+    # The interference: an advisory score blocks admission. Consumed, so the next
+    # example starts clean and the mutation cannot hide behind leftover state.
+    if _recorded:
+        score = _recorded.pop()
+        if score < 100.0:
+            violations.append("Advisory rubric score below threshold")
+
+    return rubric_module.GateResult(passed=len(violations) == 0, violations=violations)
+
+
+rubric_module.AdvisoryRubric.evaluate = _recording_rubric_evaluate
+rubric_module.BlockingGate.evaluate = _gate_consults_the_rubric
+"""
+
+
+[Q-24]
+runtime     = "python"
+property    = "backend/tests/property/test_q24_secret_absence.py"
+target      = "src.secrets.redaction._redact_text"
+mutation    = "Empty the redaction pattern list"
+description = """
+Appendix B's control verbatim, and it is the exact experiment REVIEW-PHASE-0.md Pass 8 ran.
+The two generic patterns -- the classic-PAT shape and the AWS key-id shape -- stop being
+applied while explicit project secrets are still replaced, so redaction still visibly does
+something and only the pattern half is gone. Q-24 samples the two provider shapes, so the
+raw value survives into the payload and both assertions fail: the secret is present and the
+pattern marker is absent.
+
+Removing the whole function would also fail the test, and would be a worse control: it
+cannot distinguish "the pattern table was emptied" from "redaction was deleted", and the
+first is the defect that actually shipped once.
+"""
+patch = """
+import re
+
+from src.secrets import redaction
+
+
+def _no_pattern_table(text, project_secrets=None):
+    result = text
+    # The explicit-secret half is deliberately preserved; only the pattern table is empty.
+    if project_secrets:
+        for secret in project_secrets:
+            result = result.replace(secret, "FORGEOPS_REDACTED_VALUE")
+    return result
+
+
+redaction._redact_text = _no_pattern_table
+"""
+
+[Q-12]
+runtime     = "python"
+property    = "backend/tests/property/test_q12_redaction.py"
+target      = "src.secrets.redaction._redact_text"
+mutation    = "Stop replacing the caller's declared project secrets, keeping only the pattern table"
+description = """
+Appendix B's control is "add a `str` overload to `assemble_prompt`". That control does not
+kill the test leaf 10.6 actually wrote: the test constructs `RedactedChunk` and
+`RedactedInstruction` values and passes those, so widening `assemble_prompt` to accept `str`
+adds an unused path and every assertion still holds. A control that cannot fail is the thing
+Appendix B forbids, so this row mutates the clause the test does depend on instead, and the
+divergence is recorded rather than hidden.
+
+Q-12's subject is that redaction happens BEFORE assembly. The generated secret is a
+`SECRET_..._END` string supplied through `project_secrets`, matching no provider pattern, so
+the explicit-secret replacement is the only thing standing between it and the prompt. With
+that clause gone the value reaches `assemble_prompt` and both assertions fail.
+
+This leaves a real gap, recorded as a finding rather than papered over: nothing in the suite
+proves `assemble_prompt` REFUSES a bare `str`. The type annotation is the only thing saying
+so, and a type annotation is not a runtime chokepoint.
+
+The two provider regexes below are ASSEMBLED from fragments rather than written out, which is
+this repository's standing rule for a credential shape in tracked source
+(`.antigravity/steering/secret-safety.md`, and `scripts/check-added-shapes.py`'s own pattern
+table). The first draft of this row spelled them and the pre-commit hook blocked the commit,
+which is the gate working.
+"""
+patch = """
+import re
+
+from src.secrets import redaction
+
+_PAT_TOKEN = "gh" + "p_" + "[a-zA-Z0-9]{36}"
+_PAT_KEYID = "AK" + "IA" + "[A-Z0-9]{16}"
+
+
+def _pattern_table_only(text, project_secrets=None):
+    result = text
+    # The caller's declared secrets are no longer replaced. The provider patterns still are,
+    # so redaction looks alive and only the explicit half is missing.
+    result = re.sub(_PAT_TOKEN, "FORGEOPS_REDACTED_PATTERN", result)
+    result = re.sub(_PAT_KEYID, "FORGEOPS_REDACTED_PATTERN", result)
+    return result
+
+
+redaction._redact_text = _pattern_table_only
+"""
+
+[Q-18]
+runtime     = "python"
+property    = "backend/tests/property/test_q18_readiness.py"
+target      = "src.projects.readiness.ReadinessEngine.evaluate_project"
+mutation    = "Invert the test-coverage term so declaring tests LOWERS the score"
+description = """
+Appendix B's control is "replace the integer division in `Score`'s per-category term with
+float division". Leaf 12.3 implemented scoring as five flat integer constants summed -- there
+is no division anywhere in `evaluate_project` -- so that control has nothing to change. The
+mutation delivers the same class of defect against the shape that exists: one per-category
+term is computed the wrong way round.
+
+Q-18 asserts monotonicity directly: it re-evaluates with `has_tests` forced True and requires
+`res_more.overall_score >= res1.overall_score`. Inverting the term makes adding tests subtract
+25, so every example generated with `has_tests=False` violates it, and Hypothesis reaches that
+half of a boolean on essentially the first example.
+
+Determinism and the 0..100 bound are left intact on purpose. A mutation that broke all three
+clauses at once would pass this control while telling us nothing about WHICH clause the test
+depends on; monotonicity is the one this row proves is load-bearing.
+"""
+patch = """
+from src.projects import readiness
+
+_original = readiness.ReadinessEngine.evaluate_project
+
+
+def _inverted_test_term(self, project_data):
+    flipped = dict(project_data)
+    # The term is read the wrong way round: declaring tests now scores as if there were none.
+    flipped["has_tests"] = not project_data.get("has_tests", True)
+    return _original(self, flipped)
+
+
+readiness.ReadinessEngine.evaluate_project = _inverted_test_term
+"""
+
+[Q-21]
+runtime     = "python"
+property    = "backend/tests/property/test_q21_template_validity.py"
+target      = "src.generation.template_library.get_default_template_loader"
+mutation    = "Corrupt one template so it carries a placeholder the renderer never substitutes"
+description = """
+Appendix B's control is "corrupt one template's Dockerfile `FROM` line". Taken literally that
+does not kill leaf 15.7's test: the test asserts the port is present and that no `{{` or `}}`
+survives, and a wrong base image satisfies both. So the corruption here is the one the test
+can see, and it is the corruption that matters for this property -- an unresolved mustache
+placeholder reaching a rendered artifact.
+
+`{{UNSUBSTITUTED}}` is appended to whichever template is drawn, so the renderer leaves it in
+place and both placeholder assertions fail. Q-21 samples every registered template, so the
+mutation is reachable for all of them rather than for one.
+"""
+patch = """
+from src.generation import template_library
+
+_original_loader = template_library.get_default_template_loader
+
+
+def _loader_with_a_corrupt_template():
+    loader = _original_loader()
+    _original_render = loader.render
+
+    def _render_leaving_a_placeholder(name, params):
+        rendered = _original_render(name, params)
+        # A placeholder the renderer was never told about, so nothing substitutes it.
+        return rendered + "\\n# LABEL unresolved={{UNSUBSTITUTED}}\\n"
+
+    loader.render = _render_leaving_a_placeholder
+    return loader
+
+
+template_library.get_default_template_loader = _loader_with_a_corrupt_template
+"""
+
+[Q-22]
+runtime     = "python"
+property    = "backend/tests/property/test_q22_changeset_state_legality.py"
+target      = "src.governance.chokepoint.GovernanceChokepoint.approve"
+mutation    = "Remove the optimistic-concurrency `version` predicate, so a stale approval lands"
+description = """
+**Appendix B's control verbatim, for the first time.** The previous version of this row recorded
+that the prescribed control -- "remove the optimistic-concurrency `version` predicate" -- "has no
+target", because leaf 16.1 implemented the state machine over an in-memory dict with no `version`
+column. That was accurate about the dict and wrong about the system: `change_sets.version` has
+existed since revision `0004`, and `GovernanceChokepoint.approve` has predicated its UPDATE on it
+since leaf 7.5. The control had a target the whole time; what it did not have was a property
+pointing at it.
+
+The cause was deeper than a missing mutation. Q-22's property file imported `ApprovalStatus` and
+`ApprovalService` from `src/approvals/` and drove the dictionary, asserting over the uppercase
+vocabulary `PENDING`/`APPROVED`/`REJECTED`/`EXECUTED`/`ROLLED_BACK`. **Not one of those five names is
+in `CHANGE_SET_STATUSES`**, the thirteen §3.6 states revision `0010`'s CHECK constraint enforces. So
+the property named after §3.6's state machine quantified over a different state machine, in a store
+that was not the database, behind a router that was not mounted -- while
+`CHANGE_SET_TRANSITIONS`'s docstring called itself "the single source Q-22 quantifies over" and
+several `chokepoint.py` docstrings cited Q-22 as proof of their concurrency guards. Both citations
+were false.
+
+The property is rewritten to quantify over `CHANGE_SET_TRANSITIONS` and to drive
+`GovernanceChokepoint`, so this row can state Appendix B's control as written.
+
+What the mutation does: the UPDATE keeps its `status = 'pending_approval'` predicate and loses
+`version = :version`, so it no longer refuses an approval built on state the client has not seen.
+Two independent assertions die.
+`test_a_stale_version_is_refused_rather_than_applied` fails because an `expected_version` one behind
+the stored one now updates the row and returns instead of raising 409 -- which is precisely the
+concurrent-approval defect the predicate exists to prevent.
+`test_the_update_carries_both_predicates` fails because the statement no longer contains the clause.
+
+Verified by applying it: 2 failed, 40 passed. Restored afterwards.
+
+The `status` predicate is deliberately left intact, so the control isolates optimistic concurrency
+rather than dissolving the transition guard as well -- the state-machine half is covered by the
+parametrised refusal tests over all thirteen states.
+"""
+patch = """
+from sqlalchemy import text
+
+from src.governance import chokepoint as chokepoint_module
+
+_original_approve = chokepoint_module.GovernanceChokepoint.approve
+
+
+async def _approve_without_the_version_predicate(
+    self, session, *, change_set_id, principal, comment=None, expected_version=None
+):
+    # The one line that differs from the committed method: `AND version = :version` is gone from
+    # the UPDATE, so a stale approval is applied instead of refused.
+    row = await self._load_change_set(session, change_set_id)
+    if row["status"] != "pending_approval":
+        raise chokepoint_module.problem(
+            "change-set-conflict",
+            detail=f"change set {change_set_id} is {row['status']}, not pending_approval",
+        )
+    version = int(row["version"]) if expected_version is None else int(expected_version)
+    admitted = await self._admit(session, project_id=row["project_id"], principal=principal)
+    decision = await self._evaluate_policy(
+        session,
+        principal=principal,
+        admitted=admitted,
+        operation=chokepoint_module.APPLY_OPERATION,
+        items=(),
+        change_set_id=change_set_id,
+    )
+    updated = await session.execute(
+        text(
+            "UPDATE change_sets SET status = 'approved', version = version + 1 "
+            "WHERE id = :id AND status = 'pending_approval'"
+        ),
+        {"id": change_set_id, "version": version},
+    )
+    if updated.rowcount != 1:
+        await session.rollback()
+        raise chokepoint_module.problem(
+            "change-set-conflict",
+            detail=f"change set {change_set_id} was modified concurrently; re-read it and retry",
+        )
+    return chokepoint_module.Submission(
+        change_set_id=change_set_id,
+        status="approved",
+        outcome="approved",
+        audit_seq=0,
+        blast_radius_score=int(row["blast_radius_score"]),
+        blast_radius_verdict=str(row["blast_radius_verdict"]),
+    )
+
+
+chokepoint_module.GovernanceChokepoint.approve = _approve_without_the_version_predicate
+"""
+
+[Q-26]
+runtime     = "python"
+property    = "backend/tests/property/test_q26_sse_well_formedness.py"
+target      = "src.generation.service.GenerationService.stream_generation"
+mutation    = "Emit a second `COMPLETE` after an `ERROR`"
+description = """
+**Appendix B's control verbatim, for the first time.** The previous version of this row recorded that
+the prescribed control could not fail Q-26, because leaf 13.12's test asserted only the framing of
+each frame -- `event: ` prefix, `\\ndata: ` separator, blank-line terminator -- and never counted
+terminal events. The row substituted a framing mutation and documented the gap. The gap is now
+closed in the property rather than worked around here, which is what that note asked for.
+
+Q-26 was thin in a second and worse way, found while giving generation an HTTP surface. All three of
+its original clauses were about FRAMING and none about the event NAME, so the only producer in the
+tree emitted `run_start`, `token_chunk` and `run_complete` -- **not one of which is in
+`SSEEventType`** -- and the property passed on every frame, because a frame with an invented name is
+still a perfectly well-framed frame. §7.4 states "no divergent names may be invented" and nothing
+enforced it. Worse, `tests/integration/test_generation_service.py` ASSERTED the three invented names,
+so the only test naming the vocabulary encoded the violation as the expectation.
+
+The property now carries four clauses -- framing, the closed vocabulary read out of `SSEEventType`,
+exactly one terminal event which is also last, and single-line JSON payloads -- plus a class pinning
+`format_event`'s refusal of a bare string, which is what makes the enum load-bearing instead of
+documentary.
+
+What the mutation does: it appends a `COMPLETE` frame after the stream's terminal event.
+`test_property_q26_a_stream_carries_exactly_one_terminal_event` fails on the count, and its second
+assertion still holds, so the failure is specifically about uniqueness rather than ordering.
+
+One deliberate widening, stated because it is a deviation. Appendix B says "after an `ERROR`", and a
+literal reading appends only on the error path. Phase 1's pipeline is template-rendered and its
+validation gate is deterministic, so every prompt hypothesis generates validates successfully and no
+`ERROR` is ever produced -- a literal patch would never fire and the row would report the property
+healthy without having tested anything. Appending after whichever terminal event occurred preserves
+the clause under test (a client that closed on the first terminal event never sees the second, so the
+two ends disagree about whether the run finished) and fires on the reachable path. On an error run it
+is Appendix B's control exactly.
+"""
+patch = """
+from src.core.sse import SSEEventType, format_event
+from src.generation import service as generation_service
+
+_original_stream = generation_service.GenerationService.stream_generation
+
+_TERMINAL = {SSEEventType.COMPLETE.value, SSEEventType.ERROR.value}
+
+
+def _duplicate_terminal(self, project_id, prompt, **kwargs):
+    async def _generate():
+        saw_terminal = False
+        async for frame in _original_stream(self, project_id, prompt, **kwargs):
+            yield frame
+            name = frame.partition("\\n")[0].removeprefix("event: ")
+            if name in _TERMINAL:
+                saw_terminal = True
+        if saw_terminal:
+            # The second terminal event. A client that closed on the first never sees it.
+            yield format_event(SSEEventType.COMPLETE, {"state": "accepted", "duplicate": True})
+
+    return _generate()
+
+
+generation_service.GenerationService.stream_generation = _duplicate_terminal
+"""
+
+
+[Q-28]
+runtime     = "python"
+property    = "backend/tests/property/test_q28_injection_confinement.py"
+target      = "src.generation.context.assemble_prompt"
+mutation    = "Drop the instruction section, so confined user input never reaches the prompt intact"
+description = """
+Appendix B's control is "log the injected environment map at debug level", which belongs to
+Q-28's secrets-injection half in `secrets/injection` and `executor`. Leaf 10.9's test covers
+only the prompt-assembly half: it asserts the system chunk and the instruction both appear in
+the assembled prompt. The prescribed control cannot fail that, so this row mutates the clause
+the test does depend on.
+
+Recorded as a finding rather than smoothed over: **Q-28's test does not assert confinement.**
+It checks that both strings are present, which an assembler that concatenated everything into
+one undifferentiated blob would also satisfy. Proving the injection stays inside its section
+requires the test to assert on the BOUNDARY, and it does not.
+
+The mutation drops the instruction section entirely, so `payload in assembled` fails for every
+generated input.
+"""
+patch = """
+from src.generation import context as generation_context
+
+_original_assemble = generation_context.assemble_prompt
+
+
+def _assemble_without_the_instruction(system, chunks, instruction):
+    # The instruction section is dropped: whatever the user sent is not in the prompt at all.
+    return _original_assemble(system=system, chunks=chunks, instruction=type(instruction)(""))
+
+
+generation_context.assemble_prompt = _assemble_without_the_instruction
+"""
+
+[Q-29]
+runtime     = "python"
+property    = "backend/tests/property/test_q29_retrieval_degradation.py"
+target      = "src.core.reranker.Reranker.rerank"
+mutation    = "Let the reranker return more documents than it was given"
+description = """
+Appendix B's control is "let a reranker timeout propagate as a 500". It is unreachable from
+leaf 13.13's test, and that is itself the finding: `Reranker.rerank`'s `try` block does pure
+arithmetic over the candidate list and cannot raise for any generated input, so the `except`
+branch -- the fallback the property is named for -- is never entered. **Q-29's test therefore
+does not exercise graceful degradation at all**; it exercises the happy path and checks its
+shape. Closing that needs an injectable failure in the reranker, which this row does not
+invent.
+
+The clause the test does constrain is the length bound, `len(res) <= len(candidates)`, and it
+is a real invariant: a reranker that returns more documents than it was handed has invented
+retrieval results, which is worse than degrading. The mutation emits each candidate twice, so
+every non-empty draw fails.
+"""
+patch = """
+from src.core import reranker as reranker_module
+
+_original_rerank = reranker_module.Reranker.rerank
+
+
+async def _rerank_inventing_documents(self, query, candidates):
+    result = await _original_rerank(self, query, candidates)
+    # Each surviving document is emitted twice: more results out than candidates in.
+    return list(result) + list(result)
+
+
+reranker_module.Reranker.rerank = _rerank_inventing_documents
+"""
+
+
+[Q-07]
+runtime     = "go"
+module_dir  = "agent"
+package     = "./internal/policy"
+test_run    = "TestPropertyQ07"
+original    = "agent/internal/policy/evaluator.go"
+overlay     = "backend/tests/mutation/overlays/q07_drift_is_a_warning.go"
+property    = "agent/internal/policy/q07_property_test.go"
+mutation    = "Make the agent's digest comparison a warning"
+description = """
+Appendix B's control verbatim. The overlay is the committed evaluator with one branch changed:
+the drift comparison logs and falls through to evaluation instead of returning a deny.
+`verify.go` already names this as the control in prose -- "A rejection, never a warning. Q-07's
+negative control is downgrading it" -- so this row makes that sentence executable.
+
+The property file did not exist until this leaf. Leaf 9.7 was recorded `done` with nothing
+behind it while `ErrDrift` and `verify.go`'s comment were both written expecting it, so the one
+line that stops an agent evaluating a bundle the backend never authorised had no property-level
+coverage and no control.
+
+The fixture bundle allows unconditionally and the test asserts that baseline BEFORE quantifying,
+so a deny observed under a mismatched digest is attributable to the comparison and not to a
+bundle that denies everything or an evaluator that failed to load. With the overlay applied
+every mismatched pair returns `allow` and the property fails.
+"""
+
+
+[Q-13]
+runtime     = "python"
+property    = "backend/tests/property/test_q13_cache_key.py"
+target      = "src.ai.routing.cache.TieredSemanticCache._build_key"
+mutation    = "Drop the prompt from the canonical key payload, so the key no longer depends on it"
+description = """
+Appendix B's control is "widen `lookup`/`store` back to `str`". Widening a type annotation
+changes nothing at runtime -- Python does not enforce `NewType` -- so on its own it cannot make
+any assertion fail. This row mutates what widening the type would COST: the key stops being
+computed over the prompt at all, keyed on model and params only.
+
+Two independent clauses die, which is what makes this a strong control rather than a lucky one.
+`test_a_cached_completion_is_not_retrievable_with_unredacted_text` fails because the redacted
+prompt and the raw text now produce the same digest, so the unredacted lookup hits -- exactly
+the leak the `RedactedPrompt` type exists to prevent. And
+`test_distinct_prompts_do_not_share_a_cache_entry` fails because every prompt for a given model
+collides, so one caller reads another's completion.
+
+The property file was rewritten in the same commit as this row and the reason is recorded there:
+the previous version imported only `hashlib`, hashed a value twice and asserted the digests were
+equal, so it exercised no production code and no mutation of the cache could ever have been
+detected.
+"""
+patch = """
+import hashlib
+import json
+
+from src.ai.routing import cache as cache_module
+
+
+def _key_without_the_prompt(self, model, prompt, params):
+    # The prompt is gone from the canonical payload.
+    canonical = json.dumps(
+        {"model": model, "params": params or {}},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+cache_module.TieredSemanticCache._build_key = _key_without_the_prompt
+"""
+
+
+[Q-23]
+runtime     = "go"
+module_dir  = "agent"
+package     = "./internal/fileops"
+test_run    = "TestPropertyQ23"
+original    = "agent/internal/fileops/fileops.go"
+overlay     = "backend/tests/mutation/overlays/q23_deletions_dropped.go"
+property    = "agent/internal/fileops/q23_property_test.go"
+mutation    = "Drop the deletion lines from the rendered diff"
+description = """
+Appendix B's control is "compile change items with `old_content` from the wrong revision", which
+produces a diff whose BEFORE side does not match reality. Dropping the deletion lines is that
+same defect expressed inside the differ, and it is the form this property can observe.
+
+The property file moved from Python to Go in the same commit as this row, and the reason is
+recorded there: the previous `backend/tests/property/test_q23_diff_fidelity.py` imported
+`difflib` and `hypothesis` and called Python's standard-library differ. It never touched
+`FileOps.UnifiedDiff`, so it was a test of CPython, and no mutation of the agent's differ could
+be observed from it. Appendix B names `fileops.UnifiedDiff` as the target and it lives in Go, so
+the property moved to the code instead of the code being re-implemented in the test.
+
+The invariant is the complete-edit-script one: context plus deletions must reproduce the BEFORE
+text and context plus insertions must reproduce the AFTER text. Stated that way it also fails
+under a mutation that reorders or mislabels lines, which a pair of set-membership checks would
+survive. With the deletions gone, reconstruction of BEFORE breaks the moment any line is removed.
+
+The overlay is GENERATED from the committed `fileops.go` rather than hand-transcribed, so it
+cannot drift from the 173-line original it replaces.
+"""
+
+
+[Q-11]
+runtime     = "go"
+module_dir  = "agent"
+package     = "./internal/scanner"
+test_run    = "TestPropertyQ11"
+original    = "agent/internal/scanner/watcher.go"
+overlay     = "backend/tests/mutation/overlays/q11_delete_create_coalesced.go"
+property    = "agent/internal/scanner/q11_property_test.go"
+mutation    = "Coalesce a delete followed by a create into a no-op"
+description = """
+Appendix B's control verbatim. The overlay drains the raw stream and then emits NOTHING for any
+path that saw both a Delete and a Create, so that path leaves the dirty set entirely -- which is
+what makes the defect observable, because Q-11 asserts on the set of paths a rescan must visit.
+
+The property file was rewritten in the same commit and the reason is recorded there: the previous
+version drew a list of paths, built a `map[string]bool` from them inside the test, and asserted
+`len(seen) == 0 && len(paths) > 0`, which cannot hold for any input. It constructed no
+`DebouncedWatcher`, so `WatchDebounced` could have returned an empty channel and it would still
+have passed.
+
+Rewriting it immediately found a real defect in `WatchDebounced`, fixed in the same commit: the
+delivery select offered `<-stopCh` alongside `out <- e`, and the deferred `close(stopCh)` ran while
+sends were still in flight. Both cases were then ready and Go picks uniformly at random, so about
+half the events in flight at shutdown were discarded. A file changed, the event was raised, and
+the index never learned -- exactly the harm this property names.
+
+The overlay is GENERATED from the committed `watcher.go`, so it cannot drift from the 208-line
+original it replaces.
+"""
+
+
+[Q-25]
+runtime     = "go"
+module_dir  = "agent"
+package     = "./internal/scanner/grammars"
+test_run    = "TestPropertyQ25"
+original    = "agent/internal/scanner/grammars/grammars.go"
+overlay     = "backend/tests/mutation/overlays/q25_verification_skipped.go"
+property    = "agent/internal/scanner/grammars/q25_property_test.go"
+mutation    = "Skip digest verification when the blob loads successfully"
+description = """
+Appendix B's control verbatim. `VerifyGrammar` returns nil without comparing digests, while
+`LoadGrammars` still reads every embedded blob -- so the control's stated precondition ("loads
+successfully") holds exactly and only the comparison is gone.
+
+Two things had to change before this control could exist, and both are in the same commit.
+
+The property test was asserting the wrong thing. It called `LoadGrammars`, copied one grammar,
+flipped byte 0, hashed the copy ITSELF and compared that to the locked digest -- an assertion that
+SHA-256 is collision resistant, which is a fact about the hash function and says nothing about
+ForgeOps. The production comparison was never invoked with a mismatching input, so deleting it
+changed no observable behaviour.
+
+`VerifyGrammar` was extracted from `LoadGrammars` to make the comparison reachable, with identical
+behaviour, comparison and error text. The embedded `.wasm` files cannot be modified at runtime --
+that is what `go:embed` is for -- so without a seam no test can watch the check reject anything,
+and Appendix B's control presupposes the seam.
+
+The test asserts both halves. The committed tree must VERIFY before the tampering begins,
+otherwise a mutation that rejected everything would also "pass" a test that only checked that
+tampered blobs are refused, while the agent refused to start.
+"""
+
+
+[Q-10]
+runtime     = "go"
+module_dir  = "agent"
+package     = "./internal/scanner/depgraph"
+test_run    = "TestPropertyQ10"
+original    = "agent/internal/scanner/depgraph/graph.go"
+overlay     = "backend/tests/mutation/overlays/q10_dependants_term_dropped.go"
+property    = "agent/internal/scanner/depgraph/q10_property_test.go"
+mutation    = "Drop the Dependants term from DirtyClosure"
+description = """
+Appendix B's control verbatim. `DirtyClosure` stops enqueueing a changed file's dependents, so it
+returns only the files it was handed and every transitively affected file stays clean -- an
+incremental pass then reindexes strictly less than a full rescan.
+
+The property file moved in the same commit, and the reason is recorded there. The old
+`agent/internal/scanner/q10_property_test.go` created files, called `ScanDirectory`, then called
+`ScanDirectory` again on the SAME unmodified directory and compared the two `Languages` maps. Its
+own comment said "Mutate one file and re-scan" and no mutation was performed, so it compared a
+scan to itself -- true of any deterministic scanner -- and it never touched the dependency closure
+that this control mutates.
+
+Two implementations of one rule, which is what makes "incremental equals full" mean something
+here: `DirtyClosure` walks the graph's maintained `dependents` index, while the test recomputes the
+closure from the raw edge list by fixpoint. The mutation breaks the first and not the second.
+Cycles and self-loops are drawn deliberately, because a closure that only terminates on a DAG
+hangs on a real import graph.
+
+Scope is stated in the property file rather than implied: this covers the dirty closure, not
+chunk-level or summary-level equality, because `analysis/index_service` has no incremental path to
+compare against a full rescan yet.
+"""
+
+
+[Q-06]
+runtime     = "go"
+module_dir  = "agent"
+package     = "./internal/policy"
+test_run    = "TestPropertyQ06"
+original    = "agent/internal/policy/evaluator.go"
+overlay     = "backend/tests/mutation/overlays/q06_prod_clause_inverted.go"
+property    = "agent/internal/policy/q06_property_test.go"
+mutation    = "In the agent's copy of the bundle only, invert approval.rego's prod comparison to !="
+description = """
+Appendix B's control verbatim, and `policies/agent/approval.rego` was written to receive it: its
+header says the fail-closed clauses are "kept syntactically separate from the `!=` and `==` clauses
+on purpose, so Q-06's control still bites on exactly the line Appendix B names".
+
+The overlay rewrites the rego inside `Load`, AFTER the digest has been computed from the original
+bytes. That ordering is required rather than incidental: `loadedDigest` still equals the value the
+test passes to `Evaluate`, so Q-07's drift check does not fire and Q-06 is exercised under its own
+stated precondition (digests EQUAL). Recomputing the digest after patching would make all 64
+fixtures fail with `ErrDrift`, which is Q-07's property -- and a control that fails for the wrong
+reason is not evidence about this one.
+
+The property file did not exist until this leaf. Leaf 9.6 was recorded `done` with nothing behind
+it, while `backend/src/policies/opa.py` carries the comment "It is module-level and side-effect free
+so that Q-06 (leaf 9.6) can generate inputs and feed the *same* mapping to both evaluators without
+an HTTP server in the loop". The mapping was deliberately shaped for a test nobody wrote, so the two
+evaluators of one rule had never been compared.
+
+The corpus is generated by `scripts/gen-governance-fixtures.py` from the PYTHON side -- real
+`governance_input` mapping, real OPA server, real `policies/agent` bundle -- and verified
+independently in Go. Same asymmetric two-way lock as Q-14's envelope corpus. It carries 64 fixtures
+across operations, environments, weekday/timezone instants, change-item sets and blast-radius
+verdicts, yielding 12 distinct decisions. Both a corpus-size floor and a DISTINCT-decision floor are
+committed, because a corpus in which every answer is the same cannot tell an agreeing agent from one
+that returns a constant.
+"""

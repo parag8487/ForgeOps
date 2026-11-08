@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, func, text
+from sqlalchemy import Column, DateTime, Index, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
 
@@ -23,6 +23,17 @@ class Project(SQLModel, table=True):
     """
 
     __tablename__ = "projects"
+    #: Declared here as well as in revision `0013` because `alembic check` compares the model's
+    #: metadata against the database, and an index that exists in one and not the other fails that
+    #: gate — which is the gate working, not a nuisance.
+    __table_args__ = (
+        Index(
+            "ix_projects_active_created_at",
+            "created_at",
+            "id",
+            postgresql_where=text("archived_at IS NULL"),
+        ),
+    )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     # Seam for Phase 1 PostgreSQL RLS. Nullable now; NOT NULL + policies arrive
@@ -44,3 +55,167 @@ class Project(SQLModel, table=True):
             onupdate=func.now(),
         )
     )
+    #: When the project was archived, or NULL while it is active (revision `0013`, PRD FR-05).
+    #:
+    #: A nullable timestamp rather than a status enum. An enum would invite a third value later and
+    #: force every query to enumerate which values mean "visible"; `archived_at IS NULL` has exactly
+    #: one reading and the timestamp answers "when" for free.
+    archived_at: datetime | None = Field(
+        default=None, sa_column=Column("archived_at", DateTime(timezone=True), nullable=True)
+    )
+
+
+#: The only keys `projects.settings` may carry (design.md §6.5 `0009`, §11.3).
+#:
+#: `settings` is JSONB, so the database cannot reject an unknown key without a
+#: check constraint per key — which would make every new setting a migration. The
+#: validation therefore lives here, in one place, and is asserted by
+#: `test_0009_projects.py`. An unknown key is refused rather than ignored: a typo
+#: in `embedding_backend` that silently kept the default is the failure mode this
+#: exists to prevent, and it would only surface as a project whose vectors are in
+#: the wrong table.
+PROJECT_SETTINGS_KEYS: frozenset[str] = frozenset(
+    {
+        "embedding_backend",
+        "llm_budget_usd_month",
+        "favourite",
+        "auto_approve_readme_only",
+        "max_file_size_bytes",
+        "ignore_globs",
+        # Recorded by the GitHub import (FR-01) so a project knows which branch it was imported from
+        # without a second API call. Declared here rather than written past the validator, because
+        # `validate_project_settings` refuses an unknown key and the import must go through it like
+        # any other writer.
+        "repo_default_branch",
+        "repo_private",
+        "repo_languages",
+        # The GitHub-onboarded clone (Part 3). `clone_state` is the one a screen reads: it is
+        # `awaiting_clone` between creating the project and the agent reporting the directory exists,
+        # and absent afterwards. It extends the index-status vocabulary rather than adding a parallel
+        # one — `GET /analysis/codebase/{id}/status` reads it to tell `awaiting_clone` from `empty`,
+        # which share "zero indexed files" and have different next steps.
+        #
+        # `repo_full_name` and `clone_url` are recorded because the clone needs them and a retry must
+        # not depend on the browser still holding what the user picked. Neither is a credential.
+        "clone_state",
+        "repo_full_name",
+        "clone_url",
+    }
+)
+
+#: D-48: a project reads exactly one vector table, chosen here. Changing this once
+#: embeddings exist would mean two vector spaces for one project, which is why
+#: §11.4 returns `409 project-embedding-backend-locked` instead.
+EMBEDDING_BACKENDS: frozenset[str] = frozenset({"voyage", "bge_m3"})
+
+#: The states a GitHub-onboarded project's directory can be in, before it simply exists.
+#:
+#: `awaiting_clone` — the project row exists and points at a path the agent has not created yet.
+#: `cloning` — a signed clone command is in flight.
+#: `clone_failed` — the agent refused or the fetch failed; the reason is in the audit row, and the
+#: state is distinct from `awaiting_clone` because a retry is a different action from a first attempt.
+#:
+#: There is deliberately no `cloned`: once the directory exists the key is REMOVED rather than set to a
+#: success value, so the absence of a clone state means "this is an ordinary project" and nothing
+#: downstream has to know the project came from GitHub.
+CLONE_STATES: frozenset[str] = frozenset({"awaiting_clone", "cloning", "clone_failed"})
+
+
+class ProjectSettingsError(ValueError):
+    """Raised when `projects.settings` carries an unknown key or an invalid value."""
+
+
+def validate_project_settings(settings: dict) -> dict:
+    """Validate `projects.settings` and return it unchanged.
+
+    Raises:
+        ProjectSettingsError: on an unknown key or an invalid value, naming the
+            offending key. Returning a *cleaned* copy was rejected: silently
+            dropping a key the caller believed they set is how a project ends up
+            with settings nobody can account for.
+    """
+    if not isinstance(settings, dict):
+        raise ProjectSettingsError(f"settings must be a mapping, got {type(settings).__name__}")
+
+    unknown = sorted(set(settings) - PROJECT_SETTINGS_KEYS)
+    if unknown:
+        raise ProjectSettingsError(
+            f"unknown project settings key(s) {unknown}; allowed: {sorted(PROJECT_SETTINGS_KEYS)}"
+        )
+
+    backend = settings.get("embedding_backend")
+    if backend is not None and backend not in EMBEDDING_BACKENDS:
+        raise ProjectSettingsError(f"embedding_backend must be one of {sorted(EMBEDDING_BACKENDS)}, got {backend!r}")
+
+    budget = settings.get("llm_budget_usd_month")
+    if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int | float)):
+        raise ProjectSettingsError("llm_budget_usd_month must be a number")
+    if isinstance(budget, int | float) and not isinstance(budget, bool) and budget < 0:
+        raise ProjectSettingsError("llm_budget_usd_month must not be negative")
+
+    for flag in ("favourite", "auto_approve_readme_only"):
+        value = settings.get(flag)
+        if value is not None and not isinstance(value, bool):
+            raise ProjectSettingsError(f"{flag} must be a boolean")
+
+    max_size = settings.get("max_file_size_bytes")
+    if max_size is not None and (isinstance(max_size, bool) or not isinstance(max_size, int)):
+        raise ProjectSettingsError("max_file_size_bytes must be an integer")
+    if isinstance(max_size, int) and not isinstance(max_size, bool) and max_size <= 0:
+        raise ProjectSettingsError("max_file_size_bytes must be positive")
+
+    globs = settings.get("ignore_globs")
+    if globs is not None:
+        if not isinstance(globs, list) or not all(isinstance(g, str) for g in globs):
+            raise ProjectSettingsError("ignore_globs must be a list of strings")
+
+    # A CLOSED SET, for the reason `embedding_backend` has one: the codebase-status route branches on
+    # this value to tell `awaiting_clone` from `empty`, so a typo would make a project that is waiting
+    # for a clone report as merely unscanned — the one confusion the state exists to prevent.
+    clone_state = settings.get("clone_state")
+    if clone_state is not None and clone_state not in CLONE_STATES:
+        raise ProjectSettingsError(f"clone_state must be one of {sorted(CLONE_STATES)}, got {clone_state!r}")
+
+    for text_key in ("repo_full_name", "clone_url"):
+        value = settings.get(text_key)
+        if value is not None and not isinstance(value, str):
+            raise ProjectSettingsError(f"{text_key} must be a string")
+
+    return settings
+
+
+class ProjectTag(SQLModel, table=True):
+    """§11.3's per-project tag. Unique per project, so a tag cannot be added twice.
+
+    Constraint names are spelled out in full for the reason given in
+    `governance/models.py`: SQLModel keeps its own `MetaData` without
+    `core/db.py`'s naming convention, and mutating it would make the name depend
+    on import order.
+    """
+
+    __tablename__ = "project_tags"
+    __table_args__ = (UniqueConstraint("project_id", "tag", name="uq_project_tags_project_id_tag"),)
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="projects.id", index=True, ondelete="CASCADE")
+    tag: str = Field(max_length=64)
+    created_at: datetime = Field(sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()))
+
+
+class ProjectFavourite(SQLModel, table=True):
+    """PRD FR-03's favourite, keyed on the PERSON as well as the project (revision `0013`).
+
+    `projects.settings.favourite` has existed since revision `0009` and is per project, so in any
+    tenant with two people one person starring a project would reorder the other's list. A favourite
+    is a shortcut belonging to whoever made it, so the user id is half of its identity.
+
+    No surrogate primary key. The pair IS the identity: a second row for the same user and project
+    would mean nothing, and a composite key makes that unrepresentable rather than merely refused by
+    a constraint somebody could forget to add.
+    """
+
+    __tablename__ = "project_favourites"
+
+    user_id: uuid.UUID = Field(foreign_key="users.id", primary_key=True, ondelete="CASCADE")
+    project_id: uuid.UUID = Field(foreign_key="projects.id", primary_key=True, index=True, ondelete="CASCADE")
+    created_at: datetime = Field(sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()))

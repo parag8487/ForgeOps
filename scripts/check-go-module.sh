@@ -16,10 +16,23 @@ if [ "$MOD_PATH" != "github.com/parag8487/ForgeOps/agent" ]; then
 fi
 
 # 2. Go 1.26 directive
+#
+# ACCEPTS `1.26` OR `1.26.N`, and the distinction is forced rather than chosen. The invariant this
+# protects is that the module targets the Go 1.26 language version — not 1.25, and not 1.27. A patch
+# suffix does not change the language version.
+#
+# The exact-string form of this check had to go because it made a security fix impossible to take:
+# `golang.org/x/crypto v0.56.0` — the version that fixes GO-2026-6354 and GO-2026-6355 — declares
+# `go 1.26.0`, and Go will not accept a bare `go 1.26` as satisfying a dependency that names a patch.
+# So the module could either carry the vulnerable v0.54.0 or fail this check. That is a gate blocking
+# a fix rather than a defect, which is the one thing a gate must never do.
+#
+# The series itself is still pinned, so drift in either direction still fails.
 GO_VER=$(sed -n 's/^go //p' "$AGENT_DIR/go.mod" | tr -d '\r')
-if [ "$GO_VER" != "1.26" ]; then
-  err "Go directive is '$GO_VER', expected '1.26'"
-fi
+case "$GO_VER" in
+  1.26|1.26.*) ;;
+  *) err "Go directive is '$GO_VER', expected '1.26' or a 1.26 patch release" ;;
+esac
 
 # 3. -mod=readonly (verify go mod download works in readonly mode)
 export PATH="C:/IMP/kiro/_toolchain/go/bin:$PATH"
@@ -42,11 +55,35 @@ if [ -n "$GO_FILES" ]; then
 fi
 
 # 5. No forbidden placeholder packages (structural dirs should have no .go files)
-for dir in executor validator policy devtools; do
-  FOUND=$(find "$AGENT_DIR/internal/$dir" -name '*.go' 2>/dev/null || true)
-  if [ -n "$FOUND" ]; then
-    err "Forbidden .go file(s) in structural directory internal/$dir: $FOUND"
-  fi
+#
+# The list is PHASE-SCOPED and must shrink as directories are populated, or this rule becomes
+# pattern O — a check frozen at a previous phase whose findings are noise. It read
+# `executor validator policy devtools` until leaf 7.10, and `internal/executor` has held real code
+# since leaf 7.2 put the mutation boundary under it (design §2.2.1 mechanism 3, D-45). The check
+# had therefore been failing since then, and nothing noticed because it is wired into neither CI
+# nor pre-commit nor `make lint` — a stale check that nobody runs.
+#
+# That prediction came true exactly as written. `validator` was populated by group 14 and `policy`
+# by leaf 9.4 — 12 and 4 `.go` files respectively — and neither leaf removed its name here, so the
+# rule had six findings, all of them noise, and still nothing noticed because nothing ran it. Both
+# names move to 5b in this pass, which asserts the opposite and would have caught the omission the
+# day either directory was populated. `devtools` genuinely remains structural: the directory exists
+# and holds no `.go` file.
+for dir in devtools; do
+	FOUND=$(find "$AGENT_DIR/internal/$dir" -name '*.go' 2>/dev/null || true)
+	if [ -n "$FOUND" ]; then
+		err "Forbidden .go file(s) in structural directory internal/$dir: $FOUND"
+	fi
+done
+
+# 5b. And the other direction, which is what stops 5 rotting again: a directory that has LEFT the
+# structural list must actually hold code. Without this, removing a name from the loop above would
+# be indistinguishable from deleting the rule.
+for dir in executor envelope session validator policy; do
+	FOUND=$(find "$AGENT_DIR/internal/$dir" -name '*.go' 2>/dev/null || true)
+	if [ -z "$FOUND" ]; then
+		err "internal/$dir is no longer treated as structural but holds no .go file"
+	fi
 done
 
 # 6. tree-sitter absent from go.mod AND go.sum (decision D-1)

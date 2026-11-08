@@ -10,10 +10,10 @@ SHELL := /bin/sh
 DOCKER_COMPOSE_VERSION := 2.24.7
 PIP_TOOLS_VERSION := 7.6.0
 
-.PHONY: help bootstrap init-env clean
+.PHONY: help bootstrap init-env init-ca clean
 .PHONY: build build-agent build-backend build-frontend
 .PHONY: test test-agent test-backend test-frontend
-.PHONY: lint lint-agent lint-backend lint-frontend
+.PHONY: lint lint-agent lint-backend lint-frontend lint-chokepoint
 
 help: ## List the available targets
 	@printf 'ForgeOps — Phase 0 make targets\n\n'
@@ -40,14 +40,30 @@ test-agent: ## Run Go agent tests with the race detector (PRD §9)
 
 test-backend: ## Run Python backend tests
 	@printf '==> test-backend: pytest tests/ -q\n'
-	@cd backend && .venv/Scripts/python -m pytest tests/ -q
+	@# The preflight REFUSES a run whose backing services are down, rather than letting it proceed.
+	@# Without it the DB-backed property tests skip, the mutation harness then correctly reports that
+	@# Q-04/Q-16/Q-17 executed no tests and Q-05 passed under its own negative control -- and all of
+	@# that arrives 66 minutes in, under a summary line that reads like success. It does not start
+	@# anything: a test command that mutated the developer's environment would produce results that
+	@# depend on state they did not choose. See scripts/check-test-services.sh.
+	@bash scripts/check-test-services.sh
+	@cd backend && if [ -x .venv/bin/python ]; then .venv/bin/python -m pytest tests/ -q; elif [ -x .venv/Scripts/python.exe ]; then .venv/Scripts/python.exe -m pytest tests/ -q; elif [ -x .venv/Scripts/python ]; then .venv/Scripts/python -m pytest tests/ -q; else python3 -m pytest tests/ -q; fi
 
 # ─── Lint targets ───────────────────────────────────────────────────────────
-lint: lint-agent lint-backend lint-frontend ## Lint all components
+lint: lint-agent lint-backend lint-frontend lint-chokepoint ## Lint all components
+
+lint-chokepoint: ## Assert the mutation chokepoint is unbypassable (design §2.2.1, Q-03)
+	@printf '==> lint-chokepoint: reachability over both runtimes\n'
+	@bash scripts/check-chokepoint.sh
+
+.PHONY: check-phase-references
+check-phase-references: ## Assert no document names a phase or subsection the plan does not have
+	@printf '==> check-phase-references: every phase reference must resolve against the phase plan\n'
+	@if command -v python3 >/dev/null 2>&1; then python3 scripts/check-phase-references.py; else python scripts/check-phase-references.py; fi
 
 lint-agent: ## Lint Go agent with golangci-lint
-	@printf '==> lint-agent: golangci-lint run\n'
-	@cd agent && golangci-lint run ./...
+	@printf '==> lint-agent: golangci-lint v1.62.2 from agent/tools (checksum-verified)\n'
+	@cd agent && bash ../scripts/go-tool.sh github.com/golangci/golangci-lint/cmd/golangci-lint run ./...
 
 lint-backend: ## Lint Python backend with ruff
 	@printf '==> lint-backend: ruff check\n'
@@ -63,6 +79,10 @@ init-env: ## Create .env from .env.example only when .env is absent
 	@printf '==> init-env: ensuring a local .env exists without overwriting one\n'
 	@sh scripts/init-env.sh
 
+init-ca: ## Generate a development internal CA into .env only when absent; never overwrites
+	@printf '==> init-ca: ensuring a development internal CA exists without overwriting one\n'
+	@sh scripts/init-ca.sh
+
 clean: ## Remove build output only; never .env, lockfiles or Docker volumes
 	@printf '==> clean: removing build output (preserving .env, lockfiles and Docker volumes)\n'
 	@rm -rf dist agent/dist frontend/.next frontend/out frontend/coverage
@@ -72,10 +92,19 @@ clean: ## Remove build output only; never .env, lockfiles or Docker volumes
 	@printf 'clean: build output removed\n'
 
 
-.PHONY: lock-backend
+.PHONY: lock-backend lock-tools worker
+
+worker: ## Run the ARQ worker against the same Settings the API uses (design §4.6)
+	@printf '==> worker: arq src.worker.WorkerSettings\n'
+	@cd backend && arq src.worker.WorkerSettings
 lock-backend: ## Regenerate hash-pinned backend lockfiles from pyproject.toml
 	@printf '==> lock-backend: regenerating requirements.lock and requirements-dev.lock\n'
 	@sh scripts/lock-backend.sh
+
+lock-tools: ## Regenerate the hash-pinned CI tooling lock from requirements-tools.in
+	@printf '==> lock-tools: regenerating scripts/requirements-tools.lock\n'
+	@cd $(CURDIR) && pip-compile --generate-hashes --allow-unsafe --strip-extras \
+		--output-file=scripts/requirements-tools.lock scripts/requirements-tools.in
 
 
 # ─── Frontend targets (task 6) ─────────────────────────────────────────────
@@ -109,7 +138,15 @@ load: ## Run k6 load test (non-gating, requires k6 installed)
 # No target ever passes --profile, so the vault and tools services stay out.
 .PHONY: up down logs smoke
 
-up: init-env ## Start the default profile and wait until /health/ready answers
+# `init-ca` AS WELL AS `init-env`, because the stack now contains a service that cannot start without
+# an internal CA. `backend-agent` serves the agent's mutual-TLS port and issues its server certificate
+# from `INTERNAL_CA_CERT_PEM`/`INTERNAL_CA_KEY_PEM`; with neither set it exits 2 and says so. That is
+# the right behaviour — a listener must not invent trust material and hope nobody notices it is
+# self-signed by itself — but it made `make up` on a fresh clone start a stack that could not deliver
+# an approved change set.
+#
+# Safe to run every time: `init_ca.py` never overwrites an existing CA.
+up: init-env init-ca ## Start the default profile and wait until /health/ready answers
 	@printf '==> up: starting the default Compose profile and polling readiness\n'
 	@sh scripts/dev-up.sh
 
@@ -155,6 +192,18 @@ migrate-new: ## Create a new autogenerated revision; requires m="summary"
 	@printf '==> migrate-new: alembic revision --autogenerate -m "%s"\n' '$(m)'
 	@docker compose run --rm backend alembic revision --autogenerate -m "$(m)"
 
+# ─── Audit chain (task 7.6, design.md §11.9, §13.4, Appendix A.8) ────────────
+.PHONY: verify-chain audit-chain-smoke
+verify-chain: ## Recompute the audit hash chain and report the first divergence (§11.9)
+	@printf '==> verify-chain: recomputing audit_events from seq %s\n' '$(if $(since),$(since),0)'
+	@docker compose run --rm backend python -m src.audit.verify_cli \
+		$(if $(tenant),--tenant $(tenant),) $(if $(since),--since $(since),) \
+		$(if $(rows),--require-rows $(rows),)
+
+audit-chain-smoke: ## Seed the chain, verify it, then tamper one row and require the objection (D-69)
+	@printf '==> audit-chain-smoke: write, verify, tamper, verify, restore\n'
+	@docker compose run --rm -v "$(CURDIR)/scripts:/smoke:ro" backend python /smoke/audit-chain-smoke.py
+
 # ─── Supply chain (tasks 15.6 + 15.8, design.md §8.1–§8.2, §13.4) ───────────
 .PHONY: sbom release-snapshot verify-release
 sbom: ## Generate a CycloneDX SBOM for the agent build (criterion 15)
@@ -168,6 +217,12 @@ release-snapshot: ## Validate the release config without publishing (criterion 7
 verify-release: ## cosign verify-blob + SBOM presence on a published artifact (criterion 16)
 	@printf '==> verify-release: cosign verify-blob + SBOM presence check\n'
 	@sh scripts/verify-release.sh
+
+# ─── Policy bundles (task 9.1, design.md §8.3, §11.7, §13.4) ────────────────
+.PHONY: policy-test
+policy-test: ## opa check --strict + opa test over every Rego bundle (criterion 7)
+	@printf '==> policy-test: opa check --strict + opa test over policies/\n'
+	@bash scripts/policy-test.sh
 
 # ─── End-to-end (task 15.6) ────────────────────────────────────────────────
 .PHONY: e2e

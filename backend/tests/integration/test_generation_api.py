@@ -1,0 +1,359 @@
+# SPDX-License-Identifier: FSL-1.1-ALv2
+"""The generation surface exists, is authenticated, and speaks §7.4's vocabulary.
+
+`generation/` had twelve modules and no `routes.py`. The tests below pin three things: that the
+endpoint is mounted and refuses anonymous callers, that the stream emits ONLY the six event names
+§7.4 fixes — the previous service emitted three that were not among them — and that the frames
+arrive in the order §12.6 step 7 asserts.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+from src.core.sse import SSE_MEDIA_TYPE, SSEEventType, format_event
+from src.generation.service import GeneratedFile, GenerationOutcome, GenerationService
+
+from tests.integration.production_app import apply_committed_baseline_env, real_app_lifespan
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.mandatory]
+
+GENERATION_PATH = "/api/v1/generation/runs"
+
+
+@pytest_asyncio.fixture
+async def app_no_auth(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Any]:
+    from src.main import create_app
+
+    apply_committed_baseline_env(monkeypatch)
+    monkeypatch.setenv("APP_ENV", "test")
+    app = create_app()
+    async with real_app_lifespan(app):
+        yield app
+
+
+def parse_frames(raw: str) -> list[tuple[str, dict[str, Any]]]:
+    """Split an SSE body into (event, payload) pairs, failing on a malformed frame.
+
+    Written as a real parser rather than a substring search so a frame that is subtly wrong — a
+    missing blank line, a split payload — fails the test instead of matching it.
+    """
+    frames: list[tuple[str, dict[str, Any]]] = []
+    for block in raw.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.split("\n")
+        assert lines[0].startswith("event: "), f"frame does not begin with an event field: {block!r}"
+        assert lines[1].startswith("data: "), f"frame has no data field: {block!r}"
+        assert len(lines) == 2, f"a frame must be exactly two lines, got {len(lines)}: {block!r}"
+        frames.append((lines[0].removeprefix("event: "), json.loads(lines[1].removeprefix("data: "))))
+    return frames
+
+
+class TestTheFrameEncoder:
+    """`format_event` is what makes the enum load-bearing rather than documentary."""
+
+    def test_it_encodes_a_well_formed_sse_frame(self) -> None:
+        assert format_event(SSEEventType.TOKEN, {"text": "FROM python"}) == (
+            'event: token\ndata: {"text":"FROM python"}\n\n'
+        )
+
+    def test_it_refuses_an_event_name_outside_the_vocabulary(self) -> None:
+        # The exact defect this closes: the old service emitted `token_chunk`, which no listener
+        # registered for `token` would ever receive — a silently empty stream, not an error.
+        with pytest.raises(TypeError) as raised:
+            format_event("token_chunk", {})  # type: ignore[arg-type]
+        assert "SSEEventType" in str(raised.value)
+
+    def test_a_payload_containing_a_newline_cannot_split_the_frame(self) -> None:
+        # Newlines separate SSE frames, so an unescaped one would make the rest of a Dockerfile
+        # parse as SSE field names. Every artifact this streams contains newlines.
+        frame = format_event(SSEEventType.TOKEN, {"text": "FROM python\nWORKDIR /app"})
+        assert frame.count("\n\n") == 1
+        parsed = parse_frames(frame)
+        assert parsed == [("token", {"text": "FROM python\nWORKDIR /app"})]
+
+
+class TestTheStreamShape:
+    """§12.6 step 7 asserts status -> token(s) -> validation -> complete."""
+
+    async def test_it_emits_the_documented_sequence(self) -> None:
+        outcome = GenerationOutcome(run_id=uuid.uuid4())
+        raw = "".join(
+            [
+                frame
+                async for frame in GenerationService().stream_generation(
+                    uuid.uuid4(), "a python service", outcome=outcome
+                )
+            ]
+        )
+        events = [event for event, _ in parse_frames(raw)]
+
+        assert events[0] == "status"
+        assert events[-1] == "complete"
+        assert "validation" in events
+        assert events.index("validation") < events.index("complete")
+        assert events.count("token") >= 1
+        # Every token precedes the validation verdict: a token after it would mean the gate ran on
+        # output that was still arriving.
+        assert max(i for i, e in enumerate(events) if e == "token") < events.index("validation")
+
+    async def test_every_event_name_is_in_the_vocabulary(self) -> None:
+        raw = "".join([frame async for frame in GenerationService().stream_generation(uuid.uuid4(), "node app")])
+        emitted = {event for event, _ in parse_frames(raw)}
+        allowed = {e.value for e in SSEEventType}
+        # The regression guard for the original defect: run_start, token_chunk and run_complete
+        # would each fail here.
+        assert emitted <= allowed, f"emitted names outside §7.4: {emitted - allowed}"
+
+    async def test_it_produces_every_artifact_kind_fr24_requires(self) -> None:
+        """§12.6 names a Dockerfile AND Kubernetes manifests; FR-24 names two more kinds again.
+
+        This assertion has now been wrong twice in the same way, and the pattern is worth naming. It
+        began as `test_it_produces_the_two_artifacts_step_six_asks_for` requiring exactly
+        `['Dockerfile', 'k8s/deployment.yaml']` — a Deployment with no Service is not a deployable
+        manifest set, nothing can reach the pod, and journey step 10 failed on the missing
+        `k8s/service.yaml`. It then required exactly four.
+
+        Four is still not the requirement. FR-24 is P0 and names containerisation, Kubernetes manifests,
+        **CI/CD pipelines** and **infrastructure as code**. A user given a Dockerfile and manifests has
+        nothing that builds the image and nothing that creates the cluster those manifests need, and the
+        agent's `validate.yaml`, `validate.helm` and `validate.tofu` operations had nothing to check.
+
+        So this asserts the requirement by KIND rather than by a list of paths, plus the exact paths for
+        the four that other tests and the journey depend on by name. A future kind then extends the set
+        without this test having to be rewritten a third time.
+        """
+        outcome = GenerationOutcome(run_id=uuid.uuid4())
+        async for _ in GenerationService().stream_generation(uuid.uuid4(), "a python service", outcome=outcome):
+            pass
+        paths = [f.path for f in outcome.files]
+
+        # The four that are referenced by name elsewhere, in order.
+        assert paths[:4] == [
+            "Dockerfile",
+            "k8s/deployment.yaml",
+            "k8s/service.yaml",
+            "k8s/ingress.yaml",
+        ]
+        # And FR-24's other two kinds, by shape rather than by exact path: the chart and module names
+        # are derived from the project so that two projects do not collide.
+        assert any("/.github/workflows/" in f"/{p}" for p in paths), f"no CI/CD pipeline in {paths}"
+        assert any(p.endswith("Chart.yaml") for p in paths), f"no Helm chart in {paths}"
+        assert any(p.endswith(".tf") for p in paths), f"no infrastructure as code in {paths}"
+
+        assert outcome.validation_passed is True
+        assert outcome.status == "accepted"
+        assert outcome.completion_tokens >= 1
+
+    async def test_the_service_and_ingress_address_the_deployment(self) -> None:
+        """The manifests have to refer to each other, or four files are worse than two.
+
+        A Service whose selector matches no pod, or an Ingress naming a Service that does not exist,
+        would satisfy the path list above and deploy nothing. So the wiring is asserted, not the
+        file count.
+        """
+        outcome = GenerationOutcome(run_id=uuid.uuid4())
+        async for _ in GenerationService().stream_generation(uuid.uuid4(), "a python service", outcome=outcome):
+            pass
+        by_path = {f.path: f.content for f in outcome.files}
+
+        deployment = by_path["k8s/deployment.yaml"]
+        service = by_path["k8s/service.yaml"]
+        ingress = by_path["k8s/ingress.yaml"]
+
+        # The label the Deployment stamps on its pods is the label the Service selects on.
+        assert "app: forgeops-app" in deployment
+        assert "app: forgeops-app" in service
+        # The Ingress backend names the Service, and addresses the port the Service publishes.
+        assert "name: forgeops-app" in ingress
+        assert "number: 80" in ingress
+        assert "port: 80" in service
+        # And the Service targets the container's port rather than repeating 80.
+        assert "targetPort: 8000" in service
+        assert "containerPort: 8000" in deployment
+
+    async def test_the_prompt_selects_the_runtime(self) -> None:
+        node = GenerationOutcome(run_id=uuid.uuid4())
+        async for _ in GenerationService().stream_generation(uuid.uuid4(), "an express node api", outcome=node):
+            pass
+        dockerfile = next(f.content for f in node.files if f.path == "Dockerfile")
+        assert "node:20-alpine" in dockerfile
+        assert "containerPort: 3000" in next(f.content for f in node.files if f.path == "k8s/deployment.yaml")
+
+    async def test_a_terminal_frame_is_always_emitted(self) -> None:
+        # A stream ending in neither `complete` nor `error` is indistinguishable from a dropped
+        # connection, which is the one outcome a client cannot recover from.
+        raw = "".join([frame async for frame in GenerationService().stream_generation(uuid.uuid4(), "x")])
+        assert parse_frames(raw)[-1][0] in {"complete", "error"}
+
+
+class TestTheValidationGateIsDeterministic:
+    """§11.5.5 makes this gate blocking and the rubric advisory, so it must not be a score."""
+
+    def test_it_refuses_a_dockerfile_that_runs_as_root(self) -> None:
+        service = GenerationService()
+        passed, findings = service._validate(
+            (
+                GeneratedFile(path="Dockerfile", content='FROM python:3.11\nCMD ["x"]\n'),
+                GeneratedFile(
+                    path="k8s/deployment.yaml",
+                    content="apiVersion: apps/v1\nkind: Deployment\nmetadata:\nspec:\n",
+                ),
+            )
+        )
+        assert passed is False
+        assert any("USER" in f for f in findings)
+
+    def test_it_refuses_a_dockerfile_with_no_from(self) -> None:
+        passed, findings = GenerationService()._validate(
+            (GeneratedFile(path="Dockerfile", content="RUN echo hi\nUSER 1001\n"),)
+        )
+        assert passed is False
+        assert any("FROM" in f for f in findings)
+
+    def test_it_names_every_finding_rather_than_stopping_at_the_first(self) -> None:
+        passed, findings = GenerationService()._validate(
+            (
+                GeneratedFile(path="Dockerfile", content="FROM x\nUSER 1001\n"),
+                GeneratedFile(path="k8s/deployment.yaml", content="apiVersion: apps/v1\n"),
+            )
+        )
+        assert passed is False
+        # Every problem is reported, not just the first: a repair iteration is handed this list, and
+        # telling a model about one problem at a time turns a single repair into three.
+        #
+        # The manifest here declares an apiVersion and nothing else. The gate used to search for the
+        # substrings "kind:", "metadata:" and "spec:" and report three "missing" findings. It now parses
+        # the document, so it reports what is actually wrong with the object: no usable `kind`, and no
+        # `metadata` mapping — which is a shorter list and a truer one. `spec` is deliberately not
+        # required, because a ConfigMap, a Secret and a ServiceAccount are all valid Kubernetes objects
+        # with no `spec` at all, and the old check would have rejected every one of them.
+        assert len(findings) >= 2, findings
+        assert any("kind" in f for f in findings), findings
+        assert any("metadata" in f for f in findings), findings
+
+    def test_it_rejects_a_manifest_that_mentions_the_right_words_and_is_not_a_manifest(self) -> None:
+        """The defect the substring gate could not catch, stated as a test.
+
+        Every token the old gate looked for is present here, inside comments and a scalar. It parses as
+        YAML, contains "apiVersion:", "kind:", "metadata:" and "spec:", and declares no Kubernetes
+        object whatsoever.
+        """
+        passed, findings = GenerationService()._validate(
+            (
+                GeneratedFile(path="Dockerfile", content="FROM x\nUSER 1001\n"),
+                GeneratedFile(
+                    path="k8s/deployment.yaml",
+                    content=(
+                        "# apiVersion: apps/v1\n"
+                        "# kind: Deployment\n"
+                        "notes: |\n"
+                        "  metadata: and spec: appear here inside a string\n"
+                    ),
+                ),
+            )
+        )
+        assert passed is False, "a document that only mentions the right words passed the gate"
+        assert findings
+
+    def test_it_rejects_a_manifest_that_is_not_yaml_at_all(self) -> None:
+        passed, findings = GenerationService()._validate(
+            (
+                GeneratedFile(path="Dockerfile", content="FROM x\nUSER 1001\n"),
+                GeneratedFile(
+                    path="k8s/deployment.yaml",
+                    content="apiVersion: apps/v1\n  kind: Deployment\n\tmetadata: broken\nspec: x\n",
+                ),
+            )
+        )
+        assert passed is False
+        assert any("parsable" in f or "mapping" in f for f in findings), findings
+
+    def test_it_accepts_a_configmap_which_has_no_spec(self) -> None:
+        """A kind with no `spec` is a valid object, and the substring gate rejected all of them.
+
+        THE DOCKERFILE THAT USED TO BE IN THIS SET IS GONE, and removing it is what makes the assertion
+        about the ConfigMap again. It was `FROM x`, an unpinned base image, which D-106's per-file rule
+        correctly refuses — `dockerfile_base_pinned` is a check that artifact is generated to satisfy. So
+        `passed is False` became the right answer for a reason that has nothing to do with ConfigMaps,
+        and the failure named the Dockerfile while the test name said ConfigMap. One artifact, one
+        property.
+        """
+        passed, findings = GenerationService()._validate(
+            (
+                GeneratedFile(
+                    path="k8s/configmap.yaml",
+                    content="apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  k: v\n",
+                ),
+            )
+        )
+        assert passed is True, findings
+
+    def test_the_artifacts_it_generates_pass_its_own_gate(self) -> None:
+        service = GenerationService()
+        passed, findings = service._validate(service._render("a python service"))
+        assert passed is True, findings
+
+
+class TestItIsMountedAndAuthenticated:
+    async def test_the_endpoint_is_registered(self, app_no_auth: Any) -> None:
+        spec = app_no_auth.openapi()
+        assert GENERATION_PATH in spec["paths"]
+        assert "post" in spec["paths"][GENERATION_PATH]
+
+    async def test_it_declares_an_event_stream_response(self, app_no_auth: Any) -> None:
+        operation = app_no_auth.openapi()["paths"][GENERATION_PATH]["post"]
+        assert SSE_MEDIA_TYPE in operation["responses"]["200"]["content"]
+
+    async def test_it_refuses_an_unauthenticated_caller(self, app_no_auth: Any) -> None:
+        transport = ASGITransport(app=app_no_auth)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(GENERATION_PATH, json={"project_id": str(uuid.uuid4()), "prompt": "hi"})
+        assert response.status_code == 401
+
+    async def test_it_is_not_listed_public(self) -> None:
+        from src.auth.public_routes import is_public
+
+        assert not is_public(GENERATION_PATH, "POST")
+
+    async def test_an_empty_prompt_is_rejected_by_validation(self, app_no_auth: Any) -> None:
+        # min_length=1 on the field, so this is a 422 before the handler — but it must not be a 401
+        # first, or the test would prove nothing about validation. Checked via the schema instead.
+        schema = app_no_auth.openapi()["components"]["schemas"]["GenerationRequest"]
+        assert schema["properties"]["prompt"]["minLength"] == 1
+        assert set(schema["required"]) == {"project_id", "prompt"}
+
+
+class TestItConnectsGenerationToGovernance:
+    """`change_sets.origin='generation'` and `generation_run_id` existed and nothing set them."""
+
+    def test_the_route_submits_through_the_chokepoint(self) -> None:
+        import inspect
+
+        from src.generation import routes
+
+        source = inspect.getsource(routes)
+        # Asserted on the source because the alternative — a full DB round trip — belongs in the
+        # e2e journey, where steps 6 through 9 exercise this path against real tables.
+        assert "chokepoint.submit" in source
+        assert 'origin="generation"' in source
+        assert "generation_run_id=run_id" in source
+
+    def test_generated_items_are_creates_with_content(self) -> None:
+        import inspect
+
+        from src.generation import routes
+
+        source = inspect.getsource(routes)
+        # `update` would require the pre-image `change_items.old_hash` is computed from, and this
+        # endpoint has not read the working tree. Claiming one it never saw is the stale-apply
+        # hazard that column exists to catch.
+        assert 'action="create"' in source

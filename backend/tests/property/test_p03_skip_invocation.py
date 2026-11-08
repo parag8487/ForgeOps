@@ -29,6 +29,7 @@ from src.ai.routing.tiers import (
     TierChain,
     TierConfig,
 )
+from src.secrets.redaction import create_redacted_chunk
 
 # ---------------------------------------------------------------------------
 # Strategies
@@ -78,7 +79,7 @@ class TestOpenBreakerZeroInvocations:
             mock_ep.endpoint_id = eid
             mock_ep.provider_kind = "test"
 
-            async def _invoke(req, *, api_key=None, _eid=eid):
+            async def _invoke(req, *, credential=None, _eid=eid):
                 invocation_counts[_eid] += 1
                 return CompletionResponse(content="should not reach", model="m")
 
@@ -115,7 +116,7 @@ class TestOpenBreakerZeroInvocations:
         mock_final.endpoint_id = final_eid
         mock_final.provider_kind = "test"
 
-        async def _final_invoke(req, *, api_key=None):
+        async def _final_invoke(req, *, credential=None):
             invocation_counts[final_eid] += 1
             return CompletionResponse(content="final ok", model="m")
 
@@ -148,7 +149,7 @@ class TestOpenBreakerZeroInvocations:
         )
 
         request = CompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}])
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request)
+        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request, prompt=create_redacted_chunk("foo"))
 
         # Verify open-breaker endpoints have zero invocations
         for i in range(num_open):
@@ -222,7 +223,7 @@ class TestUnsupportedProtocolZeroInvocations:
         mock_final.endpoint_id = final_eid
         mock_final.provider_kind = "test"
 
-        async def _final_invoke(req, *, api_key=None):
+        async def _final_invoke(req, *, credential=None):
             invocation_counts[final_eid] += 1
             return CompletionResponse(content="final ok", model="m")
 
@@ -255,7 +256,7 @@ class TestUnsupportedProtocolZeroInvocations:
         )
 
         request = CompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}])
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request)
+        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request, prompt=create_redacted_chunk("foo"))
 
         # Verify unsupported endpoints have zero invocations
         for i in range(num_unsupported):

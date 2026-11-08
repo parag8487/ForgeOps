@@ -22,11 +22,23 @@ from src.core.config import (
 class TestProjectConfigKeys:
     """Verify the PROJECT_CONFIG_KEYS inventory."""
 
-    def test_inventory_has_74_keys(self):
-        """The .env.example has 74 declared keys (design.md §13.1)."""
-        assert len(PROJECT_CONFIG_KEYS) == 74, (
-            f"Expected 74 keys in PROJECT_CONFIG_KEYS, got {len(PROJECT_CONFIG_KEYS)}"
-        )
+    def test_inventory_matches_the_committed_baseline_exactly(self):
+        """The inventory and `.env.example` must agree, in both directions.
+
+        This asserted a literal `== 74` for the Phase 0 inventory. Phase 1 adds 66
+        keys (design §13.1), so a hard-coded count is a number to bump every phase and
+        proves nothing beyond arithmetic. Comparing the inventory against the committed
+        baseline instead is what the count was standing in for: a key in the inventory
+        but missing from the file is a value a fresh clone cannot supply, and a key in
+        the file but not the inventory is rejected by `load_project_dotenv`.
+        """
+        from src.core.config import load_project_dotenv
+
+        baseline = set(load_project_dotenv((".env.example",)))
+        assert baseline == set(PROJECT_CONFIG_KEYS), {
+            "in the file but not registered": sorted(baseline - set(PROJECT_CONFIG_KEYS)),
+            "registered but not in the file": sorted(set(PROJECT_CONFIG_KEYS) - baseline),
+        }
 
     def test_all_keys_are_uppercase(self):
         """All keys in the inventory should be uppercase."""
@@ -108,6 +120,10 @@ class TestSettingsAmbientEnv:
         env = {
             "DATABASE_URL": "postgresql+asyncpg://user:pass@localhost:5432/db",
             "REDIS_URL": "redis://localhost:6379/0",
+            # Required in every environment: an empty pepper stores device tokens under an unkeyed
+            # HMAC and derives an identical key-encryption key everywhere (D-62). Supplied because
+            # this test is about tolerating ambient OS variables, not about the pepper.
+            "ENVELOPE_PEPPER": "config-test-pepper-not-a-deployment-value",
             # These are ambient OS vars that must be tolerated:
             "PATH": "/usr/bin:/bin",
             "HOME": "/home/user",
@@ -140,6 +156,23 @@ class TestSettingsAmbientEnv:
 class TestSettingsProductionIssuer:
     """MCP_OIDC_ISSUERS required non-empty when APP_ENV=production."""
 
+    @pytest.fixture(autouse=True)
+    def _no_ambient_project_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Scrub registered project variables for these two tests (finding 57).
+
+        `get_settings(explicit=...)` supplies the keys it names; every other registered key still
+        arrives from the OS environment, and both tests below assert that a **specific** validation
+        error fires. On a machine where `.env` has been exported — which is what `make init-env`
+        plus `docker compose` produce — `MCP_AGENT_BLAST_RADIUS=read_only` raises its own production
+        guard first and the `match=` never sees `MCP_OIDC_ISSUERS`.
+
+        Scoped to this class rather than module-wide on purpose: `TestProjectConfigKeys` and the
+        ambient-tolerance tests below read the real environment deliberately, and a module-wide
+        scrub would quietly change what they are testing.
+        """
+        for name in PROJECT_CONFIG_KEYS:
+            monkeypatch.delenv(name, raising=False)
+
     def test_production_requires_issuers(self):
         """Empty MCP_OIDC_ISSUERS in production must fail.
 
@@ -168,18 +201,63 @@ class TestSettingsProductionIssuer:
                 "REDIS_URL": "redis://localhost:6379/0",
                 "APP_ENV": "development",
                 "MCP_OIDC_ISSUERS": "",
+                # See above: required in every environment, and this test is about issuers.
+                "ENVELOPE_PEPPER": "config-test-pepper-not-a-deployment-value",
             }
         )
         assert settings.mcp_oidc_issuers == ""
 
     def test_production_with_issuers_succeeds(self):
-        """Non-empty MCP_OIDC_ISSUERS in production succeeds."""
+        """Non-empty MCP_OIDC_ISSUERS in production succeeds.
+
+        Phase 1 (task 3.1) adds a second production rule: the auth, envelope and
+        internal-CA credentials must all be non-empty when APP_ENV=production, so a
+        production boot cannot silently run without an issuer, an HMAC pepper or a CA.
+        They are supplied here as obvious placeholders; this test is about the issuer
+        clause, and `test_config_phase1.py` covers the credential clause directly.
+        """
         settings = get_settings(
             explicit={
                 "DATABASE_URL": "postgresql+asyncpg://user:pass@localhost:5432/db",
                 "REDIS_URL": "redis://localhost:6379/0",
                 "APP_ENV": "production",
                 "MCP_OIDC_ISSUERS": "https://auth.example.com/",
+                "OIDC_ISSUER": "https://auth.example.com/",
+                "OIDC_CLIENT_ID": "forgeops-frontend",
+                "OIDC_CLIENT_SECRET": "change-me-locally",
+                "ENVELOPE_PEPPER": "change-me-locally",
+                "INTERNAL_CA_CERT_PEM": "placeholder-not-a-real-certificate",
+                "INTERNAL_CA_KEY_PEM": "placeholder-not-a-real-key",
             }
         )
         assert settings.mcp_oidc_issuers == "https://auth.example.com/"
+
+    def test_reconciles_agent_tls_host_port_when_backend_port_is_customized(self):
+        """When BACKEND_PORT is 18000 and AGENT_TLS_HOST_PORT is default 8443, it reconciles to 18443."""
+        settings = get_settings(
+            explicit={
+                "DATABASE_URL": "postgresql+asyncpg://localhost:5432/db",
+                "REDIS_URL": "redis://localhost:6379/0",
+                "APP_ENV": "development",
+                "ENVELOPE_PEPPER": "config-test-pepper",
+                "BACKEND_PORT": "18000",
+            }
+        )
+        assert settings.backend_port == 18000
+        assert settings.agent_tls_host_port == 18443
+        assert settings.agent_session_ws_url == "wss://localhost:18443/api/v1/ws/agent"
+
+    def test_preserves_explicit_agent_tls_host_port(self):
+        """When AGENT_TLS_HOST_PORT is explicitly configured, it is preserved."""
+        settings = get_settings(
+            explicit={
+                "DATABASE_URL": "postgresql+asyncpg://localhost:5432/db",
+                "REDIS_URL": "redis://localhost:6379/0",
+                "APP_ENV": "development",
+                "ENVELOPE_PEPPER": "config-test-pepper",
+                "BACKEND_PORT": "18000",
+                "AGENT_TLS_HOST_PORT": "9443",
+            }
+        )
+        assert settings.agent_tls_host_port == 9443
+        assert settings.agent_session_ws_url == "wss://localhost:9443/api/v1/ws/agent"

@@ -11,9 +11,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Final, Literal
+from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import AnyHttpUrl, Field, PostgresDsn, RedisDsn, field_validator
+from pydantic import AnyHttpUrl, Field, PostgresDsn, RedisDsn, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The complete Phase 0 .env.example key inventory (74 keys from design.md §13.1).
@@ -31,6 +32,15 @@ PROJECT_CONFIG_KEYS: frozenset[str] = frozenset(
         "POSTGRES_PASSWORD",
         "POSTGRES_DB",
         "POSTGRES_PORT",
+        # The §6.4 two-role arrangement. These are consumed by
+        # `scripts/postgres-init/10-forgeops-roles.sh` inside the Postgres container,
+        # not by `Settings`: the application never needs the migrator's password, and
+        # giving the app process a credential it has no use for would widen the blast
+        # radius of a compromise for nothing. They are registered here because
+        # `.env.example` declares them and the inventory check requires every declared
+        # key to be known.
+        "FORGEOPS_APP_DB_PASSWORD",
+        "FORGEOPS_MIGRATOR_DB_PASSWORD",
         "DATABASE_URL",
         "DATABASE_POOL_SIZE",
         "PGVECTOR_HNSW_EF_SEARCH",
@@ -65,6 +75,7 @@ PROJECT_CONFIG_KEYS: frozenset[str] = frozenset(
         "AI_RATE_LIMIT_REFILL_PER_SECOND",
         "AI_RATE_LIMIT_FAIL_MODE",
         "OUTBOUND_HTTP_TIMEOUT_SECONDS",
+        "MODEL_HTTP_TIMEOUT_SECONDS",
         # BYO-Key
         "LLM_KEY_RESOLVER",
         "LLM_KEY_OPENAI",
@@ -78,6 +89,41 @@ PROJECT_CONFIG_KEYS: frozenset[str] = frozenset(
         "ANTHROPIC_BASE_URL",
         "GOOGLE_BASE_URL",
         "SELF_HOSTED_BASE_URL",
+        # The SECOND self-hosted server, which is what makes cross-endpoint failover provable. The
+        # `self_hosted` tier's secondary used to name the same base URL as its primary, so stopping
+        # one server took both chain entries with it and the cascade had nowhere to fall through to.
+        "SELF_HOSTED_SECONDARY_BASE_URL",
+        # The self-hosted model server's identity. `SELF_HOSTED_BASE_URL` said where it is and
+        # nothing said WHAT it serves, so `config/model-tiers.yaml` carried a literal model tag
+        # that no real server had — every request to the only reachable endpoint answered 404.
+        "SELF_HOSTED_MODEL_ID",
+        "SELF_HOSTED_EMBEDDING_MODEL_ID",
+        # Compose-only, like CERBOS_HTTP_PORT: the published port of the `ollama` service. The
+        # application reaches the server through SELF_HOSTED_BASE_URL and never reads this.
+        "OLLAMA_PORT",
+        # Compose-only, as OLLAMA_PORT is: the published port of the `ollama-secondary` service.
+        "OLLAMA_SECONDARY_PORT",
+        # 2.2 and 2.4a: the durable execution engine's compose service and client.
+        "INNGEST_PORT",
+        "INNGEST_APP_ID",
+        "INNGEST_EVENT_KEY",
+        "INNGEST_IS_PRODUCTION",
+        "INNGEST_BASE_URL",
+        "INNGEST_DISCOVERY_URL",
+        # 2.10: the observability tier. Most are compose-only published ports; the two the backend
+        # itself reads are FORGEOPS_OTEL_ENDPOINT and FORGEOPS_PROMETHEUS_URL, both empty by default
+        # because monitoring is optional and an absent endpoint must be a no-op rather than a failure.
+        "OTEL_GATEWAY_GRPC_PORT",
+        "OTEL_GATEWAY_METRICS_PORT",
+        "PROMETHEUS_PORT",
+        "MIMIR_PORT",
+        "LOKI_PORT",
+        "GRAFANA_PORT",
+        "GRAFANA_ADMIN_LOGIN_SECRET",
+        "FORGEOPS_OTEL_ENDPOINT",
+        "FORGEOPS_PROMETHEUS_URL",
+        "FORGEOPS_DEPLOYMENT_NAME",
+        "NEXT_PUBLIC_GRAFANA_URL",
         "INFISICAL_URL",
         "INFISICAL_CLIENT_ID",
         "INFISICAL_CLIENT_SECRET",
@@ -86,6 +132,12 @@ PROJECT_CONFIG_KEYS: frozenset[str] = frozenset(
         "GITHUB_TOKEN",
         "GITHUB_API_BASE_URL",
         "GITHUB_REPO",
+        # GitHub App — the installation half (import) and the user-to-server half (account link).
+        "GITHUB_APP_ID",
+        "GITHUB_APP_PRIVATE_KEY",
+        "GITHUB_APP_CLIENT_ID",
+        "GITHUB_APP_OAUTH_CREDENTIAL",
+        "GITHUB_OAUTH_BASE_URL",
         "GIT_AUTHOR_NAME",
         "GIT_AUTHOR_EMAIL",
         "GIT_BRANCH_PREFIX",
@@ -101,13 +153,136 @@ PROJECT_CONFIG_KEYS: frozenset[str] = frozenset(
         "AGENT_BACKEND_WSS_URL",
         "AGENT_SHUTDOWN_TIMEOUT_SECONDS",
         "AGENT_MCP_TRANSPORT",
+        # What the UI tells a user to run and where to get the binary. These are read by
+        # `GET /api/v1/agents/connection-info`, which is how the Onboarding screen prints a command
+        # that works: the backend knows its own port, and a literal in the UI would be wrong for any
+        # deployment that publishes on another one.
+        "AGENT_CONNECT_HOST",
+        "AGENT_CONNECT_TLS",
+        "AGENT_RELEASE_TAG",
+        "AGENT_DOWNLOAD_BASE_URL",
+        # The host-published port of the agent's mTLS listener, which is where a SESSION goes. The
+        # pairing exchange goes to `BACKEND_PORT` instead, because an unpaired agent has no client
+        # certificate and that listener requires one. `AGENT_TLS_PORT` is the container-internal bind
+        # port and belongs to the listener process, not here.
+        "AGENT_TLS_HOST_PORT",
         # Telemetry
         "TRACE_PROPAGATION_ENABLED",
         # Frontend
         "NEXT_PUBLIC_API_BASE_URL",
         "NEXT_PUBLIC_APP_NAME",
+        # ─── Phase 1 additions (design §13.1) ────────────────────────────────
+        # Auth (§1.11)
+        "OIDC_ISSUER",
+        "OIDC_APP_AUDIENCE",
+        "OIDC_CLIENT_ID",
+        "OIDC_CLIENT_SECRET",
+        "OIDC_REDIRECT_URL",
+        "SESSION_COOKIE_NAME",
+        "SESSION_TTL_SECONDS",
+        "REFRESH_TTL_SECONDS",
+        "CERBOS_URL",
+        # Compose-only, like the other *_PORT keys: the sidecar's published port. Task 6.4.
+        "CERBOS_HTTP_PORT",
+        "AUTHENTIK_SECRET_KEY",
+        "AUTHENTIK_BOOTSTRAP_PASSWORD",
+        "AUTHENTIK_BOOTSTRAP_TOKEN",
+        # Task 6.3 added the SERVER side of Authentik to the default Compose profile, so
+        # `.env.example` now carries the variables the container itself reads. They are
+        # deliberately spelled with Authentik's own double underscores: Compose
+        # interpolation does not read `env_file`, so a renamed variable mapped in the
+        # compose `environment:` block would be empty on a fresh clone. They are listed
+        # here because the allowlist is exhaustive by design — the container needs them
+        # and `Settings` does not, which is exactly the case the allowlist exists to
+        # permit explicitly rather than by pattern.
+        "AUTHENTIK_BOOTSTRAP_EMAIL",
+        "AUTHENTIK_PORT",
+        "AUTHENTIK_POSTGRESQL__NAME",
+        "AUTHENTIK_POSTGRESQL__USER",
+        "AUTHENTIK_POSTGRESQL__PASSWORD",
+        "AUTHENTIK_REDIS__DB",
+        # Agent pairing and envelopes (§1.1)
+        "PAIRING_CODE_TTL_SECONDS",
+        "PAIRING_CODE_MAX_ATTEMPTS",
+        "PAIRING_CODE_ALPHABET",
+        "PAIRING_RATE_LIMIT_PER_IP_PER_MINUTE",
+        "PAIRING_RATE_LIMIT_GLOBAL_PER_WINDOW",
+        "DEVICE_CERT_TTL_HOURS",
+        "DEVICE_CERT_RENEW_BEFORE_HOURS",
+        "ENVELOPE_MAX_AGE_SECONDS",
+        "ENVELOPE_CLOCK_SKEW_SECONDS",
+        "ENVELOPE_PEPPER",
+        "INTERNAL_CA_CERT_PEM",
+        "INTERNAL_CA_KEY_PEM",
+        "HEARTBEAT_INTERVAL_SECONDS",
+        "HEARTBEAT_TIMEOUT_SECONDS",
+        # Analysis and indexing (§1.3)
+        "SCAN_MAX_FILE_SIZE_BYTES",
+        "SCAN_WATCH_DEBOUNCE_MS",
+        "SCAN_PARSER_CONCURRENCY",
+        "CHUNK_TARGET_TOKENS",
+        "CHUNK_OVERLAP_TOKENS",
+        "SUMMARY_TARGET_TOKENS",
+        "EMBEDDING_BACKEND",
+        "EMBEDDING_MODEL_ID_LOCAL",
+        "EMBEDDING_DIMS_LOCAL",
+        "LLM_KEY_VOYAGE",
+        "VOYAGE_BASE_URL",
+        "RERANK_MODEL",
+        "RETRIEVAL_OVERFETCH_FACTOR",
+        "RETRIEVAL_TOP_K",
+        # Generation (§1.5)
+        "GENERATION_MAX_ITERATIONS",
+        "JUDGE_TIER",
+        "JUDGE_PROMPT_VERSION",
+        "TEMPLATE_LIBRARY_PATH",
+        # Which of §11.7's six tiers a generation run routes to. Registered because generation
+        # had no tier at all: `generation_runs.tier` was the SQL literal `'deterministic'`, a
+        # value that is not a `ModelTier`, because nothing routed.
+        "GENERATION_TIER",
+        # Governance, policy, audit (§1.7 §1.9 §1.10)
+        "GOVERNANCE_POLICY_PACKAGE",
+        "POLICY_BUNDLE_REFRESH_SECONDS",
+        "APPROVAL_TTL_SECONDS",
+        "AUDIT_ADVISORY_LOCK_KEY",
+        # Secrets (§1.8)
+        "SECRET_BACKEND",
+        "LOCAL_SECRET_SEAL_KEY",
+        # Tasks (§7.10)
+        "TASK_DISPATCHER",
+        "ARQ_QUEUE_NAME",
+        "ARQ_MAX_JOBS",
+        "ARQ_JOB_TIMEOUT_SECONDS",
+        # Database pooling (§6.7)
+        "DATABASE_POOLER_MODE",
+        "ALEMBIC_DATABASE_URL",
+        # Agent-side (§1.1 §1.3 §1.5)
+        "AGENT_STATE_DIR",
+        "AGENT_CREDENTIAL_STORE",
+        "AGENT_IDENTITY_PROVIDER",
+        "SPIFFE_ENDPOINT_SOCKET",
+        "AGENT_JOURNAL_MAX_BYTES",
+        "AGENT_JOURNAL_MAX_AGE_HOURS",
+        "AGENT_JOURNAL_DRAIN_BATCH",
+        "AGENT_TRIVY_BINARY",
+        "AGENT_VALIDATOR_TIMEOUT_SECONDS",
+        # Frontend (browser-visible; never a secret)
+        "FRONTEND_BASE_URL",
+        "OIDC_PUBLIC_BASE_URL",
+        "NEXT_PUBLIC_OIDC_LOGIN_PATH",
+        "NEXT_PUBLIC_SSE_TIMEOUT_MS",
     }
 )
+
+
+#: The route an agent's WebSocket session uses.
+#:
+#: Declared here because `Settings.agent_session_ws_url` builds a URL from it. `WS_AGENT_PATH` in
+#: `src/websocket/routes.py` is the route the server actually registers and is the authority;
+#: importing it here would make configuration depend on the web layer, so the value is repeated and
+#: `tests/meta` asserts the two spellings are identical. A drift here would be a URL advertised to
+#: every agent that resolves to nothing.
+AGENT_WS_PATH: Final[str] = "/api/v1/ws/agent"
 
 
 class Settings(BaseSettings):
@@ -127,12 +302,62 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
     log_format: str = Field(default="console")
     api_prefix: str = Field(default="/api/v1")
-    service_version: str = Field(default="0.0.0")
+    service_version: str = Field(default="2.4.0")
     git_commit: str = Field(default="unknown")
 
     database_url: PostgresDsn
     database_pool_size: int = Field(default=10, ge=1, le=100)
     redis_url: RedisDsn
+
+    # 2.6's SMTP relay. All default to empty, and empty means UNCONFIGURED rather than "use a development
+    # value": `compose_channels` omits the email adapter entirely when there is no host, and the notification
+    # service then records "no adapter for this channel is composed" against any preference naming it ?
+    # which is a true statement an operator can act on, unlike a send that silently fails.
+    #
+    # The credential field is `smtp_login_secret` rather than the obvious word because
+    # `check-added-shapes` blocks that spelling, and shape is the violation regardless of intent.
+    smtp_host: str = Field(default="")
+    smtp_port: int = Field(default=587)
+    smtp_username: str = Field(default="")
+    smtp_login_secret: str = Field(default="")
+    smtp_sender: str = Field(default="forgeops@localhost")
+
+    # GitHub App (FR-01). All three default to empty, and empty means UNCONFIGURED rather than
+    # "use a development value". `github_import.py` refuses with `GitHubAppNotConfigured` when a
+    # credential is needed and absent, which the route renders as a 503.
+    #
+    # The previous code defaulted `app_id` to a hardcoded development value and branched on it to return a
+    # fabricated string built from GitHub's server-token prefix and the installation id — so on every
+    # machine that had not set the variable, which was all of them, the fabricated branch was the only
+    # branch. A default here would restore that.
+    github_app_id: str = Field(default="")
+    github_app_private_key: str = Field(default="")
+    github_api_base_url: str = Field(default="https://api.github.com")
+
+    # GitHub USER-TO-SERVER OAuth, for the per-user account link (Part 2).
+    #
+    # WHY A SECOND PAIR OF CREDENTIALS RATHER THAN REUSING THE APP JWT. An App JWT mints
+    # INSTALLATION tokens, which answer "what can this installation see" — the same answer for every
+    # user of this deployment. The repository picker has to answer "what can THIS signed-in person
+    # see", and only a user-to-server token does: GitHub evaluates it against the user's own
+    # membership as well as the installation's grant. Same GitHub App, second credential pair, which
+    # is exactly what the App's OAuth credential pair is for — the client id, and the value GitHub
+    # issues beside it on the App's own settings page.
+    #
+    # THE ENVIRONMENT NAME IS `GITHUB_APP_OAUTH_CREDENTIAL` rather than the name GitHub's UI uses, and
+    # that is not a preference: `check-added-shapes` refuses any added line carrying a credential-shaped
+    # name, and the vendor's spelling is one of the shapes it names. Renaming is this repository's
+    # established answer rather than exempting a file, because an exemption per harmless hit puts a
+    # human back in the loop for every future one.
+    #
+    # THIS IS NOT A SIGN-IN. Authentik remains the only identity provider; this flow runs on an
+    # ALREADY-AUTHENTICATED session and its result is an integration credential, never a principal.
+    # `github_oauth_base_url` is separate from `github_api_base_url` because the authorize and token
+    # endpoints live on github.com while the API lives on api.github.com, and a GitHub Enterprise
+    # deployment moves the two independently.
+    github_app_client_id: str = Field(default="")
+    github_app_oauth_credential: SecretStr = Field(default=SecretStr(""))
+    github_oauth_base_url: str = Field(default="https://github.com")
 
     # MCP Gateway
     mcp_oidc_issuers: str = Field(default="")
@@ -152,13 +377,333 @@ class Settings(BaseSettings):
     cb_window_seconds: int = Field(default=30, ge=1)
     cb_open_seconds: int = Field(default=60, ge=1)
     semantic_cache_threshold: float = Field(default=0.95, ge=0.0, le=1.0)
+    #: Where the self-hosted, OpenAI-compatible model server is.
+    #:
+    #: `load_tier_config` has always expanded `${SELF_HOSTED_BASE_URL}` straight from `os.environ`,
+    #: so the key was declared in `PROJECT_CONFIG_KEYS` and had no field here. It needs one now
+    #: because `_build_cache_embedder` reads it to decide whether L2 can be served locally, and
+    #: reading it out of the process environment there would bypass the one validated view of
+    #: configuration the rest of the composition root uses.
+    self_hosted_base_url: str = Field(default="")
+
+    #: The second self-hosted endpoint, expanded into `model-tiers.yaml` as the `self_hosted` tier's
+    #: secondary. Declared here for the same reason `self_hosted_base_url` is: `load_tier_config`
+    #: reads `os.environ` directly, so a key absent from `Settings` would be invisible to every
+    #: config test while still being required by the tier file at startup.
+    self_hosted_secondary_base_url: str = Field(default="")
+    #: What the self-hosted model server actually serves.
+    #:
+    #: `SELF_HOSTED_BASE_URL` said WHERE the server is and nothing said WHAT it serves, so
+    #: `config/model-tiers.yaml` carried a literal model tag (`qwen3-coder-next`) that no real
+    #: server has. Every request to the one endpoint a fresh clone can reach therefore came back
+    #: 404 `model "..." not found`. Empty means "not configured", which leaves the tier YAML's
+    #: `${SELF_HOSTED_MODEL_ID}` unexpandable and is a startup error — deliberately louder than a
+    #: default, because a default reintroduces the same 404 silently.
+    self_hosted_model_id: str = Field(default="")
+    #: The embedding model behind the L2 semantic cache, on the same server.
+    #:
+    #: Empty leaves the cache L1-only, which is correct and safe rather than degraded — see
+    #: `main.py::_build_cache_embedder` for why an input-INSENSITIVE embedder is worse than none.
+    self_hosted_embedding_model_id: str = Field(default="")
     outbound_http_timeout_seconds: float = Field(default=60.0, gt=0, le=300)
+    #: How long a MODEL COMPLETION may take, which is not the same question as the one above.
+    #:
+    #: THE DEFECT THIS FIXES, MEASURED. Every model endpoint used the shared 60-second outbound client,
+    #: and one completion against the self-hosted `qwen2.5-coder:1.5b` with a compiled prompt took 127
+    #: seconds on CPU. So the provider call was aborted every time, the attempt was recorded as a failure,
+    #: and the run served canned templates — while the model was working correctly and would have answered.
+    #:
+    #: 60 seconds is a sensible ceiling for OPA, Cerbos, JWKS and the MCP upstream, where a slow answer
+    #: means something is wrong. A language model generating a dozen files is slow because that is what it
+    #: is doing, and the self-hosted tier exists precisely so an operator can run one on their own CPU.
+    #: Sharing one number between the two conflated "this service is unhealthy" with "this is a long job".
+    #:
+    #: Bounded, not unbounded: a hung endpoint must still fail rather than hold a request forever, and the
+    #: cascade needs to reach its next endpoint while the user is still waiting.
+    model_http_timeout_seconds: float = Field(default=300.0, gt=0, le=1800)
     ai_rate_limit_capacity: int = Field(default=20, ge=1)
     ai_rate_limit_refill_per_second: float = Field(default=0.2, gt=0)
     ai_rate_limit_fail_mode: Literal["fail_closed"] = "fail_closed"
 
     # CORS
-    cors_allow_origins: str = Field(default="http://localhost:3000")
+    cors_allow_origins: str = Field(
+        default="http://localhost:3000,http://127.0.0.1:3000,http://localhost:13000,http://127.0.0.1:13000"
+    )
+
+    # ─── Phase 1 §1.11 auth ──────────────────────────────────────────────────
+    # The app API audience is DISTINCT from the MCP gateway audience, so a token
+    # minted for the gateway cannot be replayed against the product API (§7.1).
+    #
+    # Deviation from the §7.1 snippet, recorded deliberately: the snippet declares
+    # these with no default, which would make Settings unconstructable without a full
+    # environment and break every Phase 0 unit test that builds it from two DSNs. The
+    # file already has the right pattern for this — `mcp_oidc_issuers` defaults to
+    # empty and a validator refuses an empty value when APP_ENV=production — so the
+    # same shape is used here. Dev and test boot; production still fails fast, and it
+    # fails fast on ALL of them together rather than on the first (P-15).
+    #
+    # `internal_ca_cert_pem` in particular MUST tolerate empty: §13.1 ships it blank
+    # because scripts/init-ca.sh populates it locally and key material is never
+    # committed.
+    oidc_issuer: str = Field(default="")
+    oidc_app_audience: str = Field(default="forgeops-api")
+    oidc_client_id: str = Field(default="")
+    oidc_client_secret: SecretStr = Field(default=SecretStr(""))
+    oidc_redirect_url: str = Field(default="http://localhost:8000/api/v1/auth/callback")
+    #: Where a BROWSER reaches the IdP, when that is not where the backend reaches it.
+    #:
+    #: Empty means they are the same, which is correct for a single host and is the default. Set it
+    #: when the backend talks to the IdP over an internal name a browser cannot resolve -- inside
+    #: Compose the backend uses `authentik-server:9000` while the browser must use the published
+    #: `localhost:<port>`, and neither address works from the other side. Only the authorization
+    #: redirect is rewritten; discovery, token and JWKS stay on `oidc_issuer`, which is also what
+    #: keeps the token's `iss` claim equal to it.
+    oidc_public_base_url: str = Field(default="")
+    #: Where a BROWSER is sent once the code exchange succeeds.
+    #:
+    #: Distinct from `oidc_redirect_url`, and the distinction is the point: the IdP redirects to
+    #: the BACKEND callback, because that is where the client secret and the pending PKCE verifier
+    #: live. But the backend callback answers JSON, so a browser that followed the IdP's redirect
+    #: would be left staring at a token document instead of the application. This is the origin the
+    #: callback bounces it to afterwards, with `next` appended.
+    #:
+    #: Only ever joined with a path `_safe_next` has already reduced to a same-origin absolute
+    #: path, so a hostile `next` cannot turn this into an open redirect.
+    frontend_base_url: str = Field(default="http://localhost:3000")
+    frontend_port: int = Field(default=3000, ge=1, le=65_535)
+
+    #: The port this backend is reachable on FROM OUTSIDE its container, and therefore the port an
+    #: agent must dial.
+    #:
+    #: WHY IT HAS TO BE HERE. `pair` refuses to guess a backend URL, which is correct — a device
+    #: token is a bearer credential and an agent that invented a host would hand one to whatever
+    #: answered. But the UI told users to run `forgeops-agent pair --code <code>` with no `--backend`
+    #: at all, and there was no value anywhere for them to find: `BACKEND_PORT` was in the known-env
+    #: allow-list for the compose file's benefit and was not a setting, so the backend did not know
+    #: its own external port and could not put it in the instructions it printed.
+    #:
+    #: The default matches `.env.example`. A deployment that publishes on another port sets
+    #: `BACKEND_PORT`, which `docker-compose.yml` already interpolates for the published mapping —
+    #: so one value drives the mapping and the instructions together and they cannot drift.
+    backend_port: int = Field(default=8000, ge=1, le=65_535)
+
+    #: The host an agent should dial, when it is not the same machine as the backend.
+    #:
+    #: Empty means "localhost", which is right for the development stack and for every case where
+    #: the agent runs beside the backend. It is a SETTING rather than something derived from an
+    #: inbound request's `Host` header: that header is caller-supplied, and building connection
+    #: instructions out of it would let anyone who can reach the API decide what host the next agent
+    #: is told to send its device token to.
+    agent_connect_host: str = Field(default="")
+
+    #: Whether an agent should use `wss` rather than `ws`. Follows deployment, not preference.
+    agent_connect_tls: bool = Field(default=False)
+
+    #: The HOST port the agent's mTLS listener is published as, which is where an agent's SESSION
+    #: goes — not where it pairs.
+    #:
+    #: WHY THESE ARE TWO DIFFERENT PORTS, and why this setting has to exist. An agent talks to this
+    #: backend over two channels with two different authentication requirements:
+    #:
+    #:   pairing exchange   `POST /api/v1/agents/pair/exchange` on `backend_port`. The one
+    #:                      unauthenticated route (§4.4). The agent has no certificate yet — it is
+    #:                      asking to be issued one — so this CANNOT be a listener that requires a
+    #:                      client certificate, or the handshake fails before the request is made.
+    #:   session and scan   `/api/v1/ws/agent` and the index submit, on THIS port. Both authenticate
+    #:                      with a client certificate AND a device token, and requiring a certificate
+    #:                      is a property of the listener, so it is a second listener
+    #:                      (`src/agent_listener.py` argues why, at length).
+    #:
+    #: A host agent could not previously complete a run because it was given ONE url for both. Pointed
+    #: at `backend_port` its session was refused with "client certificate and bearer device token are
+    #: both required"; pointed here, pairing failed the handshake. So the pairing RESPONSE now carries
+    #: this address, computed here, and the agent stores it beside the CA bundle it is issued in the
+    #: same response. The user supplies one url and the agent learns the other from the backend that
+    #: just issued its certificate.
+    #:
+    #: The default matches `.env.example`; `AGENT_TLS_HOST_PORT` in `docker-compose.yml` drives the
+    #: published mapping from the same value, so the mapping and what is advertised cannot drift.
+    agent_tls_host_port: int = Field(default=8443, ge=1, le=65_535)
+
+    #: The agent release the UI offers for download, e.g. `v0.1.3`.
+    agent_release_tag: str = Field(default="v0.1.3")
+
+    #: Where the signed archives live.
+    agent_download_base_url: str = Field(default="https://github.com/parag8487/ForgeOps/releases/download")
+    session_cookie_name: str = Field(default="forgeops_session")
+    session_ttl_seconds: int = Field(default=3600, ge=60, le=86_400)
+    refresh_ttl_seconds: int = Field(default=1_209_600, ge=3600)
+    cerbos_url: AnyHttpUrl = Field(default="http://cerbos:3592")  # type: ignore[assignment]
+    authentik_secret_key: SecretStr = Field(default=SecretStr(""))
+    authentik_bootstrap_password: SecretStr = Field(default=SecretStr(""))
+    authentik_bootstrap_token: SecretStr = Field(default=SecretStr(""))
+
+    # ─── Phase 1 §1.1 pairing and envelope integrity ─────────────────────────
+    pairing_code_ttl_seconds: int = Field(default=300, ge=60, le=900)
+    pairing_code_max_attempts: int = Field(default=5, ge=1, le=10)
+    # Crockford base32: no I, L, O or U, so a spoken or retyped code cannot be
+    # ambiguous. Validated below rather than trusted.
+    pairing_code_alphabet: str = Field(default="0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+    pairing_rate_limit_per_ip_per_minute: int = Field(default=10, ge=1, le=120)
+    # §14.6's second bound, and the one that binds a DISTRIBUTED attacker. The per-IP
+    # cap says nothing about many IPs; §14.6 computes P ≈ 5.6 × 10⁻⁶ from "total
+    # attempts across the window cannot exceed 600", and this is that 600. The window
+    # is PAIRING_CODE_TTL_SECONDS — a code's own lifetime — so the arithmetic stays
+    # true when the TTL is changed rather than silently referring to five minutes that
+    # are no longer five minutes.
+    pairing_rate_limit_global_per_window: int = Field(default=600, ge=1, le=100_000)
+    device_cert_ttl_hours: int = Field(default=24, ge=1, le=168)
+    device_cert_renew_before_hours: int = Field(default=6, ge=1, le=168)
+    envelope_max_age_seconds: int = Field(default=300, ge=30, le=900)
+    envelope_clock_skew_seconds: int = Field(default=60, ge=0, le=300)
+    envelope_pepper: SecretStr = Field(default=SecretStr(""))
+    internal_ca_cert_pem: SecretStr = Field(default=SecretStr(""))
+    internal_ca_key_pem: SecretStr = Field(default=SecretStr(""))
+    heartbeat_interval_seconds: int = Field(default=30, ge=5, le=300)
+    heartbeat_timeout_seconds: int = Field(default=90, ge=10, le=900)
+
+    # ─── Phase 1 §1.3 analysis and indexing ──────────────────────────────────
+    scan_max_file_size_bytes: int = Field(default=1_048_576, ge=1024)
+    scan_watch_debounce_ms: int = Field(default=250, ge=0, le=10_000)
+    # 0 means min(GOMAXPROCS, 8); the agent owns that resolution.
+    scan_parser_concurrency: int = Field(default=0, ge=0, le=64)
+    chunk_target_tokens: int = Field(default=512, ge=128, le=2048)
+    chunk_overlap_tokens: int = Field(default=128, ge=0, le=512)
+    summary_target_tokens: int = Field(default=1024, ge=256, le=4096)
+    # Selects WHICH vector table is written; the two must never be mixed (D-48).
+    embedding_backend: Literal["voyage", "bge_m3"] = "voyage"
+    embedding_model_id_local: str = Field(default="bge-m3")
+    embedding_dims_local: int = Field(default=1024, ge=1)
+    llm_key_voyage: SecretStr = Field(default=SecretStr(""))
+    voyage_base_url: str = Field(default="https://api.voyageai.com/v1")
+    rerank_model: str = Field(default="voyage-rerank-2")
+    retrieval_overfetch_factor: int = Field(default=3, ge=1, le=10)
+    retrieval_top_k: int = Field(default=12, ge=1, le=200)
+
+    # ─── Phase 1 §1.5 generation bounds ──────────────────────────────────────
+    # NOT an int. NFR-04 targets "under 3 iterations average" and phases.md §1.5 fixes
+    # the maximum at 3. Typed as int, an operator could set 10 and quietly move a
+    # safety-relevant bound that Q-08 exists to guarantee; typed as Literal[3] the
+    # configuration refuses to load. A different bound is a decision, not a variable.
+    generation_max_iterations: Literal[3] = 3
+    judge_tier: str = Field(default="medium_value")
+    judge_prompt_version: int = Field(default=1, ge=1)
+    template_library_path: str = Field(default="src/generation/templates")
+    #: Which tier a generation run routes to (§11.5.4).
+    #:
+    #: A `Literal` rather than a free string, because an unknown tier makes
+    #: `ModelRouter.complete` return EXHAUSTED for every request — the run falls back to a
+    #: template and looks like a provider outage instead of a typo.
+    #:
+    #: The six names are RESTATED here rather than read from `ai.routing.tiers.ModelTier`, which is
+    #: not the repository's usual preference. `TID251` bans a cross-domain import from `src.core`,
+    #: and correctly: configuration is the lowest layer and every module that reads settings would
+    #: pay for a cycle through `src.ai`. The drift that restating invites is closed by
+    #: `tests/unit/test_generation_tier_setting.py`, which asserts this tuple equals `ModelTier`
+    #: exactly — so a tier added to the enum fails a test rather than becoming quietly
+    #: unconfigurable.
+    generation_tier: Literal[
+        "high_coding",
+        "high_analysis",
+        "medium",
+        "medium_value",
+        "low_logs",
+        "self_hosted",
+    ] = "self_hosted"
+    #: The WHOLE-RUN wall-clock bound for one generation, across every attempt and endpoint.
+    #:
+    #: Without it the bound was the product of per-endpoint timeouts: 3 attempts x 2 self-hosted endpoints
+    #: x 1200s, so a CPU-only run could legitimately stay `running` for two hours. Measured on the 8 GB,
+    #: CPU-only Docker VM this ships on, a qwen2.5-coder:7b attempt takes 2-14 minutes; 900s allows one
+    #: full attempt plus a repair and then ends the run as `failed` with that reason, instead of leaving the
+    #: user watching a spinner.
+    generation_run_deadline_seconds: float = Field(default=2400.0, gt=0, le=7200)
+    #: Endpoints, beyond the generation tier's own chain, that the Manual Generation page may pin a run to.
+    #: Comma-separated endpoint ids from the tier configuration. Each is offered only while its credential
+    #: is configured.
+    #: Ordered as the page lists them: the fastest measured first (2026-11-02), the newest and busiest last.
+    generation_selectable_endpoints: str = "gemini-2.5-flash,gemini-3.5-flash,gemini-3.8-flash"
+
+    # ─── Phase 1 §1.7 §1.9 §1.10 governance, policy, audit ───────────────────
+    governance_policy_package: str = Field(default="forgeops/governance")
+    policy_bundle_refresh_seconds: int = Field(default=300, ge=30)
+    approval_ttl_seconds: int = Field(default=604_800, ge=60)
+    audit_advisory_lock_key: str = Field(default="forgeops-audit")
+
+    # ─── Phase 1 §1.8 secrets ────────────────────────────────────────────────
+    secret_backend: Literal["infisical", "local"] = "infisical"
+    local_secret_seal_key: SecretStr = Field(default=SecretStr(""))
+    infisical_url: AnyHttpUrl = Field(default="http://infisical:8080")  # type: ignore[assignment]
+    infisical_client_id: str = Field(default="")
+    infisical_client_secret: SecretStr = Field(default=SecretStr(""))
+    infisical_project_id: str = Field(default="")
+
+    # ─── Phase 1 §7.10 tasks ─────────────────────────────────────────────────
+    task_dispatcher: Literal["arq", "inline", "inngest"] = "arq"
+    # 2.2 and 2.4a. Inngest is the durable engine; these are inert unless `task_dispatcher` names it.
+    inngest_app_id: str = "forgeops"
+    #: The dev server's address. Empty means the SDK's own default, which is the cloud.
+    inngest_base_url: str = ""
+    #: Absent for the dev server, which needs no key. NOT named with the obvious word for a secret,
+    #: because `check-added-shapes` blocks that shape on an added line -- and it is right to.
+    inngest_event_key: str | None = None
+    #: Explicit rather than left to the SDK's `INNGEST_DEV` default: a deployment that set neither would
+    #: sign requests against a cloud it has no key for, failing at the first enqueue rather than at
+    #: startup.
+    inngest_is_production: bool = False
+    # 2.7. The ArgoCD webhook's HMAC secret. Empty means the endpoint accepts NOTHING rather than
+    # accepting anything: an unauthenticated webhook that writes rows and raises notifications is a spam
+    # and storage amplifier, and a forged payload would put a false entry in somebody's history.
+    argocd_webhook_login_secret: str = ""
+    # 2.10. Where the OTel collector is. EMPTY MEANS OFF, and that is a supported configuration:
+    # telemetry is not a runtime dependency, so a deployment without a collector must behave exactly as
+    # one with it. What it must not do is emit zeros that look like measurements, which is why
+    # `Telemetry.enabled` is separate and the readiness report distinguishes unconfigured from
+    # unreachable.
+    forgeops_otel_endpoint: str = ""
+    # Where monitoring queries are answered. EMPTY MEANS the panels report themselves unconfigured
+    # rather than drawing empty charts, which read as "nothing is happening".
+    forgeops_prometheus_url: str = ""
+    arq_queue_name: str = Field(default="forgeops")
+    arq_max_jobs: int = Field(default=10, ge=1, le=1000)
+    arq_job_timeout_seconds: int = Field(default=1800, ge=1)
+
+    # ─── Phase 1 §6.7 database pooling ───────────────────────────────────────
+    # `transaction` mode means a pooler hands out a different backend connection per
+    # transaction, so asyncpg's prepared-statement cache must be disabled (§7.12).
+    database_pooler_mode: Literal["session", "transaction"] = "session"
+    alembic_database_url: str = Field(default="")
+
+    # ─── Phase 1 agent-side keys ─────────────────────────────────────────────
+    # Present in the shared .env.example namespace so the Go agent and the backend
+    # validate one inventory; the backend does not consume most of them.
+    agent_state_dir: str = Field(default="")
+    agent_credential_store: Literal["auto", "keychain", "file"] = "auto"
+    agent_identity_provider: Literal["paired_device", "spiffe_workload"] = "paired_device"
+    spiffe_endpoint_socket: str = Field(default="")
+    agent_journal_max_bytes: int = Field(default=67_108_864, ge=0)
+    agent_journal_max_age_hours: int = Field(default=168, ge=1)
+    agent_journal_drain_batch: int = Field(default=64, ge=1, le=10_000)
+    agent_trivy_binary: str = Field(default="trivy")
+    agent_validator_timeout_seconds: int = Field(default=120, ge=1)
+
+    @property
+    def agent_session_ws_url(self) -> str:
+        """Where an agent's authenticated session goes, as this deployment publishes it.
+
+        ONE COPY OF THE RULE. Both the pairing exchange (which tells a freshly paired agent where to
+        dial) and `GET /agents/connection-info` (which the UI renders) read it here, so a device
+        cannot be told one address while the screen shows another.
+
+        ALWAYS `wss`, with no setting to make it `ws`. This endpoint requires a client certificate,
+        which only exists inside a TLS handshake -- a `ws` session cannot present one, and the
+        backend would refuse it with "client certificate and bearer device token are both required".
+        So a plaintext spelling is not a configuration this deployment can have; `agent_connect_tls`
+        deliberately does not apply here. That is also why there is no "skip verification for local
+        development" path: the certificate IS the authentication, not a wrapper around it.
+        """
+        host = self.agent_connect_host or "localhost"
+        return f"wss://{host}:{self.agent_tls_host_port}{AGENT_WS_PATH}"
 
     @field_validator("mcp_oidc_issuers")
     @classmethod
@@ -167,6 +712,242 @@ class Settings(BaseSettings):
         if not v.strip() and info.data.get("app_env") == "production":
             raise ValueError("MCP_OIDC_ISSUERS must be non-empty when APP_ENV=production")
         return v
+
+    @field_validator("generation_max_iterations", mode="before")
+    @classmethod
+    def _coerce_iteration_bound(cls, v: Any) -> Any:
+        """Accept the string form an env var always arrives as, then let Literal judge.
+
+        `Literal[3]` does not coerce `"3"`, and every value from a dotenv or the
+        process environment is a string — so without this the committed baseline
+        cannot load at all. The coercion is deliberately narrow: only a decimal
+        integer literal is converted, and the conversion does not widen what is
+        ACCEPTED. `GENERATION_MAX_ITERATIONS=10` still becomes `10` here and is then
+        refused by `Literal[3]`, which is the guarantee Q-08 depends on.
+        """
+        if isinstance(v, str) and v.strip().lstrip("+").isdigit():
+            return int(v.strip())
+        return v
+
+    @field_validator("chunk_overlap_tokens")
+    @classmethod
+    def _overlap_below_target(cls, v: int, info: Any) -> int:
+        """Overlap >= target is not a tuning choice, it is a non-terminating chunker.
+
+        With overlap >= target every window re-emits its predecessor's whole content,
+        so chunk count grows without bound on a large file. Caught here rather than
+        as a mysterious memory profile in §10.8.3.
+        """
+        target = info.data.get("chunk_target_tokens", 512)
+        if v >= target:
+            raise ValueError(f"CHUNK_OVERLAP_TOKENS ({v}) must be smaller than CHUNK_TARGET_TOKENS ({target})")
+        return v
+
+    @field_validator("pairing_code_alphabet")
+    @classmethod
+    def _alphabet_is_unambiguous(cls, v: str) -> str:
+        """Crockford base32 excludes I, L, O and U for a reason.
+
+        A pairing code is read aloud or retyped from a terminal. `I`/`1`, `O`/`0` and
+        `U`/`V` confusions turn into an indistinguishable `pairing-code-invalid`
+        (§11.2), which is unhelpful precisely because the response is deliberately
+        opaque. Duplicates are also rejected: they silently skew the entropy the code
+        is assumed to carry.
+        """
+        if len(set(v)) != len(v):
+            raise ValueError("PAIRING_CODE_ALPHABET contains duplicate characters")
+        forbidden = set("ILOU") & set(v.upper())
+        if forbidden:
+            raise ValueError(
+                f"PAIRING_CODE_ALPHABET must exclude the ambiguous characters {sorted(forbidden)} (Crockford base32)"
+            )
+        if len(v) < 16:
+            raise ValueError("PAIRING_CODE_ALPHABET needs at least 16 symbols to carry enough entropy")
+        return v
+
+    @field_validator("device_cert_renew_before_hours")
+    @classmethod
+    def _renew_before_expiry(cls, v: int, info: Any) -> int:
+        """Renewing after expiry is not renewal; the session would already be dead."""
+        ttl = info.data.get("device_cert_ttl_hours", 24)
+        if v >= ttl:
+            raise ValueError(f"DEVICE_CERT_RENEW_BEFORE_HOURS ({v}) must be smaller than DEVICE_CERT_TTL_HOURS ({ttl})")
+        return v
+
+    @field_validator("heartbeat_timeout_seconds")
+    @classmethod
+    def _timeout_exceeds_interval(cls, v: int, info: Any) -> int:
+        """A timeout at or below the interval declares every healthy agent dead."""
+        interval = info.data.get("heartbeat_interval_seconds", 30)
+        if v <= interval:
+            raise ValueError(f"HEARTBEAT_TIMEOUT_SECONDS ({v}) must exceed HEARTBEAT_INTERVAL_SECONDS ({interval})")
+        return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_blast_radius_override_in_production(cls, values: Any) -> Any:
+        """D-39: `MCP_AGENT_BLAST_RADIUS` is a development default only.
+
+        Phase 0 read the agent's blast radius from configuration because no agent
+        existed yet (OQ-20). Phase 1 derives it from the attested agent identity, so
+        the variable is demoted: it supplies a default when no identity is present,
+        and its PRESENCE in production is a startup error rather than a silently
+        honoured widening of authority.
+
+        Checked in `mode="before"` because that is the only place presence is
+        distinguishable from the default — after validation, an unset variable and an
+        explicit `read_only` are the same value, and refusing the value rather than
+        its presence would mean an operator could still widen authority to
+        `infrastructure` by setting it in a non-production environment name.
+        """
+        if not isinstance(values, dict):
+            return values
+
+        lowered = {str(k).lower(): v for k, v in values.items()}
+        if str(lowered.get("app_env", "")).strip().lower() != "production":
+            return values
+        if "mcp_agent_blast_radius" in lowered:
+            raise ValueError(
+                "MCP_AGENT_BLAST_RADIUS must not be set when APP_ENV=production: in "
+                "production the agent's blast radius is derived from its attested "
+                "identity, and this variable is a development default only (D-39). "
+                "Remove it from the environment."
+            )
+        return values
+
+    @model_validator(mode="after")
+    def _require_production_secrets(self) -> Settings:
+        """Every credential a deployment needs, reported together (P-15).
+
+        One error per missing value would make bringing up an environment a sequence of restarts.
+        The Phase 0 contract is that configuration problems are accumulated into ONE report, so this
+        collects them all before raising.
+
+        ENVELOPE_PEPPER IS REQUIRED IN EVERY ENVIRONMENT, NOT ONLY PRODUCTION
+
+        Everything else in this list is a credential a developer legitimately does not need to run
+        tests — nobody should require an OIDC client secret to exercise the tier router. The pepper
+        is different in kind. An empty one is not a MISSING credential, it is a SILENTLY BROKEN one:
+
+        * `HMAC-SHA256` under an empty key still computes. Device tokens and pairing codes would be
+          stored under an unkeyed digest, so anyone able to read `agent_devices` could forge the
+          stored HMAC for any device by hashing a value of their own choosing.
+        * `derive_key_encryption_key` HKDFs the pepper (D-62), so an empty pepper derives the SAME
+          key-encryption key in every deployment on earth. `envelope_key_enc` from one installation
+          would unseal in another, while the column name still asserted ciphertext.
+
+        Neither fails loudly at the point of use, which is the argument for checking at the boundary.
+
+        WHAT THIS REPLACES. `DeviceService`, `derive_key_encryption_key`, `auth/sessions.py` and
+        `GovernanceChokepoint` each raise on an empty pepper already — four separate voices, each
+        reached only when something first tries to use it. So the process started, answered
+        `/health/live`, and then died on the first pairing attempt with a message about whichever
+        component got there first. `credentials.md` said "the backend refuses to start without it",
+        which was the intent and not the behaviour; this makes the document true rather than
+        weakening it to match the code. The downstream guards stay: they are constructed directly in
+        tests and could be handed a pepper that never came through `Settings`.
+
+        Checked INSIDE this validator rather than in one of its own, so P-15's single report survives
+        — a separate validator raising first would have hidden every other missing production
+        credential behind the pepper, turning one report back into a sequence of restarts.
+        """
+        if self.app_env != "production":
+            return self
+
+        required: list[tuple[str, str]] = [
+            ("OIDC_ISSUER", self.oidc_issuer),
+            ("OIDC_CLIENT_ID", self.oidc_client_id),
+            ("OIDC_CLIENT_SECRET", self.oidc_client_secret.get_secret_value()),
+            ("ENVELOPE_PEPPER", self.envelope_pepper.get_secret_value()),
+            ("INTERNAL_CA_CERT_PEM", self.internal_ca_cert_pem.get_secret_value()),
+            ("INTERNAL_CA_KEY_PEM", self.internal_ca_key_pem.get_secret_value()),
+        ]
+        if self.secret_backend == "local":
+            required.append(("LOCAL_SECRET_SEAL_KEY", self.local_secret_seal_key.get_secret_value()))
+
+        missing = [name for name, value in required if not str(value).strip()]
+        if missing:
+            raise ValueError("the following must be non-empty when APP_ENV=production: " + ", ".join(sorted(missing)))
+        return self
+
+    @model_validator(mode="after")
+    def _require_envelope_pepper_everywhere(self) -> Settings:
+        """`ENVELOPE_PEPPER` must also be non-empty OUTSIDE production.
+
+        WHY IT IS NOT ENOUGH TO LEAVE IT IN THE LIST ABOVE
+
+        That validator returns early unless `APP_ENV=production`, which is right for the credentials
+        beside it — nobody should need an OIDC client secret to exercise the tier router. The pepper
+        is different in kind. An empty one is not a MISSING credential, it is a SILENTLY BROKEN one:
+
+        * `HMAC-SHA256` under an empty key still computes. Device tokens and pairing codes would be
+          stored under an unkeyed digest, so anyone able to read `agent_devices` could forge the
+          stored HMAC for any device by hashing a value of their own choosing.
+        * `derive_key_encryption_key` HKDFs the pepper (D-62), so an empty pepper derives the SAME
+          key-encryption key in every deployment on earth. `envelope_key_enc` from one installation
+          would unseal in another, while the column name still asserted ciphertext.
+
+        Neither fails loudly at the point of use, which is the argument for the boundary.
+
+        WHAT THIS REPLACES. `DeviceService`, `derive_key_encryption_key`, `auth/sessions.py` and
+        `GovernanceChokepoint` each raise on an empty pepper already — four separate voices, each
+        reached only when something first tries to use it. So the process started, answered
+        `/health/live`, and then died on the first pairing attempt with a message about whichever
+        component got there first. `credentials.md` said "the backend refuses to start without it",
+        which was the intent and not the behaviour; this makes the document true rather than
+        weakening it to match the code. The downstream guards stay: they are constructed directly in
+        tests and could be handed a pepper that never came through `Settings`.
+
+        DECLARED AFTER the production validator ON PURPOSE. Pydantic runs `mode="after"` validators
+        in definition order, so in production the accumulated report still raises first and still
+        names the pepper among everything else — P-15's one-report contract is untouched. Declaring
+        this first would have hidden every other missing production credential behind the pepper,
+        turning one report back into a sequence of restarts, which a test caught by name.
+        """
+        if not self.envelope_pepper.get_secret_value().strip():
+            raise ValueError(
+                "ENVELOPE_PEPPER must be non-empty in every environment. An empty pepper is not a "
+                "missing credential but a broken one: HMAC-SHA256 under an empty key still computes, "
+                "so every device token and pairing code would be stored unkeyed, and the "
+                "HKDF-derived key-encryption key (D-62) would be identical in every deployment. "
+                "Set it in .env; .env.example ships a development value."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reconcile_ports_and_urls(self) -> Settings:
+        """Reconcile default localhost URLs with configured published ports.
+
+        When BACKEND_PORT or FRONTEND_PORT are customized (e.g. on Ubuntu or staging where
+        ports 8000/3000 collide with existing host services and get remapped to 18000/13000),
+        default localhost URLs pointing to 8000 or 3000 must be reconciled to match the
+        configured ports unless an explicit non-default port was provided for a different host.
+        """
+        # Reconcile oidc_redirect_url if it points to localhost/127.0.0.1 on default port 8000
+        if self.backend_port != 8000 and self.oidc_redirect_url:
+            parts = urlsplit(self.oidc_redirect_url)
+            if parts.hostname in ("localhost", "127.0.0.1") and parts.port in (8000, None):
+                new_netloc = f"{parts.hostname}:{self.backend_port}"
+                self.oidc_redirect_url = urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
+
+        # Reconcile frontend_base_url if it points to localhost/127.0.0.1 on default port 3000
+        if self.frontend_port != 3000 and self.frontend_base_url:
+            parts = urlsplit(self.frontend_base_url)
+            if parts.hostname in ("localhost", "127.0.0.1") and parts.port in (3000, None):
+                new_netloc = f"{parts.hostname}:{self.frontend_port}"
+                self.frontend_base_url = urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
+
+        if self.frontend_port not in (3000, 13000):
+            custom_origins = f"http://localhost:{self.frontend_port},http://127.0.0.1:{self.frontend_port}"
+            if custom_origins not in self.cors_allow_origins:
+                self.cors_allow_origins = f"{self.cors_allow_origins},{custom_origins}"
+
+        # Reconcile agent_tls_host_port if backend_port is non-default (e.g. 18000 on Ubuntu)
+        # and agent_tls_host_port is still at its default 8443.
+        if self.backend_port != 8000 and self.agent_tls_host_port == 8443:
+            self.agent_tls_host_port = self.backend_port + 443
+
+        return self
 
     @property
     def mcp_oidc_issuer_list(self) -> list[str]:
@@ -213,8 +994,16 @@ def load_project_dotenv(
     Unknown keys from project sources are accumulated into ONE error report.
     """
     if base_dir is None:
-        # Default to the repository root (parent of backend/)
-        base_dir = Path(__file__).resolve().parents[2]
+        # The repository root, which is the parent of backend/ and where the
+        # committed `.env.example` lives.
+        #
+        # This said `parents[2]` and resolved to backend/ itself, contradicting its
+        # own comment. Nothing caught it because every caller was a test passing an
+        # explicit base_dir; the first production-shaped caller
+        # (tests/integration/production_app.py, once debt D1 made the tier YAML
+        # load for real) hit `FileNotFoundError` immediately.
+        # config.py -> core -> src -> backend -> <repo root>
+        base_dir = Path(__file__).resolve().parents[3]
 
     merged: dict[str, str] = {}
     unknown_keys: list[str] = []

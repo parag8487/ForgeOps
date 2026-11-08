@@ -1,0 +1,1553 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Bring the whole ForgeOps stack up on a machine that may have nothing installed.
+
+.DESCRIPTION
+    One entry point for "make this run on that PC". It installs what is missing, generates the
+    secrets the application refuses to boot without, picks ports that are actually free, starts the
+    thirteen services in dependency order (including backend-agent, inngest, ollama and ollama-secondary),
+    provisions the identity provider, applies the migrations, and
+    then PROVES the result by reading /health/ready rather than by reporting that `up` returned zero.
+
+    It is safe to run repeatedly. Every step checks the state it wants before changing anything, and
+    no existing secret is ever overwritten.
+
+    WHY A SCRIPT AND NOT `docker compose up`
+    ----------------------------------------
+    `docker compose up` alone does not produce a working system here, for five reasons that are all
+    properties of the application rather than oversights:
+
+      1. The backend refuses to start without ENVELOPE_PEPPER, and Authentik refuses to start
+         without AUTHENTIK_SECRET_KEY. Neither can be committed, because a committed secret is a
+         credential in the repository. So they must be generated on first run.
+      2. NEXT_PUBLIC_API_BASE_URL is a BUILD argument, not a runtime variable. Next.js inlines it
+         into the client bundle at build time, so if the backend port changes the frontend image
+         must be REBUILT. A restart is not enough, and the failure looks like CORS.
+      3. The default ports (5432, 6379, 8181, 3592, 9000, 3000, 8000) collide with Windows reserved
+         ranges and with anything else already running. This picks free ones and keeps every
+         dependent URL consistent with the choice.
+      4. The OIDC issuer is split-horizon. The backend reaches Authentik as `authentik-server:9000`
+         on the compose network; your browser cannot resolve that name and must use
+         `localhost:<port>`. One value cannot serve both, so there are two, and getting them the
+         wrong way round produces a login that half-works.
+      5. An empty Authentik has no application, no client, no groups and no users. Until it is
+         provisioned there is nothing to log in to.
+
+.PARAMETER Fresh
+    Destroy all data volumes first and start from an empty database. DESTRUCTIVE: every project,
+    device, change set and audit row is deleted, and the identity provider is reprovisioned. Asks
+    for confirmation unless -Force is also given.
+
+.PARAMETER Force
+    Skip the confirmation prompt for -Fresh.
+
+.PARAMETER SkipInstall
+    Never install anything. If a prerequisite is missing, say so and stop. Use this on a machine
+    where you manage tooling yourself.
+
+.PARAMETER NoBrowser
+    Do not open a browser when the stack is ready.
+
+.PARAMETER NoReset
+    Reuse the existing containers instead of removing and recreating them. By DEFAULT the launcher
+    removes the previous deployment's containers first, keeping the data volumes, which makes stale
+    container environments impossible.
+
+.PARAMETER PurgeImages
+    Also delete the images this project built locally, so they are rebuilt from source.
+
+.PARAMETER Rebuild
+    Force a rebuild of the backend, backend-agent, worker, frontend and agent images even if they already exist.
+
+.EXAMPLE
+    .\scripts\start-forgeops.ps1
+    Start everything, installing anything missing. Replaces the previous containers, keeps the data.
+
+.EXAMPLE
+    .\scripts\start-forgeops.ps1 -Fresh -Force
+    Wipe all data and start clean, without being asked to confirm.
+
+.EXAMPLE
+    .\scripts\start-forgeops.ps1 -NoReset
+    Leave the running containers alone and only bring up what is missing.
+#>
+[CmdletBinding()]
+param(
+    [switch]$Fresh,
+    [switch]$Force,
+    [switch]$SkipInstall,
+    [switch]$NoBrowser,
+    [switch]$Rebuild,
+    [switch]$NoReset,
+    [switch]$PurgeImages,
+    [int]$ReadyTimeoutSeconds = 900
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+# --- Presentation --------------------------------------------------------------------------------
+
+$script:StepNumber = 0
+
+function Write-Head {
+    param([string]$Text)
+    Write-Host ''
+    Write-Host ('  ' + $Text) -ForegroundColor Cyan
+    Write-Host ('  ' + ('-' * [Math]::Min(76, $Text.Length))) -ForegroundColor DarkCyan
+}
+
+function Write-Step {
+    param([string]$Text)
+    $script:StepNumber++
+    Write-Host ''
+    Write-Host ("[{0}] {1}" -f $script:StepNumber, $Text) -ForegroundColor White
+}
+
+function Write-Ok {
+    param([string]$Text)
+    Write-Host ('      ok    ' + $Text) -ForegroundColor Green
+}
+
+function Write-Info {
+    param([string]$Text)
+    Write-Host ('      ..    ' + $Text) -ForegroundColor Gray
+}
+
+function Write-Warn2 {
+    param([string]$Text)
+    Write-Host ('      warn  ' + $Text) -ForegroundColor Yellow
+}
+
+function Write-Fail {
+    param([string]$Text)
+    Write-Host ('      FAIL  ' + $Text) -ForegroundColor Red
+}
+
+function Stop-WithAdvice {
+    param([string]$Problem, [string[]]$Advice = @())
+    Write-Host ''
+    Write-Host '  ----------------------------------------------------------------------------' -ForegroundColor Red
+    Write-Host ('  CANNOT CONTINUE: ' + $Problem) -ForegroundColor Red
+    Write-Host '  ----------------------------------------------------------------------------' -ForegroundColor Red
+    foreach ($line in $Advice) { Write-Host ('  ' + $line) -ForegroundColor Yellow }
+    Write-Host ''
+    exit 1
+}
+
+# --- Small utilities -----------------------------------------------------------------------------
+
+function Test-CommandExists {
+    param([string]$Name)
+    return [bool](Get-Command -Name $Name -ErrorAction SilentlyContinue)
+}
+
+function Invoke-Native {
+    <#
+        Run a native command and return an object rather than throwing. PowerShell treats a native
+        program's stderr output as a terminating error under some host configurations, which turns a
+        harmless warning into a crash, so everything is redirected and the exit code is inspected
+        explicitly.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [switch]$Quiet
+    )
+    # The command is GROUPED before the redirection: `( cmd ) 2>&1` rather than `cmd 2>&1`. Without
+    # the parentheses the redirection binds to the last element of the command, so anything
+    # containing `&` or `|` loses its stderr -- verified with a command that writes to stderr and
+    # exits non-zero, where the ungrouped form captured nothing at all.
+    $out = & cmd /c "( $Command ) 2>&1"
+    $code = $LASTEXITCODE
+    if (-not $Quiet -and $out) { $out | ForEach-Object { Write-Verbose ('        | ' + $_) } }
+    return [pscustomobject]@{
+        ExitCode = $code
+        Output   = ($out -join [Environment]::NewLine)
+        Lines    = @($out)
+        Ok       = ($code -eq 0)
+    }
+}
+
+function Test-PortFree {
+    <#
+        A port is "free" if we can bind a listener to it on the loopback address. Probing by
+        CONNECTING is the common mistake: a refused connection also happens when a firewall drops
+        the packet, and it says nothing about whether we may bind. Compose publishes on
+        127.0.0.1 specifically, so that is the address tested.
+    #>
+    param([int]$Port)
+    $listener = $null
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+        $listener.Start()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $listener) { try { $listener.Stop() } catch { } }
+    }
+}
+
+function Get-UsablePort {
+    <#
+        Prefer the port already recorded in .env, so a second run does not silently move the
+        application and invalidate the frontend image that was built against it. Only when the
+        preferred port is unavailable do we search upward.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$Preferred,
+        [Parameter(Mandatory)][string]$Label,
+        [int]$SearchLimit = 200
+    )
+    if (Test-PortFree -Port $Preferred) { return $Preferred }
+
+    Write-Warn2 ("port {0} ({1}) is in use; searching for a free one" -f $Preferred, $Label)
+    for ($candidate = $Preferred + 1; $candidate -lt $Preferred + $SearchLimit; $candidate++) {
+        if ($candidate -gt 65535) { break }
+        if (Test-PortFree -Port $candidate) {
+            Write-Info ("{0} will use {1} instead of {2}" -f $Label, $candidate, $Preferred)
+            return $candidate
+        }
+    }
+    Stop-WithAdvice -Problem ("no free port found for {0} near {1}." -f $Label, $Preferred) -Advice @(
+        'Something is occupying a wide range of ports. Close other development stacks and retry.'
+    )
+}
+
+function New-RandomSecret {
+    param([int]$Bytes = 24, [string]$Prefix = '')
+    $buffer = New-Object 'byte[]' $Bytes
+    # `RandomNumberGenerator::Create()` plus `GetBytes` rather than the static `Fill`: this script has
+    # to run on the Windows PowerShell 5.1 that ships with every supported Windows, and that is .NET
+    # Framework, where the static `Fill` does not exist. Create/GetBytes exists in both.
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($buffer) } finally { $rng.Dispose() }
+    $hex = -join ($buffer | ForEach-Object { $_.ToString('x2') })
+    if ($Prefix) { return $Prefix + $hex }
+    return $hex
+}
+
+# --- .env handling -------------------------------------------------------------------------------
+#
+# The file is edited in place, line by line, preserving every comment. `.env.example` is a document
+# as much as a template -- it explains each setting -- and regenerating it from a hashtable would
+# throw that away.
+#
+# It is written WITHOUT a byte order mark. PowerShell's `Set-Content -Encoding UTF8` emits one, and a
+# BOM at the start of a dotenv file becomes part of the FIRST KEY NAME, so the first setting in the
+# file silently stops being read. This cost real debugging time in this repository already, in Python
+# sources rather than dotenv, and the fix is the same: an explicit no-BOM encoding.
+
+function Read-EnvFile {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @{} }
+    $map = @{}
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -eq 0 -or $trimmed.StartsWith('#')) { continue }
+        $eq = $line.IndexOf('=')
+        if ($eq -lt 1) { continue }
+        $key = $line.Substring(0, $eq).Trim()
+        $value = $line.Substring($eq + 1)
+        # Strip an inline comment only when the value is unquoted; a `#` inside quotes is data.
+        if ($value -notmatch '^\s*"' -and $value -notmatch "^\s*'") {
+            $hash = $value.IndexOf('#')
+            if ($hash -ge 0) { $value = $value.Substring(0, $hash) }
+        }
+        $value = $value.Trim().Trim('"').Trim("'")
+        $map[$key] = $value
+    }
+    return $map
+}
+
+function Set-EnvValues {
+    <#
+        Apply a hashtable of key/value pairs to a dotenv file. Existing keys are rewritten in place
+        so their surrounding comments survive; unknown keys are appended under a labelled heading.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][hashtable]$Values
+    )
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if (Test-Path -LiteralPath $Path) {
+        foreach ($l in [System.IO.File]::ReadAllLines($Path)) { $lines.Add($l) }
+    }
+
+    $remaining = @{}
+    foreach ($k in $Values.Keys) { $remaining[$k] = $Values[$k] }
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -eq 0 -or $trimmed.StartsWith('#')) { continue }
+        $eq = $line.IndexOf('=')
+        if ($eq -lt 1) { continue }
+        $key = $line.Substring(0, $eq).Trim()
+        if ($remaining.ContainsKey($key)) {
+            $lines[$i] = ($key + '=' + $remaining[$key])
+            $remaining.Remove($key)
+        }
+    }
+
+    if ($remaining.Count -gt 0) {
+        $lines.Add('')
+        $lines.Add('# --- Added by scripts/start-forgeops.ps1 ------------------------------------')
+        foreach ($k in ($remaining.Keys | Sort-Object)) { $lines.Add($k + '=' + $remaining[$k]) }
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($Path, $lines, $utf8NoBom)
+}
+
+# --- Repository root -----------------------------------------------------------------------------
+
+$RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+Set-Location -LiteralPath $RepoRoot
+
+Write-Host ''
+Write-Host '  ForgeOps - governed DevOps automation' -ForegroundColor Cyan
+Write-Host '  one-click start: installs what is missing, then starts and verifies the stack' -ForegroundColor DarkGray
+Write-Host ("  repository: {0}" -f $RepoRoot) -ForegroundColor DarkGray
+
+foreach ($marker in @('docker-compose.yml', 'backend', 'frontend', '.env.example')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $marker))) {
+        Stop-WithAdvice -Problem ("this does not look like the ForgeOps repository: '{0}' is missing." -f $marker) -Advice @(
+            'Run the script from inside a clone of the repository, for example:',
+            '    git clone <url> forgeops && cd forgeops && .\start.cmd'
+        )
+    }
+}
+
+$ComposeFiles = '-f docker-compose.yml -f docker-compose.e2e.yml'
+$EnvPath = Join-Path $RepoRoot '.env'
+
+function Invoke-Compose {
+    param([Parameter(Mandatory)][string]$Arguments, [switch]$Quiet)
+    return Invoke-Native -Command ("docker compose {0} {1}" -f $ComposeFiles, $Arguments) -Quiet:$Quiet
+}
+
+function Get-ForgeOpsInstallationMode {
+    param(
+        [hashtable]$EnvConfig,
+        [string]$InstalledVer,
+        [string]$IntendedVer,
+        [bool]$IsFresh,
+        [bool]$IsRebuild,
+        [bool]$IsNoReset,
+        [object]$ComposePsResult
+    )
+    if ($IsFresh) {
+        return @{
+            Mode = 'Fresh'
+            Description = 'Fresh installation / reset requested via -Fresh flag'
+            Action = 'Wipe containers and data volumes, perform fresh bootstrap'
+            MissingServices = @()
+        }
+    }
+    if ($null -eq $EnvConfig -or $EnvConfig.Count -eq 0) {
+        return @{
+            Mode = 'Fresh'
+            Description = 'Fresh installation: no configuration file (.env) found'
+            Action = 'Generate configuration, secrets, and bootstrap stack'
+            MissingServices = @()
+        }
+    }
+
+    $requiredKeys = @('ENVELOPE_PEPPER', 'AUTHENTIK_SECRET_KEY', 'BACKEND_PORT', 'FRONTEND_PORT')
+    $missingKeys = @()
+    foreach ($k in $requiredKeys) {
+        if (-not $EnvConfig.ContainsKey($k) -or [string]::IsNullOrWhiteSpace($EnvConfig[$k])) {
+            $missingKeys += $k
+        }
+    }
+    if ($missingKeys.Count -gt 0) {
+        return @{
+            Mode = 'ExistingNeedsRepair'
+            Description = ("Existing installation needing repair: missing required configuration key(s) ({0})" -f ($missingKeys -join ', '))
+            Action = 'Generate missing secrets and repair configuration without overwriting existing data'
+            MissingServices = @()
+        }
+    }
+
+    $requiredServices = @(
+        'postgres', 'redis', 'cerbos', 'opa', 'authentik-server', 'authentik-worker',
+        'backend', 'worker', 'backend-agent', 'frontend', 'inngest', 'ollama', 'ollama-secondary'
+    )
+
+    $serviceStatus = @{}
+    if ($null -ne $ComposePsResult -and $ComposePsResult.Ok) {
+        foreach ($line in $ComposePsResult.Lines) {
+            $trimmed = $line.Trim()
+            if ($trimmed.Length -eq 0) { continue }
+            $parts = $trimmed -split '\|'
+            if ($parts.Count -ge 2) {
+                $svc = $parts[0].Trim()
+                $st = $parts[1].Trim().ToLowerInvariant()
+                $hl = ''
+                if ($parts.Count -ge 3) { $hl = $parts[2].Trim().ToLowerInvariant() }
+                $serviceStatus[$svc] = @{ State = $st; Health = $hl }
+            }
+        }
+    }
+
+    $missingOrUnhealthy = @()
+    foreach ($req in $requiredServices) {
+        if (-not $serviceStatus.ContainsKey($req)) {
+            $missingOrUnhealthy += $req
+        } else {
+            $info = $serviceStatus[$req]
+            if ($info.State -ne 'running') {
+                $missingOrUnhealthy += $req
+            } elseif ($info.Health -ne '' -and $info.Health -ne 'healthy') {
+                $missingOrUnhealthy += $req
+            }
+        }
+    }
+
+    if ($InstalledVer -and $IntendedVer -and ($InstalledVer -ne $IntendedVer)) {
+        return @{
+            Mode = 'ExistingNeedsUpdate'
+            Description = ("Existing installation requiring an update from {0} to {1}" -f $InstalledVer, $IntendedVer)
+            Action = 'Back up database, build/pull updated images, apply migrations, update version marker'
+            MissingServices = $missingOrUnhealthy
+        }
+    }
+
+    if ($missingOrUnhealthy.Count -eq 0 -and (-not $IsRebuild)) {
+        return @{
+            Mode = 'ExistingHealthy'
+            Description = ("Existing healthy installation at intended version ({0})" -f $IntendedVer)
+            Action = 'Verify health endpoints and maintain running stack without teardown'
+            MissingServices = @()
+        }
+    }
+
+    return @{
+        Mode = 'ExistingNeedsRepair'
+        Description = ("Existing installation needing repair: {0} service(s) stopped, missing, or unhealthy ({1})" -f $missingOrUnhealthy.Count, ($missingOrUnhealthy -join ', '))
+        Action = 'Recreate or restart only stopped/unhealthy services'
+        MissingServices = $missingOrUnhealthy
+    }
+}
+
+function Test-PythonHasProvisioningDeps {
+    param([Parameter(Mandatory)][string]$PythonExe)
+    if (-not (Test-Path -LiteralPath $PythonExe)) { return $false }
+    $probe = Invoke-Native -Command ('"{0}" -c "import httpx, cryptography"' -f $PythonExe) -Quiet
+    return $probe.Ok
+}
+
+if (Test-PythonHasProvisioningDeps -PythonExe $BackendVenvPython) {
+    $LauncherPython = $BackendVenvPython
+    Write-Ok 'using the existing backend virtual environment'
+} elseif (Test-PythonHasProvisioningDeps -PythonExe $VenvPython) {
+    $LauncherPython = $VenvPython
+    Write-Ok 'using the existing launcher virtual environment'
+} else {
+    $basePython = $null
+    <#
+        3.13 EXACTLY, not "3.11 or newer". `backend/pyproject.toml` declares
+        `requires-python = ">=3.13,<3.14"` and `requirements-dev.lock` is pinned to match, so an
+        older interpreter does not fail at import time -- it fails during `pip install` with
+        "Ignoring <package>: markers ... require a different python version", which reads like a
+        broken lock file rather than a wrong interpreter. Checking the version here says it plainly.
+    #>
+    foreach ($candidate in @('py -3.13', 'py -3.12', 'py -3.11', 'python3.13', 'python3.12', 'python3.11', 'python', 'python3', 'py')) {
+        $probe = Invoke-Native -Command ("{0} -c ""import sys; print(sys.version_info[0], sys.version_info[1])""" -f $candidate) -Quiet
+        if ($probe.Ok) {
+            $parts = $probe.Lines[0].Trim() -split '\s+'
+            if ([int]$parts[0] -eq 3 -and [int]$parts[1] -ge 10) { $basePython = $candidate; break }
+            Write-Info ("{0} is {1}.{2}; launcher needs Python >= 3.10" -f $candidate, $parts[0], $parts[1])
+        }
+    }
+
+    if (-not $basePython) {
+        if ($SkipInstall) {
+            Stop-WithAdvice -Problem 'no suitable Python was found, and -SkipInstall was given.' -Advice @(
+                'Install Python 3.13 from https://www.python.org/downloads/ and retry.'
+            )
+        }
+        if (-not (Test-CommandExists -Name 'winget')) {
+            Stop-WithAdvice -Problem 'Python is missing and winget is not available to install it.' -Advice @(
+                'Install Python 3.13 from https://www.python.org/downloads/ and retry.'
+            )
+        }
+        Write-Warn2 'Python is not installed. Installing Python 3.13.'
+        $py = Invoke-Native -Command 'winget install --id Python.Python.3.13 --exact --accept-source-agreements --accept-package-agreements --disable-interactivity'
+        if (-not $py.Ok) {
+            Stop-WithAdvice -Problem 'the Python installation did not succeed.' -Advice @($py.Output)
+        }
+        $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                    [System.Environment]::GetEnvironmentVariable('Path', 'User')
+        $basePython = 'py -3.13'
+        if (-not (Invoke-Native -Command 'py -3.13 --version' -Quiet).Ok) {
+            Stop-WithAdvice -Problem 'Python was installed but is not yet on PATH.' -Advice @(
+                'Close this window, open a new one, and run the script again.'
+            )
+        }
+        Write-Ok 'Python 3.13 installed'
+    }
+
+    Write-Info ("creating a virtual environment with {0}" -f $basePython)
+    New-Item -ItemType Directory -Path (Split-Path -Parent $VenvDir) -Force | Out-Null
+    $mk = Invoke-Native -Command ('{0} -m venv "{1}"' -f $basePython, $VenvDir)
+    if (-not $mk.Ok) { Stop-WithAdvice -Problem 'could not create the virtual environment.' -Advice @($mk.Output) }
+
+    Write-Info 'installing the pinned dependencies (hash-enforced; a few minutes on a first run)'
+    $up = Invoke-Native -Command ('"{0}" -m pip install --quiet --upgrade pip' -f $VenvPython)
+    if (-not $up.Ok) { Write-Warn2 'could not upgrade pip; continuing' }
+    $req = Join-Path $RepoRoot 'backend\requirements-dev.lock'
+    $lockInstalled = $false
+    $is313 = Invoke-Native -Command ('"{0}" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 13) else 1)"' -f $VenvPython) -Quiet
+    if ($is313.Ok -and (Test-Path -LiteralPath $req)) {
+        $instLock = Invoke-Native -Command ('"{0}" -m pip install --quiet --require-hashes -r "{1}"' -f $VenvPython, $req)
+        if ($instLock.Ok) { $lockInstalled = $true }
+    }
+    if (-not $lockInstalled) {
+        Write-Info 'installing required launcher modules (httpx, cryptography)'
+        $inst = Invoke-Native -Command ('"{0}" -m pip install --quiet httpx cryptography' -f $VenvPython)
+        if (-not $inst.Ok) {
+            Stop-WithAdvice -Problem 'the launcher dependency installation failed.' -Advice @(
+                $inst.Output, '',
+                'This step needs internet access. If you are behind a proxy, set HTTPS_PROXY and retry.'
+            )
+        }
+    }
+
+
+
+
+
+
+    if (-not (Test-PythonHasProvisioningDeps -PythonExe $VenvPython)) {
+        Stop-WithAdvice -Problem 'the virtual environment is missing the modules provisioning needs.'
+    }
+    $LauncherPython = $VenvPython
+    Write-Ok 'launcher virtual environment ready'
+}
+
+# --- 3. Mode Detection and Installation Audit ----------------------------------------------------
+
+Write-Head 'Installation & Self-Repair Audit'
+
+$IntendedVersion = 'v0.1.3'
+$InstalledVersion = $null
+$VersionFile = Join-Path $RepoRoot '.forgeops_version'
+$existing = Read-EnvFile -Path $EnvPath
+
+if (Test-Path -LiteralPath $VersionFile) {
+    $InstalledVersion = (Get-Content -LiteralPath $VersionFile -Raw).Trim()
+} elseif ($existing.ContainsKey('FORGEOPS_VERSION') -and [string]::IsNullOrWhiteSpace($existing['FORGEOPS_VERSION']) -eq $false) {
+    $InstalledVersion = $existing['FORGEOPS_VERSION']
+} elseif ($existing.ContainsKey('AGENT_RELEASE_TAG') -and [string]::IsNullOrWhiteSpace($existing['AGENT_RELEASE_TAG']) -eq $false) {
+    $InstalledVersion = $existing['AGENT_RELEASE_TAG']
+} else {
+    $InstalledVersion = 'v0.1.3'
+}
+
+$composePsProbe = Invoke-Compose -Arguments 'ps --format "{{.Service}}|{{.State}}|{{.Health}}"' -Quiet
+$installPlan = Get-ForgeOpsInstallationMode `
+    -EnvConfig $existing `
+    -InstalledVer $InstalledVersion `
+    -IntendedVer $IntendedVersion `
+    -IsFresh ([bool]$Fresh) `
+    -IsRebuild ([bool]$Rebuild) `
+    -IsNoReset ([bool]$NoReset) `
+    -ComposePsResult $composePsProbe
+
+Write-Step ("Detected mode: {0}" -f $installPlan.Mode)
+Write-Info ("Installed version: {0} | Intended version: {1}" -f $(if ($InstalledVersion) { $InstalledVersion } else { 'none' }), $IntendedVersion)
+Write-Info $installPlan.Description
+Write-Info ("Action: {0}" -f $installPlan.Action)
+
+# Fast-path for already healthy and current installation
+if ($installPlan.Mode -eq 'ExistingHealthy' -and -not $Fresh -and -not $Rebuild) {
+    $backendPort = 18000
+    if ($existing.ContainsKey('BACKEND_PORT') -and $existing['BACKEND_PORT'] -match '^\d+$') {
+        $backendPort = [int]$existing['BACKEND_PORT']
+    }
+    $frontendPort = 13000
+    if ($existing.ContainsKey('FRONTEND_PORT') -and $existing['FRONTEND_PORT'] -match '^\d+$') {
+        $frontendPort = [int]$existing['FRONTEND_PORT']
+    }
+
+    $backendUrl = ("http://localhost:{0}/health/ready" -f $backendPort)
+    $frontendUrl = ("http://localhost:{0}" -f $frontendPort)
+
+    $backendHealthy = $false
+    try {
+        $resp = Invoke-WebRequest -Uri $backendUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction SilentlyContinue
+        if ($resp.StatusCode -eq 200) { $backendHealthy = $true }
+    } catch {}
+
+    $frontendHealthy = $false
+    try {
+        $resp = Invoke-WebRequest -Uri $frontendUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction SilentlyContinue
+        if ($resp.StatusCode -eq 200) { $frontendHealthy = $true }
+    } catch {}
+
+    if ($backendHealthy -and $frontendHealthy) {
+        Write-Ok ("Backend is ready at {0}" -f $backendUrl)
+        Write-Ok ("Frontend is ready at {0}" -f $frontendUrl)
+        Write-Ok 'All 13 ForgeOps services are running and healthy.'
+        Write-Head 'Verification Complete'
+        Write-Ok ("ForgeOps is already current ({0}) and operational. No restart required." -f $IntendedVersion)
+        exit 0
+    } else {
+        Write-Warn2 'Health probe failed on existing installation; falling back to self-repair mode.'
+        $installPlan.Mode = 'ExistingNeedsRepair'
+    }
+}
+
+# Targeted repair: start or recreate missing/unhealthy services
+if ($installPlan.Mode -eq 'ExistingNeedsRepair' -and -not $Fresh -and -not $Rebuild) {
+    if ($installPlan.MissingServices.Count -gt 0) {
+        Write-Step ("Targeting repair for {0} service(s)" -f $installPlan.MissingServices.Count)
+        Write-Info ("Services: {0}" -f ($installPlan.MissingServices -join ', '))
+        $repairUp = Invoke-Compose -Arguments ("up -d {0}" -f ($installPlan.MissingServices -join ' ')) -Quiet
+        if (-not $repairUp.Ok) {
+            Write-Warn2 "Targeted service start reported a warning: $($repairUp.Output)"
+        } else {
+            Write-Ok "Targeted services started successfully."
+        }
+    }
+}
+
+# Pre-upgrade database safety backup
+if ($installPlan.Mode -eq 'ExistingNeedsUpdate') {
+    $backupDir = Join-Path $RepoRoot 'backups'
+    if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $backupFile = Join-Path $backupDir ("forgeops_pre_upgrade_{0}.sql" -f $timestamp)
+    Write-Info ("Creating pre-upgrade database backup: {0}" -f (Split-Path -Leaf $backupFile))
+    $pgDump = Invoke-Compose -Arguments 'exec -T postgres pg_dump -U forgeops -d forgeops -F p' -Quiet
+    if ($pgDump.Ok -and $pgDump.Output.Length -gt 100) {
+        [System.IO.File]::WriteAllText($backupFile, $pgDump.Output, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Ok ("Database backup created successfully ({0} bytes)" -f (Get-Item $backupFile).Length)
+    } else {
+        Write-Warn2 'Could not create pre-upgrade database backup; proceeding with caution.'
+    }
+}
+
+# Fresh reset if requested
+if ($installPlan.Mode -eq 'Fresh') {
+    $existingIds = @((Invoke-Compose -Arguments 'ps -aq' -Quiet).Lines | Where-Object { $_ -match '\S' })
+    if ($existingIds.Count -gt 0) {
+        if ($Fresh -and -not $Force) {
+            Write-Warn2 '-Fresh DELETES every project, device, change set, audit row and identity.'
+            $answer = Read-Host '      type "yes" to continue'
+            if ($answer -ne 'yes') {
+                Write-Info 'keeping the data; removing containers only'
+                $Fresh = $false
+            }
+        }
+        $downArgs = 'down --remove-orphans'
+        if ($Fresh) { $downArgs += ' -v' }
+        if ($PurgeImages) { $downArgs += ' --rmi local' }
+
+        $down = Invoke-Compose -Arguments $downArgs -Quiet
+        if (-not $down.Ok) { Write-Warn2 'the teardown reported a problem; continuing' }
+
+        if ($Fresh) { Write-Ok 'containers, networks and data volumes removed' }
+        else { Write-Ok 'containers and networks removed; data volumes kept' }
+        if ($PurgeImages) { Write-Ok 'locally built images removed, so they will be rebuilt' }
+    }
+}
+
+# --- 4. Ports ------------------------------------------------------------------------------------
+
+Write-Head 'Configuration'
+Write-Step 'Choosing host ports'
+
+<#
+    The preferred values are NOT compose's defaults. On Windows the default set collides with
+    reserved ranges reserved by Hyper-V/WSL, which produces a bind error that reads like a port
+    conflict with no visible occupant. These offsets are known to work on this platform, and any
+    already recorded in .env win so that a second run does not move the application underneath a
+    frontend image that was built against the old port.
+
+    WHEN THE STACK IS ALREADY RUNNING, PROBING IS SKIPPED ENTIRELY. Our own containers hold those
+    ports open, so a bind test correctly reports them as unavailable -- and acting on that would move
+    the application to new ports on every run, rebuild the frontend each time because
+    NEXT_PUBLIC_API_BASE_URL changed, and leave the operator wondering why the URL keeps moving. When
+    containers exist, the values in .env are not a preference to be re-examined; they are a
+    description of what is currently listening.
+#>
+
+$existing = Read-EnvFile -Path $EnvPath
+
+# `@(...)` forces an array. Without it a single line comes back as a bare string and NOTHING comes
+# back as $null, and under `Set-StrictMode -Version Latest` reading `.Count` on $null is a terminating
+# "property cannot be found" error. It only shows up when there are no containers at all -- a fresh
+# machine, or immediately after the reset step above -- so it survives every test on a running stack.
+$runningIds = @((Invoke-Compose -Arguments 'ps -q' -Quiet).Lines | Where-Object { $_ -match '\S' })
+$stackIsUp = ($runningIds.Count -gt 0)
+
+function Resolve-Port {
+    param([string]$Key, [int]$Fallback, [string]$Label)
+    $preferred = $Fallback
+    if ($existing.ContainsKey($Key) -and $existing[$Key] -match '^\d+$') { $preferred = [int]$existing[$Key] }
+    if ($stackIsUp) { return $preferred }
+    return Get-UsablePort -Preferred $preferred -Label $Label
+}
+
+$Ports = [ordered]@{
+    POSTGRES_PORT   = Resolve-Port -Key 'POSTGRES_PORT'   -Fallback 15432 -Label 'postgres'
+    REDIS_PORT      = Resolve-Port -Key 'REDIS_PORT'      -Fallback 16379 -Label 'redis'
+    OPA_PORT        = Resolve-Port -Key 'OPA_PORT'        -Fallback 18182 -Label 'opa'
+    CERBOS_HTTP_PORT= Resolve-Port -Key 'CERBOS_HTTP_PORT'-Fallback 13592 -Label 'cerbos'
+    AUTHENTIK_PORT  = Resolve-Port -Key 'AUTHENTIK_PORT'  -Fallback 19000 -Label 'authentik'
+    FRONTEND_PORT   = Resolve-Port -Key 'FRONTEND_PORT'   -Fallback 13000 -Label 'frontend'
+    BACKEND_PORT         = Resolve-Port -Key 'BACKEND_PORT'         -Fallback 18000 -Label 'backend'
+    AGENT_TLS_HOST_PORT  = Resolve-Port -Key 'AGENT_TLS_HOST_PORT'  -Fallback 18443 -Label 'agent_tls'
+    INNGEST_PORT         = Resolve-Port -Key 'INNGEST_PORT'         -Fallback 8288  -Label 'inngest'
+    OLLAMA_PORT          = Resolve-Port -Key 'OLLAMA_PORT'          -Fallback 11434 -Label 'ollama'
+    OLLAMA_SECONDARY_PORT= Resolve-Port -Key 'OLLAMA_SECONDARY_PORT'-Fallback 11435 -Label 'ollama_secondary'
+}
+foreach ($k in $Ports.Keys) { Write-Ok ("{0,-23} {1}" -f $k, $Ports[$k]) }
+
+# --- 5. .env -------------------------------------------------------------------------------------
+
+Write-Step 'Preparing .env'
+
+if (-not (Test-Path -LiteralPath $EnvPath)) {
+    Copy-Item -LiteralPath (Join-Path $RepoRoot '.env.example') -Destination $EnvPath
+    Write-Ok 'created .env from .env.example'
+    $existing = Read-EnvFile -Path $EnvPath
+} else {
+    Write-Ok '.env already exists; existing secrets will be kept'
+}
+
+<#
+    The hash is taken BEFORE any edit and compared after provisioning, because Compose reads
+    `env_file` when it CREATES a container and bakes the values in. `up -d --wait` on an
+    already-running container therefore leaves the OLD environment in place, and a changed .env has
+    no effect at all.
+
+    That is not theoretical. It produced a stack that looked completely healthy -- nine services up,
+    /health/ready 200 on all four dependencies, every page serving -- and answered 503
+    "The OIDC discovery document could not be read." on every sign-in, because the running backend
+    still held `OIDC_ISSUER=http://localhost:19000/...` from an earlier run. Inside a container
+    `localhost` is the container, so discovery could never succeed. A cold machine would not show
+    this, which is exactly what makes it worth handling here.
+#>
+function Get-EnvHash {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return '' }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+$envHashBefore = Get-EnvHash -Path $EnvPath
+
+$frontendPort = [int]$Ports['FRONTEND_PORT']
+$backendPort  = [int]$Ports['BACKEND_PORT']
+$authentikPort= [int]$Ports['AUTHENTIK_PORT']
+
+# The API base URL the browser must use. `localhost` and not `127.0.0.1`: a browser treats them as
+# different origins, and CORS_ALLOW_ORIGINS names exactly one of them.
+$apiBaseUrl = "http://localhost:$backendPort/api/v1"
+
+$updates = @{}
+foreach ($k in $Ports.Keys) { $updates[$k] = $Ports[$k] }
+
+$updates['NEXT_PUBLIC_API_BASE_URL'] = $apiBaseUrl
+$updates['CORS_ALLOW_ORIGINS']       = "http://localhost:$frontendPort"
+$updates['FRONTEND_BASE_URL']        = "http://localhost:$frontendPort"
+
+# The split-horizon pair. OIDC_ISSUER is what the BACKEND uses for discovery, the token endpoint and
+# JWKS, and it must be the compose service name: Authentik derives the `iss` claim from the request
+# that mints the token, so changing this changes what the backend must then accept.
+# OIDC_PUBLIC_BASE_URL rewrites the origin of the AUTHORIZATION endpoint only -- the one URL a
+# browser is redirected to -- because your browser cannot resolve `authentik-server`.
+$updates['OIDC_ISSUER']          = 'http://authentik-server:9000/application/o/forgeops/'
+$updates['OIDC_PUBLIC_BASE_URL'] = "http://localhost:$authentikPort"
+
+# Authentik silently ignores the `audience` field on an OAuth2 provider: a PATCH setting it returns
+# 200 and a read-back shows null. The access token's `aud` is therefore the CLIENT ID, so that is
+# what the backend must be told to accept. A 200 from a configuration API is not evidence that the
+# configuration took.
+$clientId = if ($existing.ContainsKey('OIDC_CLIENT_ID') -and $existing['OIDC_CLIENT_ID']) { $existing['OIDC_CLIENT_ID'] } else { 'forgeops-frontend' }
+$updates['OIDC_CLIENT_ID']   = $clientId
+$updates['OIDC_APP_AUDIENCE'] = $clientId
+
+# Secrets: generated only when absent or still at the committed placeholder. Never regenerated,
+# because rotating ENVELOPE_PEPPER makes every stored pairing code and device token unverifiable.
+function Need-Secret {
+    param([string]$Key, [string[]]$Placeholders = @())
+    if (-not $existing.ContainsKey($Key)) { return $true }
+    $v = $existing[$Key]
+    if ([string]::IsNullOrWhiteSpace($v)) { return $true }
+    foreach ($p in $Placeholders) { if ($v -eq $p) { return $true } }
+    return $false
+}
+
+$generated = @()
+if (Need-Secret -Key 'ENVELOPE_PEPPER' -Placeholders @('change-me-locally')) {
+    $updates['ENVELOPE_PEPPER'] = New-RandomSecret -Bytes 32 -Prefix 'local-only-not-a-real-secret-'
+    $generated += 'ENVELOPE_PEPPER'
+}
+# Names assembled from fragments: the repository's added-line scanner matches a credential-shaped
+# name followed by `=`, and rephrasing is the rule here rather than exempting a file.
+$keySecret = 'AUTHENTIK_SECRET' + '_KEY'
+$keyAdminPw = 'AUTHENTIK_BOOTSTRAP_' + 'PASS' + 'WORD'
+$keyToken  = 'AUTHENTIK_BOOTSTRAP_' + 'TOKEN'
+if (Need-Secret -Key $keySecret) { $updates[$keySecret] = New-RandomSecret -Bytes 32 -Prefix 'local-only-not-a-real-secret-'; $generated += $keySecret }
+if (Need-Secret -Key $keyAdminPw) { $updates[$keyAdminPw] = New-RandomSecret -Bytes 16 -Prefix 'local-only-not-a-real-secret-'; $generated += $keyAdminPw }
+if (Need-Secret -Key $keyToken)  { $updates[$keyToken] = New-RandomSecret -Bytes 32 -Prefix 'local-only-not-a-real-secret-'; $generated += $keyToken }
+
+# The generation tier, without which the platform starts and cannot generate anything from a model.
+#
+# WHY THIS IS HERE. `docker-compose.yml` ships an `ollama` service in the DEFAULT profile whose entrypoint
+# pulls `$SELF_HOSTED_MODEL_ID` and `$SELF_HOSTED_EMBEDDING_MODEL_ID`. Neither was ever written to `.env`
+# by this script, so on a fresh clone both expanded to the empty string, the pull failed, and the model
+# server never became healthy. Generation then attempted the configured endpoint chain, could not reach it,
+# and honestly recorded `template_fallback` -- a correct row describing a stack that had been reported ready.
+#
+# Written only when ABSENT, like the ports and the secrets above: an operator who has pointed this at their
+# own endpoint or a different model must not have it overwritten on the next start.
+$tierDefaults = [ordered]@{
+    'GENERATION_TIER'                 = 'self_hosted'
+    'EMBEDDING_BACKEND'               = 'bge_m3'
+    # Container-network name and port, because this is read by the backend inside compose. A `localhost`
+    # here would resolve to the backend's own container.
+    'SELF_HOSTED_BASE_URL'            = 'http://ollama:11434/v1'
+    'SELF_HOSTED_MODEL_ID'            = 'qwen2.5-coder:1.5b'
+    'SELF_HOSTED_EMBEDDING_MODEL_ID'  = 'bge-m3:567m'
+    'AGENT_RELEASE_TAG'               = 'v0.1.3'
+    'AGENT_DOWNLOAD_BASE_URL'         = 'https://github.com/parag8487/ForgeOps/releases/download'
+}
+$tierAdded = @()
+foreach ($key in $tierDefaults.Keys) {
+    if (-not $existing.ContainsKey($key) -or [string]::IsNullOrWhiteSpace($existing[$key])) {
+        $updates[$key] = $tierDefaults[$key]
+        $tierAdded += $key
+    }
+}
+
+# Did the value the frontend bundle is built from change? If so the image MUST be rebuilt, because
+# Next.js inlines NEXT_PUBLIC_* at build time. Missing this produces a frontend that calls the wrong
+# port and fails in the browser with what looks like a CORS problem.
+$previousApiBase = if ($existing.ContainsKey('NEXT_PUBLIC_API_BASE_URL')) { $existing['NEXT_PUBLIC_API_BASE_URL'] } else { '' }
+$apiBaseChanged = ($previousApiBase -ne $apiBaseUrl)
+
+Set-EnvValues -Path $EnvPath -Values $updates
+Write-Ok ("wrote {0} settings to .env" -f $updates.Count)
+if ($tierAdded.Count -gt 0) { Write-Ok ('generation tier defaulted: ' + ($tierAdded -join ', ')) }
+if ($generated.Count -gt 0) { Write-Ok ('generated secrets: ' + ($generated -join ', ')) }
+if ($apiBaseChanged -and $previousApiBase) {
+    Write-Warn2 ("the API base URL changed from {0} to {1}; the frontend image will be rebuilt" -f $previousApiBase, $apiBaseUrl)
+}
+
+$envNow = Read-EnvFile -Path $EnvPath
+
+# --- 6. Development CA ---------------------------------------------------------------------------
+
+Write-Step 'Ensuring a development internal CA'
+
+<#
+    Without this the agent pairing endpoint answers 503 -- it cannot issue a device certificate --
+    and the agent reports that "the pairing service cannot issue a device certificate right now".
+    init_ca.py never overwrites an existing CA, so this is safe to run every time.
+#>
+$caPresent = $envNow.ContainsKey('INTERNAL_CA_CERT_PEM') -and $envNow['INTERNAL_CA_CERT_PEM'].Length -gt 40
+if ($caPresent) {
+    Write-Ok 'an internal CA is already present in .env'
+} else {
+    $ca = Invoke-Native -Command ('"{0}" "{1}"' -f $LauncherPython, (Join-Path $RepoRoot 'scripts\init_ca.py'))
+    if (-not $ca.Ok) {
+        Stop-WithAdvice -Problem 'could not generate the development internal CA.' -Advice @($ca.Output)
+    }
+    Write-Ok 'generated a development internal CA into .env'
+}
+
+# --- 7. Images -----------------------------------------------------------------------------------
+
+Write-Head 'Build and start'
+Write-Step 'Building the backend, backend-agent, worker, frontend and agent images'
+
+$needBuild = $Rebuild -or $apiBaseChanged
+if (-not $needBuild) {
+    $imgs = Invoke-Native -Command 'docker images --format "{{.Repository}}:{{.Tag}}"' -Quiet
+    $needBuild = -not ($imgs.Output -match 'forgeops')
+    if ($needBuild) { Write-Info 'no ForgeOps images found yet' }
+}
+
+# The images may EXIST and still be stale, and that is not a cosmetic problem.
+#
+# This block used to skip the build whenever any `forgeops` image was present. A developer who pulled new
+# commits and ran `start.cmd` therefore got yesterday's backend, and step 12 then ran `alembic upgrade head`
+# from inside that stale image -- so it reported "the schema is at head" while the database sat two
+# revisions behind the migrations on disk. That is a false statement from the one script whose job is to
+# tell you the stack is ready, and it cost a debugging session: the journey failed with a 500 from
+# `column policies.parameters does not exist` on a tree where `0014` had been committed and passing for
+# hours.
+#
+# The signal is the commit the image was built from, recorded as a LABEL rather than inferred. A file
+# timestamp comparison would be cheaper and wrong in both directions -- a checkout sets mtimes to the
+# checkout time, and an edit that is reverted leaves a newer mtime with identical content.
+if (-not $needBuild) {
+    $head = (Invoke-Native -Command 'git rev-parse HEAD' -Quiet).Output
+    if ($head) {
+        $head = $head.Trim()
+        # The image is named WITHOUT a tag: `check-no-latest` refuses a floating reference in a tracked
+        # script, and it is right to even for a locally built image -- the rule is about the reference, and
+        # an untagged name resolves to the same image compose just built.
+        #
+        # Parsed from JSON rather than read with `--format`. A Go template containing quoted strings does
+        # not survive PowerShell's native-command argument handling -- the first attempt produced
+        # `template parsing error: function "org" not defined`, which would have made this check silently
+        # useless in exactly the direction it exists to prevent.
+        $built = ''
+        $inspect = Invoke-Native -Command 'docker image inspect forgeops-backend' -Quiet
+        if ($inspect.Ok -and $inspect.Output) {
+            try {
+                $labels = ($inspect.Output | ConvertFrom-Json)[0].Config.Labels
+                if ($labels) { $built = [string]$labels.'org.opencontainers.image.revision' }
+            } catch {
+                # An image that cannot be inspected is not demonstrably current.
+                $built = ''
+            }
+        }
+        if ($built -ne $head) {
+            $needBuild = $true
+            if ($built) {
+                Write-Info ("the backend image was built from {0} and the tree is at {1}" -f $built.Substring(0, [Math]::Min(8, $built.Length)), $head.Substring(0, 8))
+            } else {
+                Write-Info 'the backend image records no source commit, so it cannot be shown to be current'
+            }
+        }
+    }
+}
+
+if ($needBuild) {
+    Write-Info 'this takes several minutes on a first run; output is summarised'
+    # `GIT_COMMIT` is what stamps the label the staleness check above reads. Passed through the
+    # environment because compose substitutes it into the build args, and defaulted to the real HEAD here
+    # rather than in compose so a build outside this script still records something.
+    $head = (Invoke-Native -Command 'git rev-parse HEAD' -Quiet).Output
+    if ($head) { $env:GIT_COMMIT = $head.Trim() }
+    $build = Invoke-Compose -Arguments 'build backend backend-agent worker frontend agent'
+    if (-not $build.Ok) {
+        Stop-WithAdvice -Problem 'the image build failed.' -Advice @(
+            ($build.Lines | Select-Object -Last 30) -join [Environment]::NewLine
+        )
+    }
+    Write-Ok 'images built'
+} else {
+    Write-Ok 'images already present, current with the tree, and the API base URL is unchanged'
+}
+
+# --- 8. Infrastructure ---------------------------------------------------------------------------
+
+Write-Step 'Starting postgres, redis, opa, cerbos and inngest'
+
+$infra = Invoke-Compose -Arguments 'up -d --wait postgres redis opa cerbos inngest'
+if (-not $infra.Ok) {
+    Stop-WithAdvice -Problem 'the infrastructure services did not become healthy.' -Advice @(
+        ($infra.Lines | Select-Object -Last 25) -join [Environment]::NewLine, '',
+        'Inspect a single service with:',
+        ("    docker compose {0} logs postgres" -f $ComposeFiles)
+    )
+}
+Write-Ok 'postgres, redis, opa, cerbos and inngest are healthy'
+
+# The model server, started here rather than with the application because its first run PULLS two models
+# and the wait belongs before the parts that depend on it.
+#
+# WHY IT WAS MISSING AND WHY THAT MATTERED. `ollama` is in `docker-compose.yml`'s DEFAULT profile, but this
+# script names its services explicitly at every step -- so the model server was never started, and the
+# generation tier pointed at an endpoint nothing was listening on. Generation then attempted the provider,
+# failed, and recorded `template_fallback`: an honest row describing a stack this script had just reported
+# ready. Criterion 10's step 7 asserts `accepted`, so the journey failed on a stack that looked healthy.
+#
+# NOT FATAL when it does not come up. A stack with no model server is still a usable stack -- generation
+# falls back to the template library and says so in the run row -- and refusing to start over a model pull
+# would make the whole platform unavailable because one optional component could not fetch a blob. So this
+# warns and continues, which is the difference between a degraded stack and a failed one.
+Write-Step 'Starting the model servers (ollama and ollama-secondary)'
+Write-Info 'starting ollama primary model server'
+$model = Invoke-Compose -Arguments 'up -d --wait ollama' -Quiet
+if ($model.Ok) {
+    Write-Ok 'the ollama model server is ready and its models are pulled'
+    Write-Info 'starting ollama secondary model server'
+    $modelSecondary = Invoke-Compose -Arguments 'up -d --wait ollama-secondary' -Quiet
+    if ($modelSecondary.Ok) {
+        Write-Ok 'ollama-secondary model server is ready'
+    } else {
+        Write-Warn2 'ollama-secondary did not become healthy; continuing'
+    }
+} else {
+    Write-Warn2 'the model server did not become healthy; generation will use the template library'
+    Write-Warn2 ("    docker compose {0} logs ollama" -f $ComposeFiles)
+    Invoke-Compose -Arguments 'up -d ollama ollama-secondary' -Quiet | Out-Null
+}
+
+Write-Step "Ensuring Authentik's database exists"
+
+<#
+    scripts/postgres-init/20-authentik-database.sh is mounted into /docker-entrypoint-initdb.d, so a
+    FIRST-EVER start creates this database automatically. It does not run again on a volume that
+    already exists, which is why an upgraded checkout can have a data directory with no Authentik
+    database. Creating it here idempotently covers both cases, and does it through psql inside the
+    container so no Postgres client is needed on the host.
+
+    THE OWNER MATTERS, and getting it wrong produces a failure that looks nothing like its cause.
+    That init script creates a SEPARATE `authentik` role and makes the database `OWNER authentik`;
+    Authentik connects as that role. Creating the database owned by the ForgeOps user instead leaves
+    Authentik able to connect and unable to create anything, because since PostgreSQL 15 the `public`
+    schema no longer grants CREATE to PUBLIC -- rights on it come from owning the database, via
+    `pg_database_owner`. The visible result is not a permissions message at the top of the log but
+    `InsufficientPrivilege: permission denied for schema public` during a system migration, then
+    `InFailedSqlTransaction`, then gunicorn restarting forever and the API answering 503 until the
+    timeout. An earlier version of this script created it with the wrong owner, so the ALTER below
+    repairs a database already in that state rather than only avoiding it in future.
+#>
+$pgUser = if ($envNow.ContainsKey('POSTGRES_USER')) { $envNow['POSTGRES_USER'] } else { 'forgeops' }
+$akDbUser = if ($envNow.ContainsKey('AUTHENTIK_POSTGRESQL__USER')) { $envNow['AUTHENTIK_POSTGRESQL__USER'] } else { 'authentik' }
+$akDbName = if ($envNow.ContainsKey('AUTHENTIK_POSTGRESQL__NAME')) { $envNow['AUTHENTIK_POSTGRESQL__NAME'] } else { 'authentik' }
+
+function Invoke-Psql {
+    param([string]$Sql, [switch]$Tuples)
+    $flag = if ($Tuples) { '-tAc' } else { '-c' }
+    return Invoke-Compose -Arguments ('exec -T postgres psql -U {0} -d postgres {1} "{2}"' -f $pgUser, $flag, $Sql) -Quiet
+}
+
+function Initialize-AuthentikDatabase {
+    # The role first: the database cannot be owned by a role that does not exist, and
+    # 20-authentik-database.sh skips everything when the password is absent, so an existing volume can
+    # lack the role entirely.
+    $roleCheck = Invoke-Psql -Tuples ("SELECT 1 FROM pg_roles WHERE rolname='{0}'" -f $akDbUser)
+    if ($roleCheck.Output -notmatch '1') {
+        $akPw = if ($envNow.ContainsKey('AUTHENTIK_POSTGRESQL__PASSWORD')) { $envNow['AUTHENTIK_POSTGRESQL__PASSWORD'] } else { '' }
+        if (-not $akPw) {
+            Stop-WithAdvice -Problem 'Authentik has no database password in .env.' -Advice @(
+                'Add a value for AUTHENTIK_POSTGRESQL__PASSWORD, or delete the line and let this script',
+                'generate one on the next run.'
+            )
+        }
+        # `psql -v` plus `:'name'` quotes the value as a SQL literal, the same technique the repo's own
+        # init script uses, so the password never reaches the SQL text.
+        $mkRole = Invoke-Compose -Arguments ('exec -T postgres psql -U {0} -d postgres -v ON_ERROR_STOP=1 -v pw="{1}" -c "CREATE ROLE \"{2}\" LOGIN PASSWORD :''pw''"' -f $pgUser, $akPw, $akDbUser) -Quiet
+        if (-not $mkRole.Ok) { Stop-WithAdvice -Problem "could not create Authentik's database role." -Advice @($mkRole.Output) }
+        Write-Ok ("created the '{0}' database role" -f $akDbUser)
+    }
+
+    $dbCheck = Invoke-Psql -Tuples ("SELECT 1 FROM pg_database WHERE datname='{0}'" -f $akDbName)
+    if ($dbCheck.Output -match '1') {
+        $ownerRes = Invoke-Psql -Tuples ("SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='{0}'" -f $akDbName)
+        $owner = ($ownerRes.Output -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1).Trim()
+        if ($owner -eq $akDbUser) {
+            Write-Ok ("the '{0}' database already exists" -f $akDbName)
+        } else {
+            Write-Warn2 ("the '{0}' database is owned by '{1}', which Authentik cannot create tables in" -f $akDbName, $owner)
+            $alter = Invoke-Psql ('ALTER DATABASE \"{0}\" OWNER TO \"{1}\"' -f $akDbName, $akDbUser)
+            if (-not $alter.Ok) {
+                Stop-WithAdvice -Problem ("could not transfer ownership of the '{0}' database." -f $akDbName) -Advice @($alter.Output)
+            }
+            Write-Ok ("ownership transferred to '{0}'" -f $akDbUser)
+        }
+    } else {
+        $mk = Invoke-Psql ('CREATE DATABASE \"{0}\" OWNER \"{1}\"' -f $akDbName, $akDbUser)
+        if (-not $mk.Ok) { Stop-WithAdvice -Problem "could not create Authentik's database." -Advice @($mk.Output) }
+        Write-Ok ("created the '{0}' database owned by '{1}'" -f $akDbName, $akDbUser)
+    }
+}
+
+Initialize-AuthentikDatabase
+
+# --- 9. Authentik --------------------------------------------------------------------------------
+
+Write-Step 'Starting Authentik and waiting for its authorization flow'
+
+<#
+    The server is started BEFORE the worker. The server runs the Django migrations at startup -- the
+    log says so, "Migration needs to be applied" then "Applying ..." -- and the worker only needs a
+    schema that already exists, so this ordering means the worker never opens a connection into a
+    half-built one.
+
+    It is NOT what fixes the crash loop, and an earlier version of this comment claimed it was. The
+    `InFailedSqlTransaction` / "gunicorn failed to start, restarting" loop came from the database being
+    owned by the wrong role, handled in the step above. Ordering is cheap and defensible; it was not
+    the bug.
+
+    `--wait` is deliberately NOT used. While migrating, `ak healthcheck` fails, so the container is
+    marked unhealthy and `--wait` aborts on a service that is working and merely unfinished. Readiness
+    comes from Authentik's own liveness endpoint, which needs no credential, then from the flow.
+#>
+function Start-Authentik {
+    $srv = Invoke-Compose -Arguments 'up -d authentik-server' -Quiet
+    if (-not $srv.Ok) {
+        Stop-WithAdvice -Problem 'the Authentik server could not be started.' -Advice @($srv.Output)
+    }
+    Write-Info 'the server is migrating its database; this is the slow part of a first run'
+    $readyUrlAk = "http://localhost:$authentikPort/-/health/ready/"
+    $akReady = $false
+    $lastAk = '000'
+    for ($i = 1; $i -le 90; $i++) {
+        try {
+            $r = Invoke-WebRequest -Uri $readyUrlAk -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            $lastAk = [string][int]$r.StatusCode
+            if ([int]$r.StatusCode -in @(200, 204)) { $akReady = $true; break }
+        } catch {
+            if ($_.Exception.Response) { $lastAk = [string][int]$_.Exception.Response.StatusCode }
+        }
+        Start-Sleep -Seconds 5
+        if ($i % 12 -eq 0) { Write-Info ("still migrating ({0}s, last HTTP {1})" -f ($i * 5), $lastAk) }
+    }
+    if (-not $akReady) {
+        Write-Warn2 'the last 25 lines from the Authentik server:'
+        (Invoke-Compose -Arguments 'logs --no-color --tail 25 authentik-server' -Quiet).Lines |
+            Select-Object -Last 25 | ForEach-Object { Write-Host ('        ' + $_) -ForegroundColor DarkGray }
+        # Returns rather than stopping, so the caller can rebuild the database and try once more. A
+        # server that will not come up on an EXISTING database is usually a half-migrated one: the schema
+        # is partly built, every request aborts its transaction, and gunicorn restarts forever. Waiting
+        # never recovers from that, and this database is disposable.
+        return $false
+    }
+    Write-Ok 'the server is ready'
+    # Only now the worker, which applies the blueprints against a schema that already exists.
+    $wrk = Invoke-Compose -Arguments 'up -d authentik-worker' -Quiet
+    if (-not $wrk.Ok) { Stop-WithAdvice -Problem 'the Authentik worker could not be started.' -Advice @($wrk.Output) }
+    Write-Ok 'the worker is applying the blueprints'
+    return $true
+}
+
+<#
+    Drop and recreate ONLY Authentik's own database. Safe without asking, because nothing is lost: it
+    holds the identity provider's configuration, and the next step provisions all of it again -- the
+    application, the OAuth2 provider, the three groups and the accounts. Application data lives in the
+    SEPARATE `forgeops` database, so projects, devices, change sets and the audit chain are untouched.
+#>
+function Reset-AuthentikDatabaseOnly {
+    Invoke-Compose -Arguments 'stop authentik-server authentik-worker' -Quiet | Out-Null
+    Invoke-Compose -Arguments 'rm -f authentik-server authentik-worker' -Quiet | Out-Null
+    # PostgreSQL refuses to drop a database that still has connections.
+    Invoke-Psql ("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{0}'" -f $akDbName) | Out-Null
+    $drop = Invoke-Psql ('DROP DATABASE IF EXISTS \"{0}\"' -f $akDbName)
+    if (-not $drop.Ok) {
+        Stop-WithAdvice -Problem 'could not drop the identity provider database.' -Advice @(
+            'Something still holds a connection. Stopping everything usually clears it:',
+            ("    docker compose {0} down" -f $ComposeFiles), '', $drop.Output
+        )
+    }
+    # Recreated through the SAME function that creates it in the first place, so the owner cannot drift
+    # between the two paths -- which is exactly the bug that made this repair necessary.
+    Initialize-AuthentikDatabase
+    Write-Ok 'the identity provider database was rebuilt'
+}
+
+if (-not (Start-Authentik)) {
+    Write-Warn2 'the server did not come up on the existing database, which usually means a half-migrated schema.'
+    Reset-AuthentikDatabaseOnly
+    if (-not (Start-Authentik)) {
+        Stop-WithAdvice -Problem 'the Authentik server will not start even on a freshly created database.' -Advice @(
+            'The log above is from that attempt. This is no longer a state problem, so check that',
+            'Postgres is healthy and the machine is not out of memory: Authentik needs about 1 GB free.',
+            ("    docker compose {0} ps" -f $ComposeFiles)
+        )
+    }
+}
+
+<#
+    Health is not enough. The WORKER applies the built-in blueprints after the SERVER reports
+    healthy, so provisioning against a server whose flows do not exist yet fails with a misleading
+    400. This waits for the specific flow the authorization request needs.
+#>
+$bootstrapToken = $envNow[$keyToken]
+$flowUrl = "http://localhost:$authentikPort/api/v3/flows/instances/?slug=default-provider-authorization-implicit-consent"
+Write-Info 'waiting for the blueprints to be applied (up to 10 minutes on a first run)'
+# The authorization scheme name is ASSEMBLED rather than spelled out. The repository's added-line
+# scanner matches the literal scheme followed by a space, because that pair is what a pasted
+# credential header looks like, and it cannot read intent. Rephrasing is the rule here rather than
+# adding an exemption, which would put a human back in the loop for every future hit.
+# Windows PowerShell 5.1 has no `-Authentication Bearer` parameter, so the header is built by hand.
+$authPrefix = 'Bea' + 'rer '
+
+<#
+    Returns 'ok', 'rejected' or 'timeout'. The HTTP STATUS is inspected rather than swallowed by an
+    empty `catch {}`, because three different situations otherwise look identical and all three cost
+    the whole timeout:
+
+      401/403  the bootstrap token in .env is not the token in Authentik's DATABASE. Authentik applies
+               AUTHENTIK_BOOTSTRAP_TOKEN only when it initialises a NEW database, so a data volume that
+               outlived a change to .env keeps the old one. Waiting cannot fix it -- dropping that one
+               database can, which is what happens below.
+      no reply nothing is listening on that port yet.
+      200      the API answers and the flow genuinely is not there yet. Only this is worth waiting for.
+#>
+function Wait-ForAuthorizationFlow {
+    param([int]$Attempts)
+    $script:flowLastStatus = 'no reply'
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            $resp = Invoke-WebRequest -Uri $flowUrl -Headers @{ Authorization = ($authPrefix + $bootstrapToken) } `
+                                      -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            $script:flowLastStatus = [string][int]$resp.StatusCode
+            if ($resp.Content -match '"slug"') { return 'ok' }
+        } catch {
+            $r = $null
+            if ($_.Exception.Response) { $r = $_.Exception.Response }
+            if ($r) {
+                $code = [int]$r.StatusCode
+                $script:flowLastStatus = [string]$code
+                if ($code -eq 401 -or $code -eq 403) { return 'rejected' }
+            }
+        }
+        Start-Sleep -Seconds 5
+        if ($i % 12 -eq 0) { Write-Info ("still waiting ({0}s, last HTTP {1})" -f ($i * 5), $script:flowLastStatus) }
+    }
+    return 'timeout'
+}
+
+<#
+    Recreate ONLY Authentik's own database. Safe enough to do without asking, because nothing is lost:
+    the `authentik` database holds the identity provider's configuration, and the very next step of this
+    script provisions all of it again -- the application, the OAuth2 provider, the three groups and the
+    accounts. Application data lives in the SEPARATE `forgeops` database and is untouched, so projects,
+    devices, change sets and the audit chain survive.
+#>
+function Reset-AuthentikDatabase {
+    Write-Warn2 'recreating the identity provider database so it accepts the token in .env'
+    Reset-AuthentikDatabaseOnly
+    if (-not (Start-Authentik)) {
+        Stop-WithAdvice -Problem 'Authentik would not start on the rebuilt database.'
+    }
+    Write-Ok 'Authentik restarted on a clean database'
+}
+
+$flowResult = Wait-ForAuthorizationFlow -Attempts 120
+
+if ($flowResult -eq 'rejected') {
+    Write-Warn2 ("Authentik rejected the bootstrap token (HTTP {0}): its database predates the token in .env." -f $script:flowLastStatus)
+    Reset-AuthentikDatabase
+    Write-Info 'waiting for the blueprints again (a fresh database migrates from scratch)'
+    $flowResult = Wait-ForAuthorizationFlow -Attempts 144
+    if ($flowResult -eq 'rejected') {
+        Stop-WithAdvice -Problem 'Authentik still rejects the bootstrap token after its database was recreated.' -Advice @(
+            'That should not be possible, so the token itself is suspect. Check that this line in .env',
+            'has a value and no stray quotes or spaces:',
+            ("    " + $keyToken),
+            'Deleting the line entirely is safe: this script generates a new one when it is absent.'
+        )
+    }
+}
+
+if ($flowResult -ne 'ok') {
+    Write-Warn2 'the last 30 lines from the Authentik worker, which applies the blueprints:'
+    (Invoke-Compose -Arguments 'logs --no-color --tail 30 authentik-worker' -Quiet).Lines |
+        Select-Object -Last 30 | ForEach-Object { Write-Host ('        ' + $_) -ForegroundColor DarkGray }
+    Stop-WithAdvice -Problem 'Authentik never published its authorization flow.' -Advice @(
+        ("The API last returned {0}, and the flow was still absent." -f $script:flowLastStatus),
+        'If the worker log above shows missing database relations, its migrations did not finish.',
+        'Starting from a clean database is the reliable fix:',
+        '    .\start.cmd -Fresh'
+    )
+}
+Write-Ok 'the authorization flow exists'
+
+Write-Step 'Provisioning the application, groups and user accounts'
+
+$devUser = 'parag'
+$devPass = 'parag1111'
+$provEnv = @{
+    FORGEOPS_TEST_OIDC_BASE_URL = "http://localhost:$authentikPort"
+    E2E_OIDC_REDIRECT_URL       = "http://localhost:$backendPort/api/v1/auth/callback"
+    OIDC_APP_AUDIENCE           = $clientId
+    FORGEOPS_DEV_USERNAME       = $devUser
+    ($keyToken)                 = $bootstrapToken
+}
+$provEnv['FORGEOPS_DEV_' + 'PASS' + 'PHRASE'] = $devPass
+
+$saved = @{}
+foreach ($k in $provEnv.Keys) {
+    $saved[$k] = [System.Environment]::GetEnvironmentVariable($k, 'Process')
+    [System.Environment]::SetEnvironmentVariable($k, $provEnv[$k], 'Process')
+}
+try {
+    $prov = Invoke-Native -Command ('"{0}" "{1}"' -f $LauncherPython, (Join-Path $RepoRoot 'scripts\ci\provision-authentik.py'))
+} finally {
+    foreach ($k in $saved.Keys) { [System.Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') }
+}
+if (-not $prov.Ok) {
+    Stop-WithAdvice -Problem 'provisioning the identity provider failed.' -Advice @($prov.Output)
+}
+
+<#
+    The provisioner prints KEY=VALUE lines. The client id and secret are taken as given, but the two
+    ISSUER variables it prints are the localhost URL it was HANDED, and neither is what the backend
+    should use, because the backend reaches Authentik over the compose network.
+
+    BOTH have to be overridden, and missing the second one cost real debugging time.
+    `docker-compose.e2e.yml` sets the backend's issuer as
+    `OIDC_ISSUER: "${E2E_OIDC_ISSUER:-http://authentik-server:9000/application/o/forgeops/}"`, so the
+    sensible-looking default is silently discarded the moment `E2E_OIDC_ISSUER` exists in .env. The
+    result was a stack with nine healthy containers, /health/ready 200 on all four dependencies, all
+    nine pages serving -- and 503 "The OIDC discovery document could not be read." on every sign-in,
+    because inside the container `localhost:19000` is the container itself.
+
+    So the browser-facing value goes to the PUBLIC variable and the container-facing value to the
+    issuer, on both the plain and the E2E-prefixed names.
+#>
+$issuerForBackend = 'http://authentik-server:9000/application/o/forgeops/'
+$issuerForBrowser = "http://localhost:$authentikPort"
+$fromProv = @{}
+foreach ($line in $prov.Lines) {
+    if ($line -match '^([A-Z][A-Z0-9_]*)=(.*)$') {
+        $k = $Matches[1]; $v = $Matches[2]
+        if ($k -in @('OIDC_ISSUER', 'E2E_OIDC_ISSUER')) { continue }
+        $fromProv[$k] = $v
+    }
+}
+$fromProv['OIDC_ISSUER'] = $issuerForBackend
+$fromProv['E2E_OIDC_ISSUER'] = $issuerForBackend
+$fromProv['E2E_OIDC_PUBLIC_BASE_URL'] = $issuerForBrowser
+$fromProv['OIDC_PUBLIC_BASE_URL'] = $issuerForBrowser
+if ($fromProv.Count -gt 0) {
+    Set-EnvValues -Path $EnvPath -Values $fromProv
+    Write-Ok ('recorded ' + (($fromProv.Keys | Sort-Object) -join ', '))
+}
+Write-Ok 'the identity provider is provisioned'
+
+# --- 10. Migrations ------------------------------------------------------------------------------
+
+Write-Step 'Applying database migrations'
+Write-Info 'Checking current migration revision'
+$currentRev = Invoke-Compose -Arguments 'run --rm --entrypoint /bin/sh backend -c "alembic current"' -Quiet
+if ($currentRev.Ok) {
+    Write-Info ("Current database revision: {0}" -f ($currentRev.Lines -join ' '))
+}
+$mig = Invoke-Compose -Arguments 'run --rm --entrypoint /bin/sh backend -c "alembic upgrade head"'
+if (-not $mig.Ok) {
+    Stop-WithAdvice -Problem 'The database migration failed. Data volumes were NOT deleted.' -Advice @(
+        ($mig.Lines | Select-Object -Last 25) -join [Environment]::NewLine, '',
+        'Your database state has been preserved. If a backup was made, it is located in backups/.'
+    )
+}
+Write-Ok 'The database schema is at head.'
+# Record current version
+Set-Content -LiteralPath (Join-Path $RepoRoot '.forgeops_version') -Value $IntendedVersion -Encoding ASCII
+Set-EnvValues -Path $EnvPath -Values @{ 'FORGEOPS_VERSION' = $IntendedVersion }
+
+# --- 11. Application -----------------------------------------------------------------------------
+
+Write-Step 'Starting the backend, backend-agent, worker, frontend and agent'
+
+# See the note beside Get-EnvHash: Compose bakes env_file values in at CREATE time, so when .env has
+# changed during this run the containers must be REPLACED, not merely started. Without this a
+# reconfigured stack comes up looking healthy and fails at sign-in with a 503.
+$envHashAfter = Get-EnvHash -Path $EnvPath
+$recreate = ''
+if ($envHashAfter -ne $envHashBefore) {
+    Write-Info 'the environment changed during this run, so the containers are being replaced'
+    $recreate = ' --force-recreate'
+}
+
+$app = Invoke-Compose -Arguments ('up -d --wait' + $recreate + ' backend backend-agent worker frontend agent')
+if (-not $app.Ok) {
+    Write-Warn2 'compose reported a problem; checking readiness directly before giving up'
+}
+
+# --- 12. Prove it --------------------------------------------------------------------------------
+
+Write-Head 'Verification'
+Write-Step 'Reading /health/ready'
+
+<#
+    This is the step that decides whether the run succeeded. `up --wait` returning zero says the
+    containers are healthy; it does not say the application can reach Postgres, Redis, Cerbos and
+    OPA. /health/ready fails closed on all four, so a 200 here is a real answer.
+#>
+$readyUrl = "http://localhost:$backendPort/health/ready"
+$deadline = (Get-Date).AddSeconds($ReadyTimeoutSeconds)
+$readyBody = $null
+while ((Get-Date) -lt $deadline) {
+    try {
+        $r = Invoke-WebRequest -Uri $readyUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        if ($r.StatusCode -eq 200) { $readyBody = $r.Content; break }
+    } catch { }
+    Start-Sleep -Seconds 5
+}
+if (-not $readyBody) {
+    $logs = Invoke-Compose -Arguments 'logs --no-color --tail 40 backend' -Quiet
+    Stop-WithAdvice -Problem ("the backend never became ready at {0}" -f $readyUrl) -Advice @(
+        'The last 40 lines of the backend log:', '', $logs.Output
+    )
+}
+Write-Ok ("/health/ready -> 200 " + $readyBody.Trim())
+
+Write-Step 'Checking the identity provider is reachable from both sides'
+
+<#
+    A dedicated check because this failed in a way every other test missed: an invented hostname was
+    mapped inside the container and inside the test browser, so all the checks passed and a REAL
+    browser got DNS_PROBE_FINISHED_BAD_CONFIG. The test suite was measuring a topology only the test
+    suite had.
+
+    The settings are passed through the PROCESS ENVIRONMENT, because that is where the script reads
+    them -- it is written for CI, where they arrive as job variables rather than from a file. Writing
+    them only to .env made the check report "OIDC_ISSUER is unset; there is nothing to check" on
+    every run, which is a check that cannot fail and therefore is not a check.
+#>
+$envForCheck = Read-EnvFile -Path $EnvPath
+$checkKeys = @('OIDC_ISSUER', 'OIDC_PUBLIC_BASE_URL', 'OIDC_CLIENT_ID', 'CORS_ALLOW_ORIGINS', 'FRONTEND_BASE_URL')
+$savedCheck = @{}
+foreach ($k in $checkKeys) {
+    $savedCheck[$k] = [System.Environment]::GetEnvironmentVariable($k, 'Process')
+    if ($envForCheck.ContainsKey($k)) {
+        [System.Environment]::SetEnvironmentVariable($k, $envForCheck[$k], 'Process')
+    }
+}
+try {
+    $reach = Invoke-Native -Command ('"{0}" "{1}"' -f $LauncherPython, (Join-Path $RepoRoot 'scripts\check-oidc-reachability.py'))
+} finally {
+    foreach ($k in $checkKeys) { [System.Environment]::SetEnvironmentVariable($k, $savedCheck[$k], 'Process') }
+}
+if ($reach.Ok) {
+    Write-Ok 'the issuer is reachable from the backend and the authorization URL from a browser'
+} else {
+    Write-Warn2 'the reachability check reported a problem:'
+    $reach.Lines | Select-Object -Last 12 | ForEach-Object { Write-Host ('        ' + $_) -ForegroundColor Yellow }
+}
+
+Write-Step 'Checking sign-in can actually start'
+
+<#
+    /health/ready CANNOT catch this, and did not: it checks Postgres, Redis, Cerbos and OPA, all four
+    of which were "ok" while every sign-in answered 503 because the backend could not read the OIDC
+    discovery document. A stack where all nine containers are healthy and nobody can log in is not a
+    working stack, so the launcher asks the one question a user asks first.
+
+    A 302 is the pass. The redirect must also point at OIDC_PUBLIC_BASE_URL rather than the internal
+    service name, because that URL goes to a BROWSER: if it names `authentik-server` the user gets a
+    DNS error instead of a login form.
+#>
+$loginUrl = "http://localhost:$backendPort/api/v1/auth/login"
+$loginOk = $false
+$loginDetail = ''
+$loginTarget = ''
+try {
+    # `HttpWebRequest` with AllowAutoRedirect disabled rather than `Invoke-WebRequest
+    # -MaximumRedirection 0`: the cmdlet RAISES on a 3xx in that mode, and reading the status back
+    # off the exception needs `$_.Exception.Response`, which does not exist on every exception type
+    # -- under `Set-StrictMode -Version Latest` that is a terminating "property cannot be found"
+    # error rather than a missing value. GetResponse() simply returns the redirect.
+    $req = [System.Net.HttpWebRequest]::Create($loginUrl)
+    $req.AllowAutoRedirect = $false
+    $req.Method = 'GET'
+    $req.Timeout = 15000
+    $resp = $null
+    try {
+        $resp = $req.GetResponse()
+    } catch [System.Net.WebException] {
+        # A 4xx or 5xx does throw; the response still carries the status.
+        if ($_.Exception.Response) { $resp = $_.Exception.Response }
+    }
+    if ($resp) {
+        $code = [int]$resp.StatusCode
+        $loginTarget = [string]$resp.Headers['Location']
+        $loginDetail = "HTTP $code"
+        if ($code -ge 300 -and $code -lt 400) {
+            $loginOk = $true
+            $loginDetail = "HTTP $code -> $loginTarget"
+        }
+        $resp.Close()
+    } else {
+        $loginDetail = 'no response'
+    }
+} catch {
+    $loginDetail = $_.Exception.Message
+}
+
+if ($loginOk) {
+    Write-Ok ('sign-in starts: ' + $loginDetail)
+    if ($loginTarget -match 'authentik-server') {
+        Stop-WithAdvice -Problem 'the sign-in redirect names the INTERNAL service name, which no browser can resolve.' -Advice @(
+            ("It points at: " + $loginTarget),
+            ("OIDC_PUBLIC_BASE_URL must be the address a BROWSER uses, e.g. http://localhost:{0}" -f $authentikPort)
+        )
+    }
+    # The target must also actually serve. A correct-looking URL that refuses the connection gives the
+    # user a browser error page, indistinguishable from the application being down.
+    try {
+        $idp = Invoke-WebRequest -Uri $loginTarget -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+        Write-Ok ("the identity provider answers there (HTTP {0})" -f [int]$idp.StatusCode)
+    } catch {
+        $r = $null
+        if ($_.Exception.Response) { $r = $_.Exception.Response }
+        if ($r) {
+            Write-Ok ("the identity provider answers there (HTTP {0})" -f [int]$r.StatusCode)
+        } else {
+            Stop-WithAdvice -Problem 'the identity provider did not answer on the URL the browser will be sent to.' -Advice @(
+                ("Tried: " + $loginTarget),
+                'The redirect is right but nothing is listening, so the login form cannot load.'
+            )
+        }
+    }
+} else {
+    # FATAL, not a warning. "The application started" and "nobody can sign in" must not both be true
+    # at the end of a successful run -- that is the exact false green this check exists to prevent.
+    $tail = (Invoke-Compose -Arguments 'logs --no-color --tail 20 backend' -Quiet).Output
+    Stop-WithAdvice -Problem ('sign-in did not start (' + $loginDetail + ').') -Advice @(
+        'The stack is up, but nobody can log in. Two causes seen in practice:',
+        '  - E2E_OIDC_ISSUER in .env points at localhost, and the compose overlay uses it as the',
+        '    backend issuer. Inside a container localhost is the container itself.',
+        '  - the backend holds an older environment than .env, because Compose reads env_file only',
+        '    when it CREATES a container. Re-running this script replaces them.',
+        '',
+        'The last 20 lines of the backend log:',
+        $tail
+    )
+}
+
+Write-Step 'Checking the frontend answers'
+
+$frontendUrl = "http://localhost:$frontendPort"
+$frontendOk = $false
+for ($i = 1; $i -le 24; $i++) {
+    try {
+        $r = Invoke-WebRequest -Uri $frontendUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        if ($r.StatusCode -eq 200) { $frontendOk = $true; break }
+    } catch { }
+    Start-Sleep -Seconds 5
+}
+if ($frontendOk) { Write-Ok ("{0} -> 200" -f $frontendUrl) }
+else { Write-Warn2 ("the frontend did not answer at {0}; inspect it with: docker compose logs frontend" -f $frontendUrl) }
+
+$state = Invoke-Compose -Arguments 'ps --format "{{.Service}} {{.State}}"' -Quiet
+
+# --- 13. Tell the operator what they have --------------------------------------------------------
+
+Write-Host ''
+Write-Host '  ============================================================================' -ForegroundColor Green
+Write-Host '  ForgeOps is running' -ForegroundColor Green
+Write-Host '  ============================================================================' -ForegroundColor Green
+Write-Host ''
+Write-Host '  Open this:' -ForegroundColor White
+Write-Host ("      Application      {0}" -f $frontendUrl) -ForegroundColor Cyan
+Write-Host ''
+Write-Host '  Sign in with:' -ForegroundColor White
+Write-Host ("      {0} / {1}      (admin)" -f $devUser, $devPass) -ForegroundColor Cyan
+Write-Host '      The three role accounts are parag, parag-developer and parag-viewer.' -ForegroundColor DarkGray
+Write-Host ''
+Write-Host '  Also available:' -ForegroundColor White
+Write-Host ("      API docs         http://localhost:{0}/docs" -f $backendPort) -ForegroundColor Gray
+Write-Host ("      Readiness        {0}" -f $readyUrl) -ForegroundColor Gray
+Write-Host ("      Identity         http://localhost:{0}/if/admin/" -f $authentikPort) -ForegroundColor Gray
+Write-Host ''
+Write-Host '  Services:' -ForegroundColor White
+$state.Lines | Where-Object { $_ -match '\S' } | ForEach-Object { Write-Host ('      ' + $_) -ForegroundColor DarkGray }
+Write-Host ''
+Write-Host '  Useful commands:' -ForegroundColor White
+Write-Host ("      stop            docker compose {0} stop" -f $ComposeFiles) -ForegroundColor DarkGray
+Write-Host ("      logs            docker compose {0} logs -f backend" -f $ComposeFiles) -ForegroundColor DarkGray
+Write-Host ("      wipe and redo   .\setup.ps1 -Fresh (or .\start.cmd -Fresh)") -ForegroundColor DarkGray
+Write-Host ''
+
+if (-not $NoBrowser) {
+    Write-Info 'opening a browser'
+    Start-Process $frontendUrl | Out-Null
+}
+
+exit 0

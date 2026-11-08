@@ -41,6 +41,98 @@ repos:
       - id: ruff-format
         files: ^backend/.*\.py$
 
+  # ─── Test-integrity regime (design §0.4) ──────────────────────────────────
+  # These read and never rewrite. They exist because Phase 0 shipped 419 green
+  # backend tests over an MCP gateway that could not serve a request (D-23): the
+  # doubles reassigned a `spec=`'d child, so they implemented the caller's
+  # contract while the real collaborators implemented a different one.
+  - repo: local
+    hooks:
+      - id: check-test-doubles
+        name: test doubles must enforce signatures (FO-TD001..004)
+        entry: python scripts/check-test-doubles.py
+        language: system
+        files: ^backend/tests/.*\.py$
+        exclude: ^backend/tests/meta/fixtures/.*
+      # secret-safety.md already says "never use a value that resembles a real provider
+      # token format". Until now that rule had no enforcement, so it held only as long as
+      # whoever wrote the test remembered it — and it stopped holding the first time it was
+      # inconvenient: a property test shipped `Bearer …`, `Basic <base64>` and an
+      # `eyJ`-prefixed JWT as source literals. None was ever usable; a scanner cannot tell,
+      # and this repository has already collected a GitGuardian incident for exactly that
+      # shape. `backend/tests/synthetic_secrets.py` is the remedy and this is the gate.
+      - id: check-test-credentials
+        name: no credential-shaped literal in a test source (FO-SEC001)
+        entry: python scripts/check-test-credentials.py
+        language: system
+        files: ^backend/tests/.*\.py$
+        exclude: ^backend/tests/meta/fixtures/.*
+      # The same added-lines shape grep that `scripts/secret-gate.ps1` runs at push time, moved
+      # to commit time. It had to move: three times a harmless credential SHAPE reached a commit
+      # and the pre-push gate caught it, and the only remedy at that point is a history rewrite.
+      # A correct check positioned after the point where the damage becomes expensive is journal
+      # pattern O. `pass_filenames: false` with `always_run: true` because the question is about
+      # the staged diff as a whole, not about any one file, and a deletion-only commit must still
+      # be scanned rather than skipped.
+      - id: check-added-shapes
+        name: no credential shape in an added line (FO-SEC001, pre-push gate stage 2a/3)
+        entry: python scripts/check-added-shapes.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: check-ci-jobs
+        name: every CI job Appendix E cites must exist
+        entry: python scripts/check-ci-jobs.py .github/workflows/ci.yml .antigravity/specs/phase-1-mvp-core/design.md
+        language: system
+        pass_filenames: false
+        files: ^(\.github/workflows/ci\.yml|\.antigravity/specs/phase-1-mvp-core/design\.md)$
+      # The merge of the former Phase 3 into Phase 2 renumbered two whole phases, and every "deferred
+      # to the former Phase 5" note in the tree then pointed at a phase that no longer exists. A stale
+      # phase reference is not cosmetic: a five-phase plan whose 2.x and 3.x sections overlap misleads
+      # the next reader more effectively than a missing note would. `always_run`, because a reference
+      # can go stale by an edit to `phases.md` alone — the file that defines what is valid.
+      - id: check-phase-references
+        name: no phase reference may name a phase or subsection phases.md lacks
+        entry: python scripts/check-phase-references.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      # Debt D4 (design §0.5). A floating tool version means two builds of the same
+      # commit can use different tools, and Phase 0 installed its own vulnerability
+      # scanner that way.
+      - id: check-no-latest
+        name: no floating tool versions (workflows, scripts, Dockerfiles)
+        entry: bash scripts/check-no-latest.sh
+        language: system
+        pass_filenames: false
+        files: ^(\.github/.*|scripts/.*|.*Dockerfile|Makefile|docker-compose.*\.yml)$
+      # An allowlist is the cheapest way to make a secret scan green, and therefore
+      # the easiest thing to widen under pressure. This fails the build if an entry
+      # loses its `paths` or `regexes` scoping, if `stopwords` appear, or if the
+      # built-in rules are switched off.
+      - id: check-gitleaks-config
+        name: the gitleaks allowlist must stay narrow
+        entry: bash scripts/check-gitleaks-config.sh
+        language: system
+        pass_filenames: false
+        files: ^\.gitleaks\.toml$
+      # design §2.2.1 mechanism 3. The nested-`internal` rule and the mint-only capability
+      # type are both stronger than a lint — one is a compile error, the other a TypeError —
+      # but neither survives a refactor that moves a package INSIDE the executor subtree, and
+      # neither notices a primitive that grows a caller. Both enumerations here are derived
+      # from the tree, so a newly marked primitive and a newly added package are covered
+      # without editing anything.
+      #
+      # `pass_filenames: false` and scoped to `^(agent|backend)/`: the check is a whole-graph
+      # question, so it cannot be answered file by file, but running it on a docs-only commit
+      # would spend a `go list` for nothing.
+      - id: check-chokepoint
+        name: the mutation chokepoint is unbypassable (design 2.2.1, Q-03)
+        entry: bash scripts/check-chokepoint.sh
+        language: system
+        pass_filenames: false
+        files: ^(agent|backend)/
+
   # ─── Agent: gofmt + go vet, scoped to agent/ (design §16.1) ────────────────
   - repo: local
     hooks:
@@ -52,18 +144,51 @@ repos:
         files: ^agent/.*\.go$
       - id: go-vet
         name: go vet (changed agent packages)
-        entry: scripts/go-vet-changed.sh
-        language: script
+        # `bash scripts/...` under `language: system`, not `language: script`, and the difference is
+        # a real defect rather than a style choice (finding 63). `language: script` asks pre-commit
+        # to execute the file through its shebang; on Windows there is no `/bin/sh`, so the hook
+        # failed with `Executable /bin/sh not found` for every commit that touched an agent Go file
+        # — which meant `go vet` was never actually run locally on this platform, while CI on Linux
+        # ran it and passed. Three sibling hooks in this file (`check-no-latest`,
+        # `check-gitleaks-config`, `check-chokepoint`) already spell it this way and work on both
+        # platforms, so this is the form that was already proven here.
+        entry: bash scripts/go-vet-changed.sh
+        language: system
         types: [go]
         files: ^agent/.*\.go$
 
   # ─── Prettier: frontend sources plus project-owned markdown/yaml/json ──────
+  #
+  # THE VERSION IS PINNED TO frontend/package.json's, and must stay equal to it. It was 3.3.3 here
+  # and 3.9.6 there, which is not a cosmetic mismatch: the two disagree about how to wrap a CSS
+  # custom property and how to quote a YAML scalar, so whichever ran last "fixed" the file and the
+  # other then rejected it. `ci / pre-commit` and the frontend job's `prettier --check` were
+  # therefore unable to pass at the same time — one formatter's output is the other's failure.
+  #
+  # A single version is the fix. Two formatters over one tree is a loop, not a stricter gate.
   - repo: https://github.com/pre-commit/mirrors-prettier
     rev: v4.0.0-alpha.8
     hooks:
       - id: prettier
-        additional_dependencies: ["prettier@3.3.3"]
+        additional_dependencies: ["prettier@3.9.6"]
         files: ^(frontend/.*\.(js|jsx|ts|tsx|css|scss|json|md|mdx|ya?ml)|docs/.*\.md|policies/.*\.ya?ml|config/.*\.ya?ml|\.github/.*\.ya?ml|[^/]+\.md)$
+        # GENERATED FILES ARE EXCLUDED HERE, not in `frontend/.prettierignore`.
+        #
+        # That file exists and says exactly why the lockfile must be left alone, but it is not
+        # honoured by this hook: pre-commit runs prettier from the REPOSITORY ROOT, so prettier looks
+        # for a root `.prettierignore` and never reads the one inside `frontend/`. The lockfile was
+        # duly rewritten from pnpm's single-quoted output to double quotes — 4,100 lines — which is
+        # the precise loop that file was written to prevent.
+        #
+        # `docs/api.md` is excluded for the same structural reason. It is generated by
+        # `scripts/dump-openapi.py`, whose `--check` mode compares its own rendering against the file
+        # byte for byte. A formatter that pads the table columns makes `--check` report drift forever,
+        # and the "fix" would be to reformat a file the generator rewrites on the next run.
+        #
+        # Neither is a check being switched off. The lockfile is policed by
+        # `pnpm install --frozen-lockfile` and `scripts/check-lock-freshness.sh`; `docs/api.md` is
+        # policed by `dump-openapi.py --check`. A generated file's format belongs to its generator.
+        exclude: ^(frontend/pnpm-lock\.yaml|docs/api\.md)$
 
   # ─── File hygiene (design §8.4) ───────────────────────────────────────────
   - repo: https://github.com/pre-commit/pre-commit-hooks

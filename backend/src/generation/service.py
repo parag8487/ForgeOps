@@ -1,0 +1,2125 @@
+# SPDX-License-Identifier: FSL-1.1-ALv2
+"""Generation streaming (design.md ?1.5, ?7.4, ?11.5; Leaf 13.8).
+
+**What changed and why.** This service emitted three event names ? `run_start`, `token_chunk`,
+`run_complete` ? by hand-formatting SSE frames. None of the three is in `SSEEventType`, which ?7.4
+fixes at six values and says explicitly that "no divergent names may be invented". Nothing caught it
+because the vocabulary was an enum nobody had to go through and this was the only producer, so the
+enum described a contract the one implementation broke.
+
+The failure that would have caused is quiet in the worst way: a browser `EventSource` with a
+listener on `token` never fires for `token_chunk`. No error, no warning ? an apparently empty
+stream. Frames now go through `core.sse.format_event`, which takes the enum rather than a string, so
+a divergent name is a `TypeError` at the call site.
+
+The stream shape is ?12.6 step 7's: `status`, then one `token` per chunk, then `validation`
+carrying the deterministic gate's verdict, then `complete`. `error` replaces `complete` when the
+pipeline fails, and is a terminal frame ? a stream that ended with neither is a stream a client
+cannot distinguish from a dropped connection.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import re
+import time
+import uuid
+from collections.abc import AsyncGenerator, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Final
+
+from pydantic import BaseModel
+
+from ..core.content_regression import regression_findings
+from ..core.manifest_facts import dockerfile_base_pinned
+from ..core.model_port import ArtifactModelPort
+from ..core.sse import SSEEventType, format_event
+from ..core.target_checks import score_lowering_findings, unsatisfied_targets
+from ..secrets.redaction import RedactedPrompt, create_redacted_prompt
+from .artifact_checks import (
+    _extract_dockerfile_container_ports,
+    _extract_k8s_service_ports,
+    _extract_k8s_workload_ports,
+    _load_documents,
+    validate_artifacts,
+)
+from .iac_renderers import (
+    GENERATED_IMAGE_TAG,
+    GENERATED_RUN_AS_USER,
+    github_workflow_yaml,
+    helm_chart_ignore,
+    helm_chart_yaml,
+    helm_deployment_template,
+    helm_helpers_template,
+    helm_values_yaml,
+    opentofu_main_tf,
+)
+from .model_prompt import (
+    OPTIONAL_ARTIFACTS,
+    REQUIRED_ARTIFACTS,
+    ArtifactParseError,
+    build_generation_prompt,
+    facts_from_project,
+    infer_runtime,
+    parse_artifacts,
+)
+from .models import MAX_GENERATION_ITERATIONS
+from .project_hygiene_renderers import (
+    compose_file,
+    dockerignore,
+    env_example,
+    lint_config,
+    secret_scanner_config,
+    security_policy,
+)
+from .prompt_compiler import CompiledPrompt
+from .retrieval import RetrievalContext, render_context_section
+
+logger = logging.getLogger(__name__)
+
+
+class RunRecord(BaseModel):
+    run_id: uuid.UUID
+    project_id: uuid.UUID
+    status: str
+    token_usage: int
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedFile:
+    """One artifact the pipeline produced, ready to become a `change_items` row.
+
+    `path` and `content` are what a change set needs, so generation hands governance exactly the
+    shape it consumes rather than a blob a caller has to re-parse. That is what lets
+    `change_sets.origin = 'generation'` and `change_sets.generation_run_id` mean something.
+    """
+
+    path: str
+    content: str
+
+
+@dataclass(slots=True)
+class GenerationOutcome:
+    """What a completed stream produced, for the caller that has to persist it.
+
+    Separate from the stream itself because an async generator's return value is awkward to reach:
+    the route needs the artifacts AFTER the last frame, and reading them off a mutable outcome the
+    generator fills is clearer than threading a queue or re-running the pipeline.
+    """
+
+    run_id: uuid.UUID
+    files: list[GeneratedFile] = field(default_factory=list)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    validation_passed: bool = False
+    status: str = "running"
+    #: One of `models.SERVED_FROM`. `pending` until the run resolves, because a row whose status
+    #: is `running` has not been served from anywhere yet and the previous code's answer to that
+    #: was the SQL literal `'template'` — a claim about the pipeline made before it ran.
+    served_from: str = "pending"
+    #: The `ModelTier` that produced this, or `template` when nothing did. Was the SQL literal
+    #: `'deterministic'`, which is not a tier.
+    tier: str = "template"
+    #: Which endpoint answered, for the NFR-04 evidence `generation_runs.endpoint_id` exists for.
+    endpoint_id: str | None = None
+    #: ONE RECORD PER MODEL ATTEMPT, so a run that served templates can say which attempt failed and why.
+    #:
+    #: Built because three investigations this cycle needed it and had to rebuild it from a live stream that
+    #: no longer existed. The cause it exposed was a 300s client budget against attempts measured at
+    #: 155-817s: every one was cut off mid-flight and recorded as a refusal. A truncated attempt and a
+    #: refused artifact look identical in a row that does not carry the duration.
+    attempts: list[dict[str, object]] = field(default_factory=list)
+    #: FR-13's retrieval record: which retrievers ran, how many chunks reached the prompt, and their
+    #: paths. Persisted to `generation_runs.retrieval`, a column that has existed since revision `0006`
+    #: and was never written.
+    #:
+    #: `None` means retrieval was never ATTEMPTED, which is a different fact from an empty result — a
+    #: project that has been scanned and yielded nothing relevant is not the same as one that was never
+    #: searched. That is why this is not defaulted to an empty dict.
+    retrieval: dict[str, Any] | None = None
+    #: Provider attempts consumed, bounded by §3.8's three. `0` for a cache hit or a run with no
+    #: router configured, which is the truth in both cases: neither called a provider.
+    iterations_used: int = 0
+    #: Per-phase wall-clock seconds (revision 0040). Filled by the route (context, compile, submit) and by
+    #: the service (model, first token, validation), so "where did the ten minutes go" is in the row.
+    timings: dict[str, float] = field(default_factory=dict)
+    #: Why the run ended `failed`, in words an operator can act on.
+    failure_reason: str | None = None
+    #: The exact (redacted) text the FIRST attempt sent to the provider. Persisted as the run's
+    #: instruction, because the compiled plan alone omits the operator's own request section.
+    sent_prompt: str | None = None
+
+
+def _kubernetes_name(raw: str) -> str:
+    """Turn a project name into a valid RFC 1123 label, or return empty when it cannot.
+
+    Kubernetes rejects a name with capitals, underscores or a leading digit, and the manifests are
+    validated by the pipeline ? so an invalid name would fail the run rather than deploy badly. An
+    empty return means "no usable name", and the caller keeps its documented default instead of
+    emitting something Kubernetes will refuse.
+    """
+    lowered = "".join(character if character.isalnum() else "-" for character in raw.strip().lower())
+    trimmed = "-".join(part for part in lowered.split("-") if part)[:63].strip("-")
+    if not trimmed or not trimmed[0].isalpha():
+        # A label must start with a letter. Prefixing rather than discarding keeps a numeric project
+        # name identifiable instead of silently becoming the generic default.
+        trimmed = f"app-{trimmed}".strip("-")[:63] if trimmed else ""
+    return trimmed
+
+
+def _deployment_yaml(app_name: str, port: int, image_tag: str = GENERATED_IMAGE_TAG) -> str:
+    """The Deployment. `replicas: 1` because nothing here knows the intended scale.
+
+    EVERY PROPERTY BELOW IS SCORED, AND THAT IS WHY IT IS HERE. This template used to emit
+    `image: {app_name}:latest` with no `resources` and no probes, and the readiness engine scores
+    exactly those three things — `kubernetes_image_tags_pinned` (20), `kubernetes_probes_declared` (25)
+    and `kubernetes_resource_limits_declared` (35). So a run whose instruction said "probes are
+    missing" fell back to this template, applied it, and the operator's score did not move. The
+    fallback is the FLOOR: an artifact that fails the check it was generated to fix is worse than no
+    artifact, because it consumes the change set and reports success.
+
+    THE NUMBERS ARE A STARTING POINT AND SAY SO IN THE FILE. An earlier version of the Helm values
+    left `resources: {}` with a comment arguing that a guessed request is worse than none. That
+    reasoning is defensible in isolation and wrong here: `kubernetes_resource_limits_declared` is a
+    check this platform scores the user against, so shipping an artifact that fails it hands the user a
+    defect and then bills them for it. A modest, clearly-labelled default that the operator will tune
+    is the honest resolution — and unlike an absent block, it cannot evict a neighbour on day one.
+
+    The probe path is `/` rather than `/healthz`: nothing here knows that the application serves a
+    dedicated health route, and a probe pointed at a 404 would restart a healthy container forever.
+    `/` is the one path a web application can be assumed to answer.
+    """
+    return "\n".join(
+        [
+            "apiVersion: apps/v1",
+            "kind: Deployment",
+            "metadata:",
+            f"  name: {app_name}",
+            "  labels:",
+            f"    app: {app_name}",
+            "spec:",
+            "  replicas: 1",
+            "  selector:",
+            "    matchLabels:",
+            f"      app: {app_name}",
+            "  template:",
+            "    metadata:",
+            "      labels:",
+            f"        app: {app_name}",
+            "    spec:",
+            "      securityContext:",
+            "        runAsNonRoot: true",
+            f"        runAsUser: {GENERATED_RUN_AS_USER}",
+            "      containers:",
+            "        - name: app",
+            # An explicit tag, not `latest`: two applies of one manifest must deploy the same code.
+            f"          image: {app_name}:{image_tag}",
+            "          ports:",
+            f"            - containerPort: {port}",
+            "          # Requests are what the scheduler reserves; limits are what stops this container",
+            "          # taking the node. Tune both to the workload's measured usage.",
+            "          resources:",
+            "            requests:",
+            '              cpu: "100m"',
+            '              memory: "128Mi"',
+            "            limits:",
+            '              cpu: "500m"',
+            '              memory: "512Mi"',
+            "          # Without probes a wedged container keeps receiving traffic, because nothing asks it.",
+            "          livenessProbe:",
+            "            httpGet:",
+            "              path: /",
+            f"              port: {port}",
+            "            initialDelaySeconds: 10",
+            "            periodSeconds: 20",
+            "          readinessProbe:",
+            "            httpGet:",
+            "              path: /",
+            f"              port: {port}",
+            "            initialDelaySeconds: 5",
+            "            periodSeconds: 10",
+            "          securityContext:",
+            "            allowPrivilegeEscalation: false",
+            "            readOnlyRootFilesystem: true",
+            "            capabilities:",
+            "              drop:",
+            '                - "ALL"',
+            "",
+        ]
+    )
+
+
+def _service_yaml(app_name: str, port: int) -> str:
+    """The Service, without which nothing can reach the pod.
+
+    `ClusterIP` and not `LoadBalancer`: a Service type that provisions cloud infrastructure is a
+    decision with a bill attached, and nothing here knows whether this cluster should expose it that
+    way. The Ingress below is the deliberate entry point.
+    """
+    return "\n".join(
+        [
+            "apiVersion: v1",
+            "kind: Service",
+            "metadata:",
+            f"  name: {app_name}",
+            "  labels:",
+            f"    app: {app_name}",
+            "spec:",
+            "  type: ClusterIP",
+            "  selector:",
+            f"    app: {app_name}",
+            "  ports:",
+            "    - name: http",
+            "      port: 80",
+            f"      targetPort: {port}",
+            "      protocol: TCP",
+            "",
+        ]
+    )
+
+
+def _ingress_yaml(app_name: str, port: int) -> str:
+    """The Ingress. The host is derived from the application name, not invented from a real domain.
+
+    `.local` deliberately: it is reserved for local resolution, so a manifest applied by accident
+    cannot claim a name that belongs to somebody else. An operator who has a real hostname edits one
+    line, which is a better default than a plausible-looking domain nobody owns.
+    """
+    del port  # The Ingress addresses the Service's port 80, not the container's.
+    return "\n".join(
+        [
+            "apiVersion: networking.k8s.io/v1",
+            "kind: Ingress",
+            "metadata:",
+            f"  name: {app_name}",
+            "  labels:",
+            f"    app: {app_name}",
+            "spec:",
+            "  rules:",
+            f"    - host: {app_name}.local",
+            "      http:",
+            "        paths:",
+            "          - path: /",
+            "            pathType: Prefix",
+            "            backend:",
+            "              service:",
+            f"                name: {app_name}",
+            "                port:",
+            "                  number: 80",
+            "",
+        ]
+    )
+
+
+@dataclass(slots=True)
+class _ModelReport:
+    """How the provider path finished, for the generator that cannot return a value.
+
+    `succeeded` is what decides whether the template runs. Reading it off a shared object is the
+    same technique `GenerationOutcome` uses one level up, and for the same reason: the caller needs
+    a fact the generator learns after its last frame.
+    """
+
+    succeeded: bool = False
+    findings: tuple[str, ...] = ()
+
+
+#: The static server for built frontends: the unprivileged nginx build (runs as uid 101, binds any port), pinned.
+STATIC_SERVER_IMAGE: Final[str] = "nginxinc/nginx-unprivileged:1.27.3-alpine"
+
+
+def _static_frontend_output_dir(
+    *,
+    runtime: str,
+    is_frontend: bool,
+    is_nextjs: bool,
+    existing: Mapping[str, str] | None,
+    frameworks: Sequence[str],
+) -> str | None:
+    """The build output directory of a frontend with no server of its own, or None when it is not one.
+
+    A Node frontend that is not Next.js and whose root package.json declares no `start` script is a static
+    site. The directory comes from the project: an explicit Vite `outDir`, Create React App's `build`, or
+    Vite's default `dist`.
+    """
+    if not runtime.startswith("node") or not is_frontend or is_nextjs or not isinstance(existing, Mapping):
+        return None
+    try:
+        package = json.loads(existing.get("package.json") or "{}")
+    except (ValueError, TypeError):
+        return None
+    scripts = package.get("scripts") if isinstance(package, dict) else None
+    if not isinstance(scripts, dict) or "build" not in scripts or "start" in scripts:
+        return None
+    for name, body in existing.items():
+        if name.replace("\\", "/").rsplit("/", 1)[-1].startswith("vite.config.") and "/" not in name.replace("\\", "/"):
+            match = re.search(r"""outDir\s*:\s*['"]([^'"]+)['"]""", body or "")
+            if match:
+                return match.group(1).strip("./") or "dist"
+    deps = {**(package.get("dependencies") or {}), **(package.get("devDependencies") or {})}
+    if "react-scripts" in deps or any("create-react-app" in f for f in frameworks):
+        return "build"
+    return "dist"
+
+
+class GenerationService:
+    """Streams a generation run and reports what it produced.
+
+    THE ORDER, AND WHY IT IS THIS ORDER
+    -----------------------------------
+    cache -> provider -> fallback cascade -> safe template, and the template is reached ONLY
+    after the provider path has genuinely been tried and failed up to §3.8's three times.
+
+    That ordering is the whole change. `stream_generation` used to call `self._render` directly
+    and this docstring used to say "the pipeline behind this is still the Phase 1 template path
+    ... not a live model call", while `routes.py` INSERTed `served_from` as the SQL string literal
+    `'template'` — not a bound parameter — so the column could not have recorded a provider call
+    even if one had happened. The template library was not the fallback; it was the only path, and
+    the schema was shaped so that nobody could tell from a row.
+
+    THE MODEL ARRIVES AS `core.model_port.ArtifactModelPort`, NOT AS `ModelRouter`
+    -----------------------------------------------------------------------------
+    `src/generation/` may not import `src.ai` (§2.2.1), and that ban is re-asserted by parsing in
+    `scripts/chokepoint_graph.py` rather than by a lint, so it cannot be silenced. The first
+    version of this wiring imported `ai.routing.router` and the parse check refused it. `src/ai`
+    implements the port in `ai/generation_port.py`; this module names only the seam, which is also
+    what would let generation be extracted with `core/model_port.py` and no knowledge of routing.
+
+    The port is INJECTED rather than constructed here for a second reason: the router behind it
+    owns the cache and the per-endpoint breakers, and it is composed once in the lifespan. A
+    service that built its own would get a private set of breakers whose state nothing else could
+    see, so a tripped endpoint would keep being retried by generation after `/api/v1/ai/complete`
+    had given up on it.
+
+    `model=None` IS A SUPPORTED CONFIGURATION, NOT A TEST SEAM
+    A deployment with no reachable endpoint runs the template path and records `served_from`
+    `template` with status `template_fallback`, which is an honest row. It is also what keeps
+    `GenerationService()` constructible with no arguments, which Q-26 and
+    `test_generation_service.py` rely on — those properties are about SSE framing and must not
+    need a model server to run.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: ArtifactModelPort | None = None,
+        max_attempts: int = MAX_GENERATION_ITERATIONS,
+    ) -> None:
+        self._model = model
+        if max_attempts < 1 or max_attempts > MAX_GENERATION_ITERATIONS:
+            # §3.8's bound is expressed in the type (`Literal[3]`), in the schema
+            # (`iterations_used BETWEEN 0 AND 3`) and in Q-08. This is the fourth place it could
+            # be broken, so it refuses rather than letting a caller write an unstorable row.
+            raise ValueError(f"max_attempts must be between 1 and {MAX_GENERATION_ITERATIONS}, got {max_attempts}")
+        self._max_attempts = max_attempts
+
+    @property
+    def routes_to_a_model(self) -> bool:
+        """Whether this service has a provider path at all.
+
+        Read by `routes.py` to decide the `tier` it records on the `running` row, so the row says
+        what was ATTEMPTED rather than what a previous phase happened to hard-code.
+        """
+        return self._model is not None
+
+    @property
+    def attempted_tier(self) -> str:
+        """The tier this run will ask for, for the `running` row's `tier` column.
+
+        `template` when there is no provider path, which is a true statement about what will
+        produce the artifacts. The column previously carried the SQL literal `'deterministic'`,
+        which is not a `ModelTier` and told a reader nothing about routing.
+        """
+        return self._model.tier_name if self._model is not None else "template"
+
+    @property
+    def pinned_endpoint_id(self) -> str | None:
+        """The one endpoint this run may call, when the operator chose one."""
+        return getattr(self._model, "pinned_endpoint_id", None) if self._model is not None else None
+
+    def opening_prompt(
+        self,
+        prompt: str,
+        *,
+        project: Mapping[str, Any] | None,
+        retrieval: RetrievalContext | None,
+        compiled: CompiledPrompt | None,
+    ) -> str:
+        """The exact redacted text attempt 1 sends, so the route can persist it BEFORE the stream.
+
+        One definition used by both the route and the attempt loop, so the recorded instruction and the
+        transmitted one cannot drift apart.
+        """
+        app_name = _kubernetes_name(str((project or {}).get("name") or "")) or "forgeops-app"
+        facts = facts_from_project(project=project, operator_prompt=prompt, default_app_name=app_name)
+        if compiled is not None:
+            text_value = compiled.text
+            if prompt and prompt.strip():
+                # NUMBERED PAST THE COMPILED PLAN'S OWN SECTIONS. The plan numbers its sections 1-4 and uses
+                # 5 for the checks it cannot address, so `## 6` is the first heading the plan never claims.
+                text_value = (
+                    text_value + "\n## 6. OPERATOR REPAIR REQUEST & DEPLOYMENT ERROR\n\n" + prompt.strip() + "\n"
+                )
+        else:
+            text_value = build_generation_prompt(
+                operator_prompt=prompt,
+                facts=facts,
+                previous_findings=(),
+                attempt=1,
+                context_lines=render_context_section(retrieval) if retrieval is not None else (),
+            )
+        return str(create_redacted_prompt(text_value))
+
+    async def stream_generation(
+        self,
+        project_id: uuid.UUID,
+        prompt: str,
+        *,
+        outcome: GenerationOutcome | None = None,
+        project: Mapping[str, Any] | None = None,
+        retrieval: RetrievalContext | None = None,
+        compiled: CompiledPrompt | None = None,
+        existing: Mapping[str, str] | None = None,
+        repair_prompts: Mapping[str, CompiledPrompt] | None = None,
+    ) -> AsyncGenerator[str]:
+        """Yield §7.4 frames for one generation run.
+
+        `outcome` is filled as the run proceeds so the caller can persist the artifacts and the
+        token counts after the stream closes. It is optional so the service stays usable — and
+        testable — without one.
+
+        `project` is the `projects` row, so the rendered artifacts describe the REAL application
+        rather than a fixed `forgeops-app`. Optional for the same reason as `outcome`: the service
+        must remain constructible in a test that is not about project facts, and `_render`
+        documents what it falls back to.
+        """
+        run_id = outcome.run_id if outcome is not None else uuid.uuid4()
+
+        yield format_event(
+            SSEEventType.STATUS,
+            {"run_id": str(run_id), "project_id": str(project_id), "state": "running"},
+        )
+
+        provider_findings: tuple[str, ...] = ()
+        pinned = self.pinned_endpoint_id
+        if self.routes_to_a_model:
+            report = _ModelReport()
+            async for frame in self._stream_from_model(
+                run_id=run_id,
+                prompt=prompt,
+                project=project,
+                outcome=outcome,
+                report=report,
+                retrieval=retrieval,
+                compiled=compiled,
+                repair_prompts=repair_prompts,
+                existing=existing,
+            ):
+                yield frame
+            if report.succeeded:
+                # The provider path emitted its own terminal frame. §7.4 permits exactly one.
+                return
+            provider_findings = report.findings
+            if pinned is not None:
+                # AN EXPLICIT CHOICE FAILS AS ITSELF. The operator picked this provider; answering with
+                # canned templates would report a run "completed" that the chosen model never produced, and
+                # answering with another provider is the silent swap this pin exists to forbid.
+                reason = (
+                    f"The selected model ({pinned}) did not produce a usable result: "
+                    + ("; ".join(provider_findings) if provider_findings else "no attempt returned content")
+                    + ". No other provider was called. Choose another model or retry."
+                )
+                if outcome is not None:
+                    outcome.status = "failed"
+                    outcome.failure_reason = reason[:2000]
+                    # The provider that was TRIED, not the `template` default: nothing rendered a template.
+                    outcome.tier = self.attempted_tier
+                yield format_event(
+                    SSEEventType.ERROR,
+                    {"run_id": str(run_id), "state": "provider_failed", "endpoint_id": pinned, "detail": reason},
+                )
+                return
+        # Falling through means either no router is configured or every provider attempt failed.
+        # Either way the template is now a genuine fallback rather than the only path, and the row
+        # will say `template`.
+        async for frame in self._stream_from_template(
+            run_id=run_id,
+            prompt=prompt,
+            project=project,
+            outcome=outcome,
+            provider_findings=provider_findings,
+            existing=existing,
+            compiled=compiled,
+        ):
+            yield frame
+
+    # ── the provider path ────────────────────────────────────────────────────
+
+    async def _stream_from_model(
+        self,
+        *,
+        run_id: uuid.UUID,
+        prompt: str,
+        project: Mapping[str, Any] | None,
+        existing: Mapping[str, str] | None,
+        outcome: GenerationOutcome | None,
+        report: _ModelReport,
+        retrieval: RetrievalContext | None = None,
+        compiled: CompiledPrompt | None = None,
+        repair_prompts: Mapping[str, CompiledPrompt] | None = None,
+    ) -> AsyncGenerator[str]:
+        """Route through the cascade, streaming real deltas, up to `max_attempts` times.
+
+        The verdict goes on `report` rather than being raised or returned. An async generator
+        cannot return a value a caller can read, and an exception would strand a stream that has
+        already emitted frames with no terminal event — the one outcome a client cannot distinguish
+        from a dropped connection.
+        """
+        assert self._model is not None
+        app_name = _kubernetes_name(str((project or {}).get("name") or "")) or "forgeops-app"
+        facts = facts_from_project(project=project, operator_prompt=prompt, default_app_name=app_name)
+
+        findings: tuple[str, ...] = ()
+        # Assigned on attempt 1 and used after acceptance; see `remember` below for why the retry
+        # prompt must not be the key.
+        first_attempt_prompt: RedactedPrompt | None = None
+        # Bound HERE rather than only on the gate-failure path, which is where it used to live. The
+        # provenance decision below reads it on every successful attempt including the ones that never
+        # reached the floor, and leaving it unbound raised UnboundLocalError on the ordinary happy path --
+        # caught immediately by `test_generation_routing.py`, which is what those tests are for.
+        substituted: tuple[str, ...] = ()
+        # ARTIFACTS THAT ALREADY PASSED, kept across attempts so a repair does not have to reproduce them.
+        #
+        # Before this, a rejected artifact made the whole set be asked for again. MEASURED on the real
+        # model: asked for six files with 55 requirements, 7b produced an unpinned `node:$NODE_VERSION`
+        # base image and REPRODUCED IT on both corrections; asked for the Dockerfile alone with its own 24
+        # requirements, it made the same mistake once and fixed it on the first correction. Every other
+        # requirement was satisfied in both asks, so this is not capability -- what a wide ask costs is the
+        # model's ability to act on a correction while regenerating five unrelated files.
+        carried: dict[str, GeneratedFile] = {}
+        # The artifact a repair attempt is for, or None for the opening whole-plan ask.
+        repair_for: str | None = None
+        asked_for_order: tuple[str, ...] = ()
+        # EVERY PATH THE GATE EVER REJECTED IN THIS RUN. A later attempt can pass while one of them is
+        # simply absent, and an absent artifact produces no finding -- so without this the run would
+        # report success on a set quietly missing a file. Measured on the criterion-10 fixture: a
+        # Deployment was rejected on attempt 1, the repair went to the Dockerfile, and the run was
+        # accepted delivering a Service and an Ingress with no Deployment -- the exact gap
+        # `ARTIFACT_COMPANIONS` exists to prevent, reintroduced by narrowing the repair.
+        ever_rejected: set[str] = set()
+        for attempt in range(1, self._max_attempts + 1):
+            yield format_event(
+                SSEEventType.PROGRESS,
+                {
+                    "run_id": str(run_id),
+                    "state": "requesting_model",
+                    "attempt": attempt,
+                    "max_attempts": self._max_attempts,
+                    "tier": self._model.tier_name,
+                    "endpoint_id": self.pinned_endpoint_id,
+                    "model": getattr(self._model, "model_name", None),
+                },
+            )
+
+            # THE COMPILED INSTRUCTION WINS when one was built. It already carries the facts, the
+            # per-path create-or-modify decision, the acceptance criteria and the prohibitions, all
+            # derived from the index — so wrapping it in the older template would restate some of it
+            # and contradict the rest.
+            #
+            # `build_generation_prompt` remains the path for a free-text prompt with no readiness
+            # findings behind it, which is still a legitimate request.
+            if compiled is not None:
+                # THE OPENING ASK IS THE WHOLE PLAN; A REPAIR IS ONE ARTIFACT.
+                #
+                # The first call is unchanged deliberately: it is what produces most of the set in one
+                # round, it is the cache key of the run, and nothing measured argues against it. Only the
+                # REPAIR is narrowed, because that is where the measurement shows the loss.
+                active = compiled
+                if repair_for is not None and repair_prompts is not None:
+                    narrow = repair_prompts.get(repair_for)
+                    if narrow is not None:
+                        active = narrow
+                model_prompt = active.text
+                if prompt and prompt.strip():
+                    # NUMBERED PAST THE COMPILED PLAN'S OWN SECTIONS. The plan numbers its sections 1-4
+                    # and uses 5 for the checks it cannot address, so an appended section headed `## 5`
+                    # produced two different sections with one number in the same prompt. `## 6` and
+                    # `## 7` are the first headings the plan never claims.
+                    model_prompt = (
+                        model_prompt + "\n## 6. OPERATOR REPAIR REQUEST & DEPLOYMENT ERROR\n\n" + prompt.strip() + "\n"
+                    )
+                if findings:
+                    # THE VALIDATOR'S OWN WORDS, fed back verbatim. A repair attempt that is told only
+                    # "it failed" has to guess what to change, and guessing is what produced the
+                    # failure. The findings are appended rather than merged into the instruction so the
+                    # model can see which of its own output is being objected to.
+                    locked_port = facts.port
+                    for carried_file in carried.values():
+                        if carried_file.path.startswith("k8s/") and (
+                            "deployment" in carried_file.path or "service" in carried_file.path
+                        ):
+                            kp_set = _extract_k8s_workload_ports(carried_file.content) or _extract_k8s_service_ports(
+                                carried_file.content
+                            )
+                            if kp_set:
+                                locked_port = sorted(kp_set)[0]
+                                break
+                        elif carried_file.path == "Dockerfile":
+                            df_set = _extract_dockerfile_container_ports(carried_file.content)
+                            if df_set:
+                                locked_port = sorted(df_set)[0]
+                                break
+
+                    model_prompt = (
+                        model_prompt
+                        + "\n## 7. WHAT THE VALIDATORS SAID ABOUT YOUR PREVIOUS ATTEMPT\n\n"
+                        + "Your last output was rejected. Fix exactly these and change nothing else:\n\n"
+                        + "\n".join(f"  - {finding}" for finding in findings)
+                        + f"\n\nCRITICAL CONSISTENCY REQUIREMENT: The application port is locked to {locked_port} "
+                        + f"and service name is '{facts.app_name}'. Every port declaration (EXPOSE, containerPort, "
+                        + "targetPort, compose port mapping) and service reference across all files must match this "
+                        + f"exact port {locked_port} and name '{facts.app_name}'.\n"
+                    )
+            else:
+                model_prompt = build_generation_prompt(
+                    operator_prompt=prompt,
+                    facts=facts,
+                    previous_findings=findings,
+                    attempt=attempt,
+                    # FR-13. Rendered per attempt from the SAME retrieval, so the repair loop keeps the
+                    # grounding it started with rather than searching again for rows that cannot have
+                    # changed between attempts. `render_context_section` returns an empty tuple when there
+                    # is nothing to say, so an unscanned project gets no heading rather than an empty one.
+                    context_lines=render_context_section(retrieval) if retrieval is not None else (),
+                )
+            # D-44: the cache key AND the L2 vector are computed over this value, and it is the
+            # only thing handed to the provider. Redacting here rather than inside the port keeps
+            # the guarantee at the boundary where raw operator text last exists.
+            redacted = create_redacted_prompt(model_prompt)
+            if attempt == 1 and outcome is not None:
+                outcome.sent_prompt = str(redacted)
+            if attempt == 1:
+                # THE CACHE KEY OF THE WHOLE RUN, kept because a later attempt's prompt is not one any
+                # future run will present: it carries the previous attempt's gate findings appended to
+                # it. Caching the accepted content under that prompt writes an entry whose key nobody
+                # will ever ask for again -- a silent permanent miss, which looks exactly like a cache
+                # that is working and never hitting.
+                first_attempt_prompt = redacted
+
+            attempt_started = time.monotonic()
+            deltas: asyncio.Queue[str | None] = asyncio.Queue(maxsize=1)
+
+            async def _sink(text: str, queue: asyncio.Queue[str | None] = deltas) -> None:
+                await queue.put(text)
+
+            # ONLY THE FIRST ATTEMPT MAY BE SERVED FROM CACHE. A later attempt exists because the gate
+            # rejected what the earlier one produced, and that rejected output is what the cache now
+            # holds -- so a hit would re-deliver the artifact that just failed, guaranteeing the loop
+            # cannot converge, and would record `served_from='l1'` with `iterations_used=0` for a run
+            # that plainly iterated.
+            task = asyncio.create_task(
+                self._model.complete(
+                    prompt=redacted,
+                    on_token=_sink,
+                    may_serve_from_cache=attempt == 1,
+                    # NOT CACHED ON PRODUCTION. What the model produced is not yet what this run will
+                    # deliver: the validation gate runs below and may reject all of it. Caching here
+                    # would poison the entry -- every later run with this prompt served the known-bad
+                    # artifact, failing the gate again and burning its attempt budget re-delivering
+                    # it. `remember` is called after acceptance instead.
+                    store_in_cache=False,
+                )
+            )
+            # The frames are emitted from the QUEUE rather than from the task's result, which is
+            # what makes them real: each one leaves this process as soon as the provider produced
+            # it. Draining after the call returned would be the 120-character slicing this
+            # replaced, wearing a different name.
+            token_count = 0
+            first_token_at: float | None = None
+            try:
+                while True:
+                    drain = asyncio.ensure_future(deltas.get())
+                    done, _ = await asyncio.wait({drain, task}, return_when=asyncio.FIRST_COMPLETED)
+                    if drain in done:
+                        if first_token_at is None:
+                            first_token_at = time.monotonic()
+                            # FIRST-TOKEN LATENCY IS ITS OWN FACT. On CPU most of an attempt is spent before
+                            # the first token (model load + prompt evaluation); on a hosted model it is
+                            # queueing. A user watching a silent screen needs to know which phase it is in.
+                            if outcome is not None:
+                                outcome.timings[f"attempt_{attempt}_first_token_seconds"] = round(
+                                    first_token_at - attempt_started, 3
+                                )
+                            yield format_event(
+                                SSEEventType.PROGRESS,
+                                {
+                                    "run_id": str(run_id),
+                                    "state": "model_streaming",
+                                    "attempt": attempt,
+                                    "first_token_seconds": round(first_token_at - attempt_started, 3),
+                                },
+                            )
+                        token_count += 1
+                        yield format_event(
+                            SSEEventType.TOKEN,
+                            {"run_id": str(run_id), "text": drain.result(), "attempt": attempt},
+                        )
+                        await asyncio.sleep(0.005)
+                        continue
+                    # The call finished. Anything already queued is still owed to the client.
+                    drain.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await drain
+                    while not deltas.empty():
+                        text = deltas.get_nowait()
+                        if text is None:
+                            continue
+                        token_count += 1
+                        yield format_event(
+                            SSEEventType.TOKEN,
+                            {"run_id": str(run_id), "text": text, "attempt": attempt},
+                        )
+                        await asyncio.sleep(0.005)
+                    break
+            finally:
+                if not task.done():
+                    task.cancel()
+
+            result = await task
+            attempt_seconds = round(time.monotonic() - attempt_started, 3)
+            if outcome is not None:
+                outcome.timings[f"attempt_{attempt}_model_seconds"] = attempt_seconds
+                outcome.timings["model_seconds"] = round(outcome.timings.get("model_seconds", 0.0) + attempt_seconds, 3)
+
+            def _record_attempt(
+                verdict: str,
+                reason: str = "",
+                *,
+                _n: int = attempt,
+                _seconds: float = attempt_seconds,
+                _repairing: str | None = repair_for,
+            ) -> None:
+                """One row of evidence per attempt.
+
+                `seconds` is the point of it. A refusal recorded at 300.0s against a 300s client budget is a
+                TRUNCATION rather than a verdict, and without the duration beside the reason that is
+                unrecoverable once the request has ended -- which is how a truncating timeout went unseen
+                through three investigations.
+                """
+                if outcome is not None:
+                    attempts_list: list[dict[str, Any]] = outcome.attempts
+                    attempts_list.append(
+                        {
+                            "attempt": _n,
+                            "seconds": _seconds,
+                            "verdict": verdict,
+                            "reason": reason[:400],
+                            "repairing": _repairing or "",
+                        }
+                    )
+
+            if not result.ok or not result.content:
+                # The port reports a transport fault and an exhausted cascade the same way, in the
+                # words the next prompt can quote. Both are repairable by a retry; neither is a
+                # reason to fail the run while the template fallback is still available.
+                findings = result.failure_reasons
+                _record_attempt("no_content", "; ".join(findings))
+                joined = " ".join(findings)
+                if self.pinned_endpoint_id is not None and any(
+                    category in joined
+                    for category in (
+                        "invalid_credential",
+                        "model_unavailable",
+                        "quota_exceeded",
+                        "bad_request",
+                        "unknown_endpoint",
+                    )
+                ):
+                    # A wrong key, a missing model or an exhausted quota will not change in the next few
+                    # seconds; retrying would spend the operator's time (and quota) to report the same thing.
+                    break
+                if (
+                    self.pinned_endpoint_id is not None
+                    and "provider_unavailable" in joined
+                    and attempt < self._max_attempts
+                ):
+                    # A 503 "high demand" from a hosted provider is transient by its own description. A short,
+                    # bounded backoff -- 3s then 6s -- is the honest retry; hammering it immediately is not.
+                    yield format_event(
+                        SSEEventType.PROGRESS,
+                        {
+                            "run_id": str(run_id),
+                            "state": "provider_busy_retrying",
+                            "attempt": attempt,
+                            "wait_seconds": 3 * attempt,
+                        },
+                    )
+                    await asyncio.sleep(3 * attempt)
+                continue
+
+            served_from = result.served_from
+            if token_count == 0:
+                # A cache hit delivers no deltas by design (see `ModelRouter.complete`), so the
+                # content is replayed here. `replayed: true` is on the payload so a client can tell
+                # the difference; these are real model tokens produced by an earlier call, and
+                # nothing here re-chunks them into invented units — the split is on line
+                # boundaries, which are units the artifact itself has.
+                for line in result.content.splitlines(keepends=True):
+                    token_count += 1
+                    yield format_event(
+                        SSEEventType.TOKEN,
+                        {"run_id": str(run_id), "text": line, "attempt": attempt, "replayed": True},
+                    )
+
+            try:
+                # WHAT THIS RUN ASKED FOR, not a fixed list of four paths.
+                #
+                # `parse_artifacts` defaulted to `REQUIRED_ARTIFACTS` — Dockerfile plus three
+                # Kubernetes manifests — so a run asked for a CI workflow failed the parse for missing a
+                # Dockerfile nobody had requested, and a run asked only to fix a `USER` directive failed
+                # for missing an ingress. That default is why the product could produce four kinds of
+                # file and no others: the parser, not the model and not the validators, was the limit.
+                #
+                # The validators were never the constraint. `artifact_checks.checker_for` already
+                # dispatches on path for Dockerfile, compose, Chart.yaml, `.github/workflows/`, `k8s/`
+                # and `*.tf`, and returns None for a kind it has no opinion about rather than refusing
+                # it.
+                #
+                # PASSED AS `requested`, NOT `required`, AND THE DIFFERENCE IS A REGRESSION I CAUSED.
+                # Treating a compiled plan's dozen write targets as all-or-nothing meant one omission
+                # discarded eleven correct files and substituted canned template output — the
+                # thirteen-step journey recorded a run that produced most of what it asked for as
+                # `template_fallback`. A shortfall is now a shortfall: the files that came back are
+                # used, the checks whose files did not are simply still failing, and the score says so
+                # honestly. Canned output in place of real partial work is worse than the partial work.
+                #
+                # Falls back to the old default when no plan was compiled, so an operator typing a free
+                # prompt still gets the previous contract rather than a run that requires nothing and
+                # therefore accepts an empty answer.
+                # AGAINST WHAT THIS CALL ASKED FOR, which on a repair is one artifact rather than six.
+                # Parsing a repair answer against the whole plan's targets would report five missing files
+                # the model was deliberately not asked for.
+                if compiled is not None and compiled.write_targets:
+                    asked_for = tuple(
+                        active.write_targets if active is not None and active.write_targets else compiled.write_targets
+                    )
+                    parsed = parse_artifacts(result.content, required=(), requested=asked_for)
+                    # The PLAN's order, not this call's: a repair asks for one file and must not
+                    # reorder the set around it.
+                    asked_for_order = tuple(compiled.write_targets)
+                else:
+                    # A compose stack is accepted when the model writes one and its absence is not a
+                    # failure, so it is passed as `requested` rather than folded into `required`.
+                    parsed = parse_artifacts(
+                        result.content,
+                        required=REQUIRED_ARTIFACTS,
+                        requested=(*REQUIRED_ARTIFACTS, *OPTIONAL_ARTIFACTS),
+                    )
+                    asked_for_order = tuple((*REQUIRED_ARTIFACTS, *OPTIONAL_ARTIFACTS))
+            except ArtifactParseError as exc:
+                findings = (str(exc),)
+                _record_attempt("parse_failed", str(exc))
+                continue
+
+            # WHAT THIS CALL PRODUCED, PLUS WHAT EARLIER CALLS ALREADY GOT RIGHT. The new answer wins for
+            # a path it covers, so a repair replaces the artifact it was asked to repair and nothing else.
+            merged = dict(carried)
+            for path, content in parsed.items():
+                merged[path] = GeneratedFile(path=path, content=content)
+
+            files = tuple(merged.values())
+            passed, gate_findings = self._validate(files, existing)
+            if compiled is not None and compiled.write_targets:
+                produced_paths = {artifact.path for artifact in files}
+                missing_essential = [
+                    t
+                    for t in compiled.write_targets
+                    if t in ("Dockerfile", "docker-compose.yml") and t not in produced_paths
+                ]
+                if missing_essential:
+                    passed = False
+                    gate_findings = (
+                        *gate_findings,
+                        *(f"{t}: required artifact was not produced" for t in missing_essential),
+                    )
+            yield format_event(
+                SSEEventType.VALIDATION,
+                {
+                    "run_id": str(run_id),
+                    "passed": passed,
+                    "findings": list(gate_findings),
+                    "served_from": served_from,
+                    "attempt": attempt,
+                },
+            )
+            if not passed:
+                _record_attempt("gate_refused", "; ".join(gate_findings))
+                # RETRY WHILE THERE IS AN ATTEMPT LEFT, because the model can usually repair what the
+                # gate named and a fully valid set is the better outcome.
+                if attempt < self._max_attempts:
+                    # KEEP WHAT PASSED, AND ASK AGAIN FOR ONE THING.
+                    #
+                    # The artifacts the gate did not name are correct; re-asking for them invites the model
+                    # to change them and, measured, stops it from fixing the one that is wrong. So they are
+                    # carried forward and the next call is narrowed to a single rejected artifact with only
+                    # that artifact's requirements.
+                    def _is_rejected(path: str, findings: list[str] = gate_findings) -> bool:
+                        for finding in findings:
+                            if finding.startswith(f"{path}: "):
+                                return True
+                            if finding.startswith("cross-artifact: ") and path in finding:
+                                return True
+                        return False
+
+                    rejected_paths = [artifact.path for artifact in files if _is_rejected(artifact.path)]
+                    # An artifact the model was asked for and did not produce at all is also a repair
+                    # target: it is missing rather than wrong, and a narrow ask is the better second try.
+                    missing = [
+                        path
+                        for path in (compiled.write_targets if compiled is not None else ())
+                        if path not in {artifact.path for artifact in files}
+                    ]
+                    ever_rejected.update(rejected_paths)
+                    ever_rejected.update(missing)
+                    for artifact in files:
+                        if not _is_rejected(artifact.path):
+                            carried[artifact.path] = artifact
+
+                    # HIGHEST STAKES FIRST when several failed, because the attempt budget is finite and a
+                    # Dockerfile carries more of the score than a `.gitleaks.toml`. `repair_prompts` is
+                    # keyed by write target, so a path with no repair prompt is one no artifact instruction
+                    # claims and there is nothing narrower to ask.
+                    def _repair_priority(p: str, current_findings: Sequence[str] = gate_findings) -> tuple[int, int]:
+                        is_df = 0 if p == "Dockerfile" or p.endswith("/Dockerfile") else 1
+                        has_direct_finding = 0 if any(f.startswith(f"{p}: ") for f in current_findings) else 1
+                        return (is_df, has_direct_finding)
+
+                    candidates = sorted(
+                        [
+                            path
+                            for path in set(rejected_paths + missing)
+                            if repair_prompts is not None and path in repair_prompts
+                        ],
+                        key=_repair_priority,
+                    )
+                    repair_for = candidates[0] if candidates else None
+                    if repair_for is not None:
+                        # ONLY THIS ARTIFACT'S FINDINGS. Handing over five other files' complaints is the
+                        # wide ask again, in the one place it does the most harm.
+                        narrowed = tuple(
+                            finding
+                            for finding in gate_findings
+                            if finding.startswith(f"{repair_for}: ")
+                            or (finding.startswith("cross-artifact: ") and repair_for in finding)
+                        )
+                        findings = narrowed or gate_findings
+                    else:
+                        findings = gate_findings
+                    continue
+
+                # LAST ATTEMPT. Keep the artifacts that PASSED rather than discarding them because a
+                # sibling failed, and this is a strengthening rather than a relaxation: an artifact the
+                # gate rejected is still never accepted — §11.5.5's gate stays blocking, per file.
+                #
+                # What changes is the alternative. Discarding the whole set fell through to the template
+                # path, which writes canned files addressing none of the user's specific findings. So a
+                # run that produced nine correct artifacts and one malformed one delivered zero correct
+                # ones. The thirteen-step journey caught exactly this, twice: first as a parse failure
+                # over the requested set, then here as a gate failure over it.
+                # Include artifacts that passed in earlier attempts and were carried forward
+                all_current = {**carried, **{artifact.path: artifact for artifact in files}}
+                candidate_files = tuple(all_current.values())
+                accepted = tuple(artifact for artifact in candidate_files if not _is_rejected(artifact.path))
+                # THE FLOOR IS PER ARTIFACT, NOT PER RUN — AND THAT IS THE DEFECT THE JOURNEY CAUGHT.
+                #
+                # Everything below `if not accepted` reaches the template path. So the floor applied
+                # only when the model produced NOTHING usable, and the case it was designed for is the
+                # opposite one: the model returns nine good artifacts and a Dockerfile with
+                # `FROM node:latest`. The bad Dockerfile was withheld, correctly, and nothing put the
+                # known-good one in its place — the change set went out with no Dockerfile at all,
+                # which is what step 8 found. `check-template-readiness.py` had been proving all along
+                # that the floor satisfies its target checks; no runtime path consulted it per kind.
+                #
+                # THIS WEAKENS NOTHING. The model's failing artifact is still never accepted. The
+                # substitute is the template the CI audit gate certifies, and the assembled set is
+                # re-validated through the SAME `_validate` — including the regression and
+                # score-lowering rules — so a substitution that would make the set worse is rejected
+                # and the withholding stands. A floor that cannot satisfy the check is not used.
+                substituted = ()
+                # ONLY WHEN SOMETHING OF THE MODEL'S SURVIVED, and the reason is provenance.
+                #
+                # If NOTHING passed, substituting the floor for every artifact would deliver a set that is
+                # entirely template content while the run row said `served_from='provider'`. That is the
+                # same class of wrongness as the `served_from` defects already recorded in PROGRESS.md: a
+                # row reporting a provenance the run did not have. The template path below already handles
+                # the nothing-survived case correctly and records `template`, so it is left to do so.
+                #
+                # Caught by `test_the_template_is_still_reached_when_no_artifact_passes`, which asserted
+                # `served_from == 'template'` and got `'provider'`. The fix for a mixed result had
+                # silently changed the answer for a total failure.
+                if accepted:
+                    accepted, substituted = self._apply_floor(
+                        accepted=accepted,
+                        rejected=tuple(artifact.path for artifact in candidate_files if artifact not in accepted),
+                        prompt=prompt,
+                        project=project,
+                        existing=existing,
+                        compiled=compiled,
+                    )
+                if not accepted:
+                    findings = gate_findings
+                    continue
+                withheld = len(candidate_files) - len(accepted)
+                files = accepted
+                yield format_event(
+                    SSEEventType.VALIDATION,
+                    {
+                        "run_id": str(run_id),
+                        "passed": True,
+                        "findings": [
+                            f"delivering {len(accepted)} artifact(s) that passed the gate; "
+                            f"{withheld} rejected artifact(s) were withheld and are not in the "
+                            "change set",
+                            *(
+                                [
+                                    "the audited template floor replaced "
+                                    f"{len(substituted)} rejected artifact(s): "
+                                    f"{', '.join(substituted)}"
+                                ]
+                                if substituted
+                                else []
+                            ),
+                            *gate_findings,
+                        ],
+                        "served_from": served_from,
+                        "attempt": attempt,
+                    },
+                )
+
+            # THE FLOOR COVERS WHAT WAS REJECTED AND NEVER REPAIRED.
+            #
+            # The attempt budget is finite, so when several artifacts fail only some get a narrow repair.
+            # The rest must be SUBSTITUTED, not dropped: the audited template is the known-good answer for
+            # exactly this case, and `check-template-readiness.py` proves it satisfies its target checks.
+            #
+            # This weakens nothing. The model's rejected artifact is still never accepted, and the
+            # assembled set goes back through the SAME `_validate` -- including the regression and
+            # score-lowering rules -- so a substitution that would make the set worse is refused and the
+            # withholding stands.
+            outstanding = tuple(
+                path
+                for path in asked_for_order
+                if path in ever_rejected and path not in {artifact.path for artifact in files}
+            )
+            if outstanding:
+                filled, also_substituted = self._apply_floor(
+                    accepted=files,
+                    rejected=outstanding,
+                    prompt=prompt,
+                    project=project,
+                    existing=existing,
+                    compiled=compiled,
+                )
+                recheck_passed, recheck_findings = self._validate(filled, existing)
+                if not recheck_passed and any("cross-artifact: port mismatch" in f for f in recheck_findings):
+                    filled2, also_sub2 = self._apply_floor(
+                        accepted=(),
+                        rejected=asked_for_order,
+                        prompt=prompt,
+                        project=project,
+                        existing=existing,
+                        compiled=compiled,
+                    )
+                    r2_passed, r2_findings = self._validate(filled2, existing)
+                    if r2_passed:
+                        filled = filled2
+                        also_substituted = tuple(sorted(set(also_substituted) | set(also_sub2)))
+                        recheck_passed = True
+                if recheck_passed:
+                    files = filled
+                    substituted = tuple(sorted(set(substituted) | set(also_substituted)))
+                    yield format_event(
+                        SSEEventType.VALIDATION,
+                        {
+                            "run_id": str(run_id),
+                            "passed": True,
+                            "findings": [],
+                            "substituted": list(substituted),
+                            "served_from": served_from,
+                            "attempt": attempt,
+                        },
+                    )
+                else:
+                    # The floor could not satisfy the checks either, so the withholding stands and the
+                    # shortfall is reported rather than papered over.
+                    report.findings = recheck_findings
+
+            # DELIVERED IN THE ORDER THE RUN ASKED FOR, applied where the set is FINAL -- after both the
+            # repair and the floor have had their say. Order is a property of the PLAN, not of the
+            # model's emission order, not of which attempt produced what, and not of the floor's
+            # iteration order. It reaches `change_items.ordinal`, so before this the diff a reviewer
+            # reads was sequenced by something nobody chose and `ORDER BY ordinal` gave different
+            # answers for identical inputs. A path the plan did not name sorts after the named ones by
+            # its own name rather than being dropped.
+            delivery_order = {path: i for i, path in enumerate(asked_for_order)}
+            files = tuple(
+                sorted(
+                    files,
+                    key=lambda f: (delivery_order.get(f.path, len(delivery_order)), f.path),
+                )
+            )
+
+            # A COMPOSE FILE IS ALWAYS DELIVERED, and it is added HERE — after the gate, before delivery.
+            #
+            # The agent deploys a local stack through Compose: `ensureBuildableArtifacts` synthesises one
+            # when a repository has none. A run that omits the file therefore does not fail; it produces a
+            # project whose stack is whatever the agent inferred — its port, its service name, its
+            # environment — instead of the ones this run already computed. Adding it here means the
+            # compose file agrees with the Dockerfile delivered beside it, because both come from the same
+            # derivation.
+            #
+            # AFTER THE GATE, deliberately. Folding it in before `_validate` would let a file this code
+            # generated change the verdict on files the model produced: an attempt whose artifacts the
+            # gate rejected could be recorded as accepted on the strength of a file the model never
+            # wrote. That is the difference between completing a shortfall and hiding one, and
+            # `test_the_template_is_still_reached_when_no_artifact_passes` asserts it.
+            #
+            # APPENDED, so it cannot disturb the plan's order. The plan's write targets are the sequence
+            # a reviewer sees and the one repairs are keyed by; inserting a file this code generated
+            # among them would make the delivered order disagree with the compiled order for no gain.
+            # The model's own compose file still wins when it produced a usable one — this is a floor,
+            # not a requirement, and requiring it would discard a whole attempt over one optional file.
+            arch = getattr(prompt, "architecture", None) or (
+                getattr(compiled, "architecture", None) if compiled is not None else None
+            )
+            is_multi = getattr(arch, "is_multi_service", False)
+            existing_compose = getattr(arch, "existing_compose_path", None)
+            write_targets = getattr(prompt, "write_targets", ()) or (
+                getattr(compiled, "write_targets", ()) if compiled is not None else ()
+            )
+            strat_l = (
+                str(
+                    getattr(compiled, "target_strategy", "")
+                    or getattr(prompt, "target_strategy", "")
+                    or (
+                        (project.get("target_strategy") or project.get("strategy"))
+                        if isinstance(project, Mapping)
+                        else ""
+                    )
+                    or ""
+                )
+            ).lower()
+            wants_compose = (
+                "compose" in strat_l
+                or is_multi
+                or bool(existing_compose)
+                or any("compose" in t for t in write_targets)
+                or not isinstance(prompt, CompiledPrompt)
+            )
+            if wants_compose and not any(
+                f.path in ("docker-compose.yml", "compose.yaml", "compose.yml") for f in files
+            ):
+                resolved_port = None
+                for f in files:
+                    if f.path == "Dockerfile":
+                        p_set = _extract_dockerfile_container_ports(f.content)
+                        if p_set:
+                            resolved_port = sorted(p_set)[0]
+                            break
+                    elif f.path.startswith("k8s/") and ("deployment" in f.path or "service" in f.path):
+                        kp_set = _extract_k8s_workload_ports(f.content) or _extract_k8s_service_ports(f.content)
+                        if kp_set:
+                            resolved_port = sorted(kp_set)[0]
+                            break
+
+                for rendered in self._render(prompt, project, compiled=compiled):
+                    if rendered.path == "docker-compose.yml":
+                        compose_content = rendered.content
+                        if resolved_port is not None:
+                            import re as _re
+
+                            compose_content = _re.sub(
+                                r'"\d{1,5}:\d{1,5}"',
+                                f'"{resolved_port}:{resolved_port}"',
+                                compose_content,
+                            )
+                        files = (*files, GeneratedFile(path=rendered.path, content=compose_content))
+                        break
+
+            if outcome is not None:
+                outcome.files = list(files)
+                outcome.prompt_tokens = (result.usage or {}).get("prompt_tokens", 0) or max(
+                    1, len(model_prompt.split())
+                )
+                outcome.completion_tokens = (result.usage or {}).get("completion_tokens", 0) or token_count
+                outcome.validation_passed = True
+                outcome.status = "accepted"
+                # WHERE THE DELIVERED ARTIFACTS ACTUALLY CAME FROM, which is not always where the
+                # completion came from. When the gate rejected everything the model produced and the
+                # audited template floor supplied every artifact being delivered, the provenance is
+                # `template` -- recording the model's `served_from` would put a row in the table
+                # claiming a provider (or a cache) produced files it did not produce. That is the same
+                # class of defect as the `served_from` failures already recorded in PROGRESS.md, and it
+                # is reachable on any prompt whose checks the configured model cannot satisfy: with
+                # `qwen2.5-coder:1.5b` and a Dockerfile needing a HEALTHCHECK, every attempt fails the
+                # gate and the floor delivers all four artifacts, yet the row said `provider`.
+                #
+                # A PARTIAL substitution stays with the model's provenance: some delivered artifact did
+                # come from it, and calling the whole run `template` would understate what the model did.
+                delivered = {artifact.path for artifact in files}
+                outcome.served_from = "template" if delivered and delivered <= set(substituted) else served_from
+                outcome.tier = self._model.tier_name
+                outcome.endpoint_id = result.endpoint_id
+                # A cache hit consumed no provider attempt, and recording one would inflate the
+                # NFR-04 iteration average the column exists to measure.
+                outcome.iterations_used = 0 if served_from in {"l1", "l2"} else attempt
+
+            # THE GATE HAS PASSED, so this answer is fit to keep. Cached here rather than in the router
+            # because only this line knows the artifacts survived validation.
+            #
+            # AND ONLY IF THE MODEL'S OWN OUTPUT PASSED, which is what `not substituted` adds.
+            #
+            # MEASURED, end to end, on the real model. A run took three attempts, was delivered with the
+            # template floor standing in for the artifacts the gate refused, and correctly recorded
+            # `served_from='provider'` because the substitution was partial. It then cached THE RAW MODEL
+            # TEXT -- the text the gate had just refused. The next run with that prompt hit the entry
+            # (`LOOKUP -> L1_exact`, observed), had the content refused by the same gate for the same
+            # reason, burned its first attempt, and went to the provider anyway: `served_from='provider'`,
+            # `iterations_used=3`, for a run that began with a cache hit.
+            #
+            # That is precisely the POISONED ENTRY the `store_in_cache=False` comment in the router
+            # describes, arriving by the one route that guard does not cover. It is strictly worse than
+            # not caching: the run pays the lookup, receives a known-bad answer, spends an attempt
+            # rediscovering that it is bad, and still calls the provider. An entry that can never serve
+            # is indistinguishable from a cache that is working and never hitting -- which is how this
+            # survived: the hit rate was zero and every run looked correct.
+            #
+            # `substituted` is the floor's own record of which artifacts it supplied. Non-empty means the
+            # delivered set is model output PLUS template files, and the raw completion alone is not the
+            # thing that was accepted -- so it is not the thing to keep.
+            #
+            # Skipped when the content came FROM the cache: rewriting an entry with itself is wasted work,
+            # and it would refresh the TTL on every read, so a hot entry could never expire -- which is how
+            # a cache comes to serve an answer from a model version that is no longer configured.
+            if served_from == "provider" and result.content and first_attempt_prompt is not None and not substituted:
+                try:
+                    await self._model.remember(
+                        prompt=first_attempt_prompt,
+                        content=result.content,
+                    )
+                except Exception as cache_err:
+                    logger.warning("Failed to store generation result in semantic cache: %s", cache_err)
+
+            _record_attempt("accepted")
+            report.succeeded = True
+            yield format_event(
+                SSEEventType.COMPLETE,
+                {
+                    "run_id": str(run_id),
+                    "state": "accepted",
+                    "files": [artifact.path for artifact in files],
+                    "completion_tokens": token_count,
+                    "served_from": served_from,
+                    "endpoint_id": result.endpoint_id,
+                },
+            )
+            return
+
+        # Every attempt failed. The template below is now reached for a stated reason.
+        report.findings = findings or ("the provider path produced no usable artifacts",)
+
+    # ── the template path, unchanged in behaviour and now genuinely a fallback ──
+
+    async def _stream_from_template(
+        self,
+        *,
+        run_id: uuid.UUID,
+        prompt: str,
+        project: Mapping[str, Any] | None,
+        existing: Mapping[str, str] | None,
+        outcome: GenerationOutcome | None,
+        provider_findings: tuple[str, ...],
+        compiled: CompiledPrompt | None = None,
+    ) -> AsyncGenerator[str]:
+        """The deterministic renderer, reached when no model produced usable artifacts."""
+        try:
+            files = self._render(prompt, project, compiled=compiled)
+        except Exception as exc:  # noqa: BLE001 - reported to the client as a terminal frame
+            if outcome is not None:
+                outcome.status = "failed"
+                outcome.served_from = "template"
+            # Terminal, and carrying the reason. A stream that just stopped would be
+            # indistinguishable from a dropped connection.
+            yield format_event(
+                SSEEventType.ERROR,
+                {"run_id": str(run_id), "detail": str(exc), "state": "failed"},
+            )
+            return
+
+        completion_tokens = 0
+        for artifact in files:
+            for chunk in self._chunks(artifact.content):
+                completion_tokens += 1
+                yield format_event(
+                    SSEEventType.TOKEN,
+                    {"run_id": str(run_id), "path": artifact.path, "text": chunk},
+                )
+
+        # §11.5.5's deterministic gate is the blocking one; the rubric is advisory and is not
+        # consulted here, deliberately, so a low rubric score cannot fail a run.
+        passed, findings = self._validate(files, existing)
+        yield format_event(
+            SSEEventType.VALIDATION,
+            {
+                "run_id": str(run_id),
+                "passed": passed,
+                "findings": list(findings),
+                "served_from": "template",
+            },
+        )
+
+        if outcome is not None:
+            outcome.files = list(files)
+            outcome.prompt_tokens = max(1, len(prompt.split()))
+            outcome.completion_tokens = completion_tokens
+            outcome.validation_passed = passed
+            outcome.served_from = "template"
+            outcome.tier = "template"
+            # `template_fallback` when a model was tried and could not deliver, `accepted` when no
+            # provider path was configured at all. The two are different facts about a run and the
+            # status vocabulary already distinguishes them; collapsing both to `accepted` would
+            # hide every provider outage.
+            if passed:
+                outcome.status = "template_fallback" if provider_findings else "accepted"
+            else:
+                outcome.status = "failed"
+            outcome.iterations_used = 0
+
+        if not passed:
+            yield format_event(
+                SSEEventType.ERROR,
+                {
+                    "run_id": str(run_id),
+                    "detail": "the deterministic validation gate refused the artifacts",
+                    "state": "failed",
+                },
+            )
+            return
+
+        yield format_event(
+            SSEEventType.COMPLETE,
+            {
+                "run_id": str(run_id),
+                "state": "accepted",
+                "files": [artifact.path for artifact in files],
+                "completion_tokens": completion_tokens,
+                "served_from": "template",
+                # Present only when a provider was actually tried, so a client can tell a
+                # deliberate template deployment from a degraded one.
+                **({"provider_findings": list(provider_findings)} if provider_findings else {}),
+            },
+        )
+
+    # ?? the pipeline, kept small and honest ??????????????????????????????????
+
+    def _render(
+        self,
+        prompt: str,
+        project: Mapping[str, Any] | None = None,
+        compiled: Any | None = None,
+        existing: Mapping[str, str] | None = None,
+    ) -> tuple[GeneratedFile, ...]:
+        """Render the four artifacts ?12.6 step 6 asks for, from what is actually known.
+
+        WHAT CHANGED AND WHY
+
+        Two artifacts were produced, not four. ?12.6 names a Dockerfile and Kubernetes manifests, and
+        the journey's own list is `Dockerfile`, `k8s/deployment.yaml`, `k8s/service.yaml`,
+        `k8s/ingress.yaml`. A Deployment with no Service is not a deployable manifest set ? nothing
+        can reach the pod ? so the missing two were a functional gap and not a formatting one.
+
+        And the resource name was the literal `forgeops-app` for every project, while the runtime was
+        chosen by looking for the substring "node" in the operator's PROMPT. A prompt is a request,
+        not a fact about the repository: the same project generates different infrastructure
+        depending on how somebody phrased a sentence, and two projects generate colliding Kubernetes
+        names. Both are hardcoded answers standing in for reading the project.
+
+        WHAT IT READS NOW, AND THE LIMIT, STATED
+
+        The `projects` row: its `name` (so the manifests name the real application) and its
+        `settings` (so an operator who has recorded a runtime, a port or a start command gets those).
+        When `settings` says nothing, the prompt is used as an explicit, LAST-resort hint rather than
+        the primary signal, and `served_from` on the persisted run still records `template` so the row
+        never claims a model produced this.
+
+        THE LIMIT, CORRECTED. This docstring used to say the codebase index could not be read
+        "because scanning the repository is group 11's analysis work and `file_tree` is empty until it
+        lands". That has not been true for some time: an agent scan populates `file_tree` and
+        `file_contents`, `GET /projects/{id}/readiness` scores from exactly those rows, and the
+        project detail screen reports their contents. The statement was a description of a constraint
+        that had since been removed, which is worse than no statement — a reader would conclude the
+        limitation was structural.
+
+        So the real limit is a narrower and more honest one: this TEMPLATE path reads the project row
+        and does not consult the index, even though the index is now there. That is a choice about
+        the fallback rather than a missing capability — the model path takes the index into account
+        through retrieval, and the template library exists to produce something defensible when no
+        model could be reached, where a partial index would make the output less predictable rather
+        than more accurate. Widening it to read `file_tree` is a change to the fallback's contract and
+        belongs with a decision about what a template may infer, not with a docstring.
+        """
+        settings: Mapping[str, Any] = {}
+        project_name = ""
+        if project is not None:
+            raw_settings = project.get("settings")
+            if isinstance(raw_settings, Mapping):
+                settings = raw_settings
+            project_name = str(project.get("name") or "")
+
+        app_name = _kubernetes_name(project_name) or "forgeops-app"
+
+        inventory = (project.get("inventory") if project is not None else None) or {}
+        # `lang` rather than `l`: a single lowercase L is indistinguishable from a 1 in most
+        # fonts, which is why ruff's E741 flags it.
+        inv_languages = [str(lang).lower() for lang in (inventory.get("languages") or [])]
+        inv_frameworks = [
+            str(f.get("name") if isinstance(f, dict) else f).lower() for f in (inventory.get("frameworks") or [])
+        ]
+        inv_manifests = [str(m).lower() for m in (inventory.get("manifests") or [])]
+
+        # The SAME derivation the model prompt uses (`model_prompt.infer_runtime`): manifests present in the
+        # project first, so a project whose index has no language list yet is not mistaken for Python.
+        runtime = infer_runtime(
+            settings=settings,
+            inventory=inventory,
+            paths=list(existing.keys()) if isinstance(existing, Mapping) else (),
+            prompt=prompt,
+        )
+
+        # Check for modern frontend frameworks (Next.js, Vite, React, Nuxt, Remix, Svelte, Vue)
+        is_nextjs = any("next" in fw for fw in inv_frameworks) or any("next.config" in m for m in inv_manifests)
+        is_vite = any("vite" in fw for fw in inv_frameworks)
+        is_frontend_or_build = (
+            is_nextjs
+            or is_vite
+            or any(fw in ("react", "vue", "nuxt", "svelte", "remix", "astro", "angular") for fw in inv_frameworks)
+            or any(lang in ("typescript", "tsx") for lang in inv_languages)
+        )
+
+        # Detect workspaces if manifests contain package.json files in subdirectories
+        ref_paths = getattr(compiled, "referenced_paths", ()) or ()
+        candidate_manifests: list[str] = list(inventory.get("manifests") or []) + [
+            str(p).replace("\\", "/") for p in ref_paths if str(p).endswith("package.json")
+        ]
+        declared_ws_dirs: list[str] = []
+        p_root = None
+        if project and project.get("path"):
+            with contextlib.suppress(Exception):
+                from ..deployments.autonomous_gates import resolve_workspace_path
+
+                p_root = resolve_workspace_path(str(project["path"]))
+                if p_root.exists() and p_root.is_dir():
+                    root_pkg = p_root / "package.json"
+                    if root_pkg.exists():
+                        import json
+
+                        pkg_d = json.loads(root_pkg.read_text(encoding="utf-8"))
+                        ws_e = pkg_d.get("workspaces")
+                        if isinstance(ws_e, list):
+                            declared_ws_dirs = [w for w in ws_e if isinstance(w, str) and "*" not in w]
+                        elif isinstance(ws_e, dict) and "packages" in ws_e:
+                            declared_ws_dirs = [w for w in ws_e["packages"] if isinstance(w, str) and "*" not in w]
+                        for w in declared_ws_dirs:
+                            candidate_manifests.append(f"{w}/package.json")
+
+        if existing is None and p_root is not None and p_root.exists() and p_root.is_dir():
+            disk_existing: dict[str, str] = {}
+            root_pkg_file = p_root / "package.json"
+            if root_pkg_file.exists():
+                with contextlib.suppress(Exception):
+                    disk_existing["package.json"] = root_pkg_file.read_text(encoding="utf-8")
+            root_lock_file = p_root / "package-lock.json"
+            if root_lock_file.exists():
+                disk_existing["package-lock.json"] = ""
+            for w in declared_ws_dirs:
+                w_pkg = p_root / w / "package.json"
+                if w_pkg.exists():
+                    with contextlib.suppress(Exception):
+                        disk_existing[f"{w}/package.json"] = w_pkg.read_text(encoding="utf-8")
+                w_lock = p_root / w / "package-lock.json"
+                if w_lock.exists():
+                    disk_existing[f"{w}/package-lock.json"] = ""
+            existing = disk_existing
+
+        seen_manifests: set[str] = set()
+        workspace_manifests: list[str] = []
+        for m_raw in candidate_manifests:
+            m = str(m_raw).strip().replace("\\", "/")
+            m_lower = m.lower()
+            if (
+                m_lower.endswith("package.json")
+                and m_lower != "package.json"
+                and not m_lower.startswith("node_modules")
+                and m_lower not in seen_manifests
+            ):
+                if declared_ws_dirs and not any(m_lower.startswith(w.lower() + "/") for w in declared_ws_dirs):
+                    continue
+                seen_manifests.add(m_lower)
+                workspace_manifests.append(m)
+        workspace_manifests.sort()
+
+        # Determine whether a lockfile exists for npm reproducibility
+        has_npm_lockfile = False
+        if p_root is not None and p_root.exists() and p_root.is_dir():
+            if (p_root / "package-lock.json").exists() or (p_root / "npm-shrinkwrap.json").exists():
+                has_npm_lockfile = True
+        if not has_npm_lockfile:
+            all_manifest_keys: list[str] = []
+            if isinstance(candidate_manifests, list | tuple | set):
+                all_manifest_keys.extend(str(m).replace("\\", "/") for m in candidate_manifests)
+            if isinstance(inv_manifests, list | tuple | set):
+                all_manifest_keys.extend(str(m).replace("\\", "/") for m in inv_manifests)
+            if isinstance(existing, Mapping):
+                all_manifest_keys.extend(str(k).replace("\\", "/") for k in existing.keys())
+            for m in all_manifest_keys:
+                m_base = m.rsplit("/", 1)[-1].lower()
+                if m_base in ("package-lock.json", "npm-shrinkwrap.json"):
+                    has_npm_lockfile = True
+                    break
+
+        if not has_npm_lockfile and existing is None and p_root is None:
+            has_npm_lockfile = True
+
+        if runtime.startswith("node"):
+            base, port = "node:20-alpine", 3000
+            if is_nextjs or is_frontend_or_build:
+                if workspace_manifests:
+                    ws_dir = workspace_manifests[0].rsplit("/package.json", 1)[0]
+                    start = ["npm", "run", "start", f"--workspace={ws_dir}"]
+                else:
+                    start = ["npm", "start"]
+                if has_npm_lockfile:
+                    install = "npm ci --prefer-offline --no-audit"
+                else:
+                    install = "npm install --prefer-offline --no-audit"
+            else:
+                if workspace_manifests:
+                    ws_dir = workspace_manifests[0].rsplit("/package.json", 1)[0]
+                    start = ["npm", "run", "start", f"--workspace={ws_dir}"]
+                else:
+                    start = ["npm", "start"]
+                if has_npm_lockfile:
+                    install = "npm ci --omit=dev"
+                else:
+                    install = "npm install --omit=dev"
+        elif runtime.startswith("go"):
+            base, start, port = "golang:1.24-alpine", ["/app/server"], 8080
+            install = "go mod download"
+        elif runtime.startswith("rust"):
+            base, start, port = "rust:1.84-slim", ["/app/server"], 8080
+            install = "cargo build --release"
+        else:
+            base, port = "python:3.11-slim", 8000
+            if any("fastapi" in fw or "uvicorn" in fw for fw in inv_frameworks):
+                start = ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", f"{port}"]
+            elif any("django" in fw for fw in inv_frameworks):
+                start = ["python", "manage.py", "runserver", f"0.0.0.0:{port}"]
+            else:
+                start = ["python", "main.py"]
+            install = "pip install --no-cache-dir -r requirements.txt"
+
+        unsupported_runtime = ""
+        if runtime and not runtime.startswith(("node", "python", "py", "go", "rust")):
+            unsupported_runtime = runtime
+
+        rejected_base = ""
+        if str(settings.get("base_image") or "").strip():
+            configured_base = str(settings["base_image"]).strip()
+            if dockerfile_base_pinned(f"FROM {configured_base}"):
+                base = configured_base
+            else:
+                rejected_base = configured_base
+        arch = (
+            (getattr(compiled, "architecture", None) if compiled is not None else None)
+            or getattr(prompt, "architecture", None)
+            or (project.get("architecture") if isinstance(project, Mapping) else None)
+        )
+        if arch and getattr(arch, "services", None) and not settings.get("port"):
+            for s in arch.services:
+                if getattr(s, "port", None):
+                    with contextlib.suppress(TypeError, ValueError):
+                        port = int(s.port)
+                        break
+
+        with contextlib.suppress(TypeError, ValueError):
+            if settings.get("port") is not None:
+                configured = int(settings["port"])
+                if 1 <= configured <= 65535:
+                    port = configured
+        configured_start = settings.get("start_command")
+        if isinstance(configured_start, list | tuple) and configured_start:
+            start = [str(part) for part in configured_start]
+        elif isinstance(configured_start, str) and configured_start.strip():
+            start = configured_start.split()
+
+        if runtime.startswith("node"):
+            ws_copies = []
+            for m in workspace_manifests:
+                if "/" in m:
+                    ws_dir = m.rsplit("/", 1)[0]
+                    if " " in ws_dir:
+                        ws_copies.append(f'COPY ["{ws_dir}/package*.json", "./{ws_dir}/"]')
+                    else:
+                        ws_copies.append(f"COPY {ws_dir}/package*.json ./{ws_dir}/")
+                else:
+                    ws_copies.append(f"COPY {m} ./{m}")
+            if is_nextjs or is_frontend_or_build:
+                build_cmd = "npm run build"
+                root_has_build = False
+                if isinstance(existing, Mapping) and "package.json" in existing:
+                    raw_pkg = existing.get("package.json", "")
+                    with contextlib.suppress(Exception):
+                        pkg_data = json.loads(raw_pkg) if isinstance(raw_pkg, str) else raw_pkg
+                        if isinstance(pkg_data, dict) and "build" in pkg_data.get("scripts", {}):
+                            root_has_build = True
+
+                if not root_has_build and workspace_manifests:
+                    for m in workspace_manifests:
+                        ws_raw = existing.get(m, "")
+                        if ws_raw:
+                            with contextlib.suppress(Exception):
+                                ws_data = json.loads(ws_raw) if isinstance(ws_raw, str) else ws_raw
+                                if isinstance(ws_data, dict) and "build" in ws_data.get("scripts", {}):
+                                    ws_dir = m.rsplit("/package.json", 1)[0]
+                                    build_cmd = f"npm run build --workspace={ws_dir}"
+                                    break
+
+                builder = [
+                    f"FROM {base} AS builder",
+                    "WORKDIR /app",
+                    "ENV npm_config_fetch_retries=5",
+                    "ENV npm_config_fetch_retry_mintimeout=20000",
+                    "ENV npm_config_fetch_retry_maxtimeout=120000",
+                    "ENV npm_config_maxsockets=15",
+                    "COPY package*.json ./",
+                    *ws_copies,
+                    f"RUN {install}",
+                    "COPY . .",
+                    "ENV NEXT_TELEMETRY_DISABLED=1",
+                    'ENV NODE_OPTIONS="--max-old-space-size=1536"',
+                    f"RUN {build_cmd}",
+                ]
+                copy_forward = ["COPY --from=builder /app ./"]
+                health = (
+                    "HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \\\n"
+                    f"  CMD node -e \"fetch('http://127.0.0.1:{port}/')"
+                    '.then(r => process.exit((r.ok || r.status < 400) ? 0 : 1)).catch(() => process.exit(1))"'
+                )
+            else:
+                builder = [
+                    f"FROM {base} AS builder",
+                    "WORKDIR /app",
+                    "ENV npm_config_fetch_retries=5",
+                    "ENV npm_config_fetch_retry_mintimeout=20000",
+                    "ENV npm_config_fetch_retry_maxtimeout=120000",
+                    "ENV npm_config_maxsockets=15",
+                    "COPY package*.json ./",
+                    *ws_copies,
+                    f"RUN {install}",
+                ]
+                copy_forward = ["COPY --from=builder /app/node_modules /app/node_modules", "COPY . ."]
+                health = (
+                    "HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \\\n"
+                    f"  CMD node -e \"fetch('http://127.0.0.1:{port}/')"
+                    '.then(r => process.exit((r.ok || r.status < 400) ? 0 : 1)).catch(() => process.exit(1))"'
+                )
+        elif runtime.startswith("go"):
+            builder = [
+                f"FROM {base} AS builder",
+                "WORKDIR /app",
+                "COPY go.mod go.sum* ./",
+                "RUN go mod download",
+                "COPY . .",
+                "RUN CGO_ENABLED=0 go build -o /app/server . || CGO_ENABLED=0 go build -o /app/server ./cmd/...",
+            ]
+            copy_forward = ["COPY --from=builder /app/server /app/server"]
+            health = (
+                "HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \\\n"
+                '  CMD ["/app/server", "--health"] || exit 0'
+            )
+        else:
+            builder = [
+                f"FROM {base} AS builder",
+                "WORKDIR /app",
+                "COPY requirements.txt ./",
+                "RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt",
+            ]
+            copy_forward = [
+                "COPY --from=builder /wheels /wheels",
+                "RUN pip install --no-cache-dir --no-index --find-links=/wheels /wheels/* "
+                "2>/dev/null || pip install -r requirements.txt",
+                "COPY . .",
+            ]
+            health = (
+                "HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \\\n"
+                f'  CMD python -c "import urllib.request,sys; '
+                f"sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:{port}/', timeout=2)"
+                '.status < 400 else 1)"'
+            )
+
+        dockerfile = "\n".join(
+            [
+                *(
+                    [
+                        f"# NOTE: the configured runtime {unsupported_runtime!r} is not one this",
+                        "# fallback renders. The Python layout below is what was produced; it is not a",
+                        f"# {unsupported_runtime} image and will not build one.",
+                    ]
+                    if unsupported_runtime
+                    else []
+                ),
+                *(
+                    [
+                        f"# NOTE: the configured base image {rejected_base!r} is not pinned to an exact",
+                        "# version or digest, so it is not used here: it would fail",
+                        "# `dockerfile_base_pinned`, the check this file exists to satisfy. Record a",
+                        f"# pinned image in the project's settings to override {base!r}.",
+                    ]
+                    if rejected_base
+                    else []
+                ),
+                *builder,
+                "",
+                f"FROM {base}",
+                "WORKDIR /app",
+                *copy_forward,
+                f"EXPOSE {port}",
+                health,
+                f"USER {GENERATED_RUN_AS_USER}",
+                f"CMD {start!r}".replace("'", '"'),
+                "",
+            ]
+        )
+        # A STATIC FRONTEND IS SERVED, NOT STARTED. The node final stage above ends in `npm start`, and a Vite /
+        # React / Vue site with no `start` script and no server of its own crash-looped on "Missing script:
+        # start" (2026-11-02). Such a project is built in the builder stage and its output served by nginx.
+        static_out = _static_frontend_output_dir(
+            runtime=runtime,
+            is_frontend=is_frontend_or_build,
+            is_nextjs=is_nextjs,
+            existing=existing,
+            frameworks=inv_frameworks,
+        )
+        if static_out is not None:
+            dockerfile = "\n".join(
+                [
+                    *builder,
+                    "",
+                    f"FROM {STATIC_SERVER_IMAGE}",
+                    "# Single-page-app fallback: unknown paths return index.html so client-side routes resolve.",
+                    # `\\n` is written literally: printf, not Python, turns it into the config's line breaks.
+                    r"RUN printf 'server {\n  listen "
+                    + str(port)
+                    + r";\n  root /usr/share/nginx/html;\n  location / { try_files $uri $uri/ /index.html; }\n}\n'"
+                    " > /etc/nginx/conf.d/default.conf",
+                    f"COPY --from=builder /app/{static_out} /usr/share/nginx/html",
+                    f"EXPOSE {port}",
+                    "HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \\",
+                    f"  CMD wget -q -O /dev/null http://127.0.0.1:{port}/ || exit 1",
+                    "USER 101",
+                    'CMD ["nginx", "-g", "daemon off;"]',
+                    "",
+                ]
+            )
+        # The linter configuration is chosen by runtime, so the file is one the project's own linter
+        # loads rather than a name that merely satisfies the path check.
+        lint_path, lint_body = lint_config(runtime)
+
+        strat = (
+            (getattr(compiled, "target_strategy", None) if compiled is not None else None)
+            or getattr(prompt, "target_strategy", None)
+            or (project.get("target_strategy") if isinstance(project, Mapping) else None)
+            or (project.get("strategy") if isinstance(project, Mapping) else None)
+            or (project.get("deployment_strategy") if isinstance(project, Mapping) else None)
+            or (
+                project.get("settings", {}).get("target_strategy")
+                if isinstance(project, Mapping) and isinstance(project.get("settings"), Mapping)
+                else None
+            )
+            or (
+                project.get("settings", {}).get("strategy")
+                if isinstance(project, Mapping) and isinstance(project.get("settings"), Mapping)
+                else None
+            )
+            or (
+                project.get("settings", {}).get("deployment_strategy")
+                if isinstance(project, Mapping) and isinstance(project.get("settings"), Mapping)
+                else None
+            )
+        )
+        strat_l = str(strat).strip().lower() if strat is not None else ""
+        is_docker_only = strat_l in ("docker_only", "docker") or "docker_only" in strat_l
+        if strat is not None:
+            if is_docker_only or strat_l in ("docker_github", "docker_github_vercel", "github_only", "vercel_only"):
+                is_k8s = False
+            elif "kubernetes" in strat_l or "k8s" in strat_l:
+                is_k8s = True
+            else:
+                is_k8s = False
+        else:
+            is_k8s = True
+
+        is_multi = getattr(arch, "is_multi_service", False) if arch is not None else False
+
+        k8s_files = (
+            (
+                GeneratedFile(path="k8s/deployment.yaml", content=_deployment_yaml(app_name, port)),
+                GeneratedFile(path="k8s/service.yaml", content=_service_yaml(app_name, port)),
+                GeneratedFile(path="k8s/ingress.yaml", content=_ingress_yaml(app_name, port)),
+                GeneratedFile(path=f"charts/{app_name}/Chart.yaml", content=helm_chart_yaml(app_name)),
+                GeneratedFile(path=f"charts/{app_name}/.helmignore", content=helm_chart_ignore()),
+                GeneratedFile(path=f"charts/{app_name}/values.yaml", content=helm_values_yaml(app_name, port)),
+                GeneratedFile(
+                    path=f"charts/{app_name}/templates/_helpers.tpl",
+                    content=helm_helpers_template(app_name),
+                ),
+                GeneratedFile(
+                    path=f"charts/{app_name}/templates/deployment.yaml",
+                    content=helm_deployment_template(app_name),
+                ),
+            )
+            if is_k8s
+            else ()
+        )
+
+        include_compose = (not is_docker_only) or is_multi or "compose" in strat_l
+        compose_files = (
+            (
+                GeneratedFile(
+                    path="docker-compose.yml",
+                    content=compose_file(
+                        app_name,
+                        port,
+                        GENERATED_IMAGE_TAG,
+                        architecture=arch,
+                    ),
+                ),
+            )
+            if include_compose
+            else ()
+        )
+
+        external_files = (
+            (
+                GeneratedFile(
+                    path=".github/workflows/build.yml",
+                    content=github_workflow_yaml(app_name, runtime="node" if runtime.startswith("node") else "python"),
+                ),
+                GeneratedFile(path="infra/main.tf", content=opentofu_main_tf(app_name, port)),
+            )
+            if not is_docker_only
+            else ()
+        )
+
+        return (
+            GeneratedFile(path="Dockerfile", content=dockerfile),
+            *k8s_files,
+            *external_files,
+            GeneratedFile(path=".dockerignore", content=dockerignore(runtime)),
+            GeneratedFile(path=".env.example", content=env_example(app_name, port, architecture=arch)),
+            *compose_files,
+            *(
+                (
+                    GeneratedFile(path="SECURITY.md", content=security_policy(app_name)),
+                    GeneratedFile(path=".gitleaks.toml", content=secret_scanner_config()),
+                    GeneratedFile(path=lint_path, content=lint_body),
+                )
+                if not is_docker_only
+                else ()
+            ),
+        )
+
+    def _chunks(self, content: str, size: int = 120) -> list[str]:
+        """Split rendered content into token-ish frames.
+
+        Not real tokenisation, and named so. The point of streaming here is that a client receives
+        progressive output; claiming these are model tokens would be a fiction the `served_from`
+        column already contradicts.
+        """
+        return [content[i : i + size] for i in range(0, len(content), size)] or [""]
+
+    def _apply_floor(
+        self,
+        *,
+        accepted: Sequence[GeneratedFile],
+        rejected: Sequence[str],
+        prompt: str,
+        project: Mapping[str, Any] | None,
+        existing: Mapping[str, str] | None,
+        compiled: Any | None = None,
+    ) -> tuple[tuple[GeneratedFile, ...], tuple[str, ...]]:
+        """Replace each rejected artifact with the audited template, when the template is better.
+
+        Returns the set to deliver and the paths that were substituted.
+
+        WHY THIS IS A SUBSTITUTION AND NOT A RELAXATION. The rejected artifact is gone either way; the
+        only question is whether the operator gets the known-good template in its place or nothing. The
+        template is the one `scripts/check-template-readiness.py` certifies against every target check,
+        over every input production can supply — so "nothing" was strictly the worse of the two, and it
+        was what the product did.
+
+        THREE CONDITIONS, ALL NECESSARY:
+
+        1. The template must actually render that path. A run that wrote something the floor has no
+           opinion about gets no substitute, because inventing one would be fabricating an artifact.
+        2. The substitute must satisfy its OWN target checks. Verified here at runtime rather than
+           trusted from CI, because the inputs differ per project and a gate that passed on other bytes
+           says nothing about these.
+        3. The assembled set must pass the WHOLE gate — structure, regression against what exists, and
+           the no-lowering rule. A substitution that costs points elsewhere is not an improvement, and
+           this is the check that notices.
+
+        If any fails, the withholding stands and the finding already names it.
+        """
+        if not rejected:
+            return tuple(accepted), ()
+
+        aligned_project = dict(project or {})
+        aligned_settings = dict(aligned_project.get("settings") or {})
+        aligned_name = aligned_project.get("name")
+        detected_port: int | None = None
+
+        for item in accepted:
+            norm = item.path.replace("\\", "/")
+            if norm.endswith((".yaml", ".yml")):
+                docs, _ = _load_documents(item.content)
+                if docs:
+                    for doc in docs:
+                        if not isinstance(doc, Mapping):
+                            continue
+                        kind = str(doc.get("kind", ""))
+                        spec = doc.get("spec") or {}
+                        meta = doc.get("metadata") or {}
+                        if kind == "Service":
+                            svc_ports = _extract_k8s_service_ports(item.content)
+                            if svc_ports and detected_port is None:
+                                detected_port = next(iter(sorted(svc_ports)))
+                            selector = spec.get("selector") if isinstance(spec, Mapping) else None
+                            if isinstance(selector, Mapping) and selector.get("app"):
+                                aligned_name = str(selector["app"])
+                            elif isinstance(meta, Mapping) and meta.get("name"):
+                                aligned_name = str(meta["name"])
+                        elif kind in ("Deployment", "StatefulSet", "DaemonSet"):
+                            wl_ports = _extract_k8s_workload_ports(item.content)
+                            if wl_ports and detected_port is None:
+                                detected_port = next(iter(sorted(wl_ports)))
+                            template = spec.get("template") if isinstance(spec, Mapping) else None
+                            t_meta = template.get("metadata") if isinstance(template, Mapping) else None
+                            t_labels = t_meta.get("labels") if isinstance(t_meta, Mapping) else None
+                            if isinstance(t_labels, Mapping) and t_labels.get("app"):
+                                aligned_name = str(t_labels["app"])
+                            elif isinstance(meta, Mapping) and meta.get("name"):
+                                aligned_name = str(meta["name"])
+                        elif kind == "Ingress":
+                            if not aligned_name and isinstance(meta, Mapping) and meta.get("name"):
+                                aligned_name = str(meta["name"])
+                        elif "services" in doc and isinstance(doc["services"], Mapping):
+                            for _sname, scfg in doc["services"].items():
+                                if isinstance(scfg, Mapping):
+                                    ports = scfg.get("ports") or []
+                                    for p in ports:
+                                        p_str = str(p)
+                                        container_p = p_str.split(":")[-1].strip().strip('"').strip("'")
+                                        if container_p.isdigit() and detected_port is None:
+                                            detected_port = int(container_p)
+                                            break
+            elif norm == "Dockerfile" or norm.endswith("/Dockerfile"):
+                df_ports = _extract_dockerfile_container_ports(item.content)
+                if df_ports and detected_port is None:
+                    detected_port = next(iter(sorted(df_ports)))
+
+        if detected_port is not None:
+            aligned_settings["port"] = detected_port
+        if aligned_name:
+            aligned_project["name"] = aligned_name
+        aligned_project["settings"] = aligned_settings
+
+        floor = {
+            item.path: item.content
+            for item in self._render(prompt, aligned_project, compiled=compiled, existing=existing)
+        }
+        candidates: dict[str, str] = {}
+        for path in rejected:
+            body = floor.get(path)
+            if body is None:
+                continue
+            # Condition 2, asked of the substitute ALONE, so a sibling cannot carry it.
+            if unsatisfied_targets({path: body}, existing):
+                continue
+            candidates[path] = body
+        if not candidates:
+            return tuple(accepted), ()
+
+        assembled = tuple(accepted) + tuple(
+            GeneratedFile(path=path, content=body) for path, body in sorted(candidates.items())
+        )
+        # Condition 3. `_validate` is the same function the model output answered to.
+        passed, _ = self._validate(assembled, existing)
+        if not passed:
+            return tuple(accepted), ()
+        return assembled, tuple(sorted(candidates))
+
+    def _validate(
+        self, files: Sequence[GeneratedFile], existing: Mapping[str, str] | None = None
+    ) -> tuple[bool, tuple[str, ...]]:
+        """§11.5.5's deterministic gate: structural checks that either hold or do not.
+
+        Deliberately not a quality score. Each check is something a malformed artifact fails outright,
+        so a refusal is explicable rather than a threshold judgement.
+
+        THE CHECKS PARSE THE DOCUMENT NOW. This method used to test for substrings — `"apiVersion:" not
+        in manifest`, `dockerfile.startswith("FROM ")`, `"USER " not in dockerfile`. That accepts a
+        manifest whose `apiVersion` is inside a comment, a Dockerfile whose `USER` appears in an
+        environment value, a document whose indentation is broken so the whole file is one scalar, and
+        anything that is not YAML at all: every one of those contains the right words. It also accepted
+        an object with no `metadata.name`, which no cluster will take. So the gate could only fail an
+        artifact that failed to mention something.
+
+        `artifact_checks` parses each document and checks its shape, and it covers the artifact kinds
+        FR-24 requires generating rather than only the two that existed: Dockerfile, Compose, Kubernetes
+        manifests, GitHub Actions workflows, `Chart.yaml` and OpenTofu configurations.
+
+        This is not the agent's validation and does not replace it. FR-27's tool-based checks —
+        `docker compose config`, `kubectl`, `helm`, `tofu`, `trivy` — run on the user's machine where
+        the workspace and the daemons are, and none of those binaries is in the backend image. Two
+        gates answering two questions: this one is "is the document well formed and the right shape",
+        cheap and offline and actionable by a repair iteration; the agent's is "will the real tools
+        accept it".
+        """
+        findings = list(validate_artifacts(files, existing=existing))
+        # A SECOND QUESTION, ASKED IN THE SAME PLACE. `validate_artifacts` answers "is this document
+        # well formed and the right shape"; a 345-byte Deployment with no probes, no resource limits
+        # and `:latest` passes that and is still strictly worse than the 1301-byte one it replaces.
+        # Findings share the `path: ` prefix, so D-106's per-file machinery handles them unchanged:
+        # the model is told what it dropped while an attempt remains, and the artifact alone is
+        # withheld if it will not put it back.
+        findings.extend(regression_findings(files, existing))
+        # A THIRD QUESTION, AND THE ONE THAT WAS ASKED OF NOTHING AT RUNTIME.
+        #
+        # `validate_artifacts` asks "is this well formed"; `regression_findings` asks "is this worse
+        # than what it replaces". Neither asks "does this satisfy the check it was generated for", and a
+        # real provider run exposed the gap: 296 completion tokens, an instruction naming
+        # `kubernetes_probes_declared` with line numbers, and a returned Deployment with no probes that
+        # passed this gate with zero findings and applied.
+        #
+        # The same rule the CI template gate uses, imported rather than restated so the two cannot
+        # disagree about what satisfying a check means.
+        findings.extend(unsatisfied_targets({item.path: item.content for item in files}, existing))
+        # INVARIANT 2: no change set may lower the score. Checked over the SET rather than per file,
+        # because a set can improve one artifact and cost points elsewhere without any single file
+        # dropping a property of its own - which is exactly what the per-file guard above cannot see.
+        findings.extend(score_lowering_findings({item.path: item.content for item in files}, existing))
+        return (not findings), tuple(findings)

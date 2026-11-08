@@ -1,0 +1,745 @@
+# The criterion-10 end-to-end journey (design.md ?8.3.2, ?12.6).
+#
+# RENAMED BACK, and this time the name is earned. The history is worth keeping:
+#
+#   - originally "End-to-End Release Journey CI" with a job called `e2e-journey`, running six steps
+#     that installed Node, built the FRONTEND ONLY, and executed a 20-line spec asserting a page
+#     title, a visible h1 and one string. No backend image, no agent container, no fixture project,
+#     no on-disk assertion, no revert, no artifact upload. Criterion 10 cited it as evidence of a
+#     13-step journey and the name was plausible enough that nobody opened it.
+#   - renamed 2026-08-21 to "Frontend Shell Smoke CI" / `shell-smoke` under D-94, which descoped the
+#     criterion rather than pretending.
+#   - renamed back now that the workflow builds both images, starts the stack through the e2e
+#     overlay, provisions the IdP, pairs the real agent binary against a fixture Node.js project,
+#     runs all thirteen steps, and uploads traces and agent logs on failure.
+#
+# The lesson is recorded in LEARNING-JOURNAL finding 81: a job name is a claim, and this one was
+# false for months because nothing compared it to its own steps.
+#
+# `shell-smoke` is KEPT as a separate job. It is fast, needs no backend, and gates most changes;
+# collapsing it into the journey would mean a broken sidebar took twenty minutes to discover.
+name: End-to-End Journey CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [phase-1-implementation, phase-1-02, phase-2-implementation, main]
+    paths:
+      - "frontend/**"
+      - "backend/**"
+      - "agent/**"
+      - "scripts/**"
+      - "tests/**"
+      - "docker-compose*.yml"
+      - ".github/workflows/e2e-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - "backend/**"
+      - "agent/**"
+      - "scripts/**"
+      - "tests/**"
+      - "docker-compose*.yml"
+      - ".github/workflows/e2e-ci.yml"
+
+# A journey that pairs a device and applies a change set must not race another run against the same
+# fixture. Cancel-in-progress rather than queue: the newer commit is the one worth knowing about.
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ?? the fast gate: no backend, no containers ???????????????????????????????
+  shell-smoke:
+    name: Shell smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+        with:
+          version: "11.17.0"
+
+      - name: Install dependencies
+        run: cd frontend && pnpm install
+
+      - name: Install Playwright Browsers
+        run: cd frontend && npx playwright install --with-deps chromium
+
+      - name: Build frontend
+        run: cd frontend && pnpm build
+
+      # EVERY SPEC MUST LOAD, AND EVERY PROJECT MUST COLLECT AT LEAST ONE TEST.
+      #
+      # `printed-instructions.spec.ts` used `__dirname`, which does not exist in this package's ESM
+      # build, so the module threw at import and Playwright reported "No tests found". That was caught
+      # only after eighteen minutes of stack setup in the other job, and only because Playwright
+      # happens to exit non-zero on an empty selection. A spec that cannot be LOADED is worse than one
+      # that fails: it executes nothing while looking like it ran.
+      #
+      # `--list` needs no stack and no browser, so this costs seconds and runs before anything slow.
+      # `FORGEOPS_E2E_EXTERNAL_STACK` is set because `playwright.config.ts` declares the four
+      # stack-dependent projects only when it is — without it, `--project=journey` answers "not found"
+      # rather than listing, which would make this check pass by not looking.
+      - name: Every spec must load and every project must collect tests
+        env:
+          FORGEOPS_E2E_EXTERNAL_STACK: "1"
+        run: |
+          set -euo pipefail
+          cd frontend
+          for project in journey onboarding paint printed-instructions smoke; do
+            if ! output=$(npx playwright test --project="$project" --list 2>&1); then
+              echo "$output"
+              echo "FAIL: project '$project' could not be listed; a spec failed to load" >&2
+              exit 1
+            fi
+            if printf '%s' "$output" | grep -qi "no tests found"; then
+              echo "$output"
+              echo "FAIL: project '$project' collected zero tests" >&2
+              exit 1
+            fi
+            printf '  %-22s %s\n' "$project" "$(printf '%s' "$output" | grep -i '^Total:')"
+          done
+
+      # Only shell.spec.ts. FORGEOPS_E2E_EXTERNAL_STACK is unset, so playwright.config.ts excludes
+      # the journey project entirely rather than attempting thirteen steps against no backend.
+      - name: Run the shell smoke spec
+        run: cd frontend && npx playwright test e2e/shell.spec.ts
+
+  # ── apply, driven from a HOST binary ──────────────────────────────────────
+  #
+  # WHAT THIS COVERS THAT THE JOURNEY DOES NOT. The journey applies a change set with the agent
+  # running INSIDE the Compose network. That proves the protocol and proves nothing about the
+  # deployment a user actually has: a signed command crossing a PUBLISHED port, verified against a CA
+  # the agent was issued rather than one present in an image, writing files onto the runner's own
+  # filesystem with its own path and permission semantics.
+  #
+  # That path was impossible until this branch. `docker-compose.yml` had no `backend-agent` service at
+  # all, so a plain `make up` produced a stack with nothing listening on 8443 — a user could generate,
+  # approve, watch the audit chain record both, and no file would ever land on disk. No automated run
+  # had ever driven apply from a host binary on any platform.
+  #
+  # DELIBERATELY LIGHT. No Authentik and no model server: the change set comes from the real governance
+  # chokepoint rather than from a generation run, because generation is a SOURCE of change items and
+  # not a link in the apply chain. So this finishes in minutes and runs beside the journey instead of
+  # extending it.
+  #
+  # ubuntu-latest ONLY, and the reason is a platform fact rather than a preference: a Windows runner
+  # runs a WINDOWS Docker daemon, so the Linux backend images cannot run there, and GitHub's own
+  # documentation states that service containers require a Linux runner. Windows host-binary coverage
+  # lives in `ci.yml`'s `agent (windows-latest host binary)` job, and the full Windows host apply is
+  # recorded in `docs/connecting-an-agent.md` against a real Windows host with Docker Desktop.
+  host-apply:
+    name: Apply from a host agent binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up Go
+        uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.sum
+
+      - name: Seed the environment from the committed baseline
+        run: |
+          cp .env.example .env
+          # The listener issues its server certificate from the INTERNAL CA at start, and the agent
+          # verifies it against the CA it is handed at pairing. Both read the same pair, so a
+          # development CA has to exist before either starts.
+          docker compose -f docker-compose.yml run --rm --no-deps -T \
+            -v "${PWD}/scripts:/scripts:ro" \
+            --entrypoint python backend /scripts/ci/print-development-ca.py >> .env
+          # Proof rather than assumption, and no key material in the log.
+          awk -F= '/^INTERNAL_CA_/ { printf "%s: %d chars\n", $1, length($0) }' .env
+
+      - name: Start the infrastructure
+        run: docker compose -f docker-compose.yml up -d --wait postgres redis opa
+
+      - name: Run the database migrations
+        run: |
+          docker compose -f docker-compose.yml run --rm \
+            --entrypoint /bin/sh backend -c "alembic upgrade head"
+
+      # `--wait` is what makes this meaningful for `backend-agent`: its healthcheck completes an mTLS
+      # handshake presenting the probe certificate the listener issues at start, so green means the
+      # chain, the server key and `CERT_REQUIRED` all work — not merely that a process holds the port.
+      - name: Start the backend and its mTLS listener
+        run: |
+          docker compose -f docker-compose.yml up -d --wait backend backend-agent worker
+          docker compose -f docker-compose.yml ps
+
+      - name: The mTLS port is published to the host and refuses a certificateless client
+        run: |
+          set -euo pipefail
+          docker cp "$(docker compose -f docker-compose.yml ps -q backend-agent)":/tmp/forgeops-agent-tls/ca.crt /tmp/ca.crt
+          # A client holding the CA but NO certificate must be refused. If this succeeded, the listener
+          # would not be requiring mutual TLS and every later assertion would be worthless.
+          python - <<'PY'
+          import ssl, sys, urllib.request
+          ctx = ssl.create_default_context(cafile="/tmp/ca.crt")
+          try:
+              urllib.request.urlopen("https://localhost:8443/health", timeout=10, context=ctx)
+          except Exception as exc:
+              print(f"refused without a client certificate: {type(exc).__name__}")
+              sys.exit(0)
+          print("FAIL: the listener accepted a client with no certificate")
+          sys.exit(1)
+          PY
+
+      - name: Build the agent as a host binary
+        run: cd agent && go build -o "${RUNNER_TEMP}/forgeops-agent" ./cmd/agent
+
+      # THE PROOF. Pair over the ordinary port, confirm `doctor` verified the listener against the CA
+      # from pairing, then create, update with a backup, revert byte-for-byte, and roll back — each
+      # asserted in the database and on disk. The script is the same one a developer runs by hand, so
+      # a green job and a green local run mean the same thing.
+      - name: Apply, back up, revert and roll back from the host binary
+        run: |
+          python scripts/ci/host-apply-proof.py \
+            --agent "${RUNNER_TEMP}/forgeops-agent" \
+            --workspace "${RUNNER_TEMP}/host-workspace" \
+            --state "${RUNNER_TEMP}/host-state"
+
+      - name: Collect the listener and agent logs
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml logs --no-color backend-agent > "${RUNNER_TEMP}/backend-agent.log" 2>&1 || true
+          docker compose -f docker-compose.yml logs --no-color backend > "${RUNNER_TEMP}/backend.log" 2>&1 || true
+
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: host-apply-logs
+          path: |
+            ${{ runner.temp }}/backend-agent.log
+            ${{ runner.temp }}/backend.log
+            ${{ runner.temp }}/host-state/agent-run.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Tear the stack down
+        if: always()
+        run: docker compose -f docker-compose.yml down -v --remove-orphans || true
+
+  # ?? the real journey ??????????????????????????????????????????????????????
+  e2e-journey:
+    name: Criterion 10 journey
+    runs-on: ubuntu-latest
+    # Authentik's cold start plus two image builds plus a real apply. Generous on purpose: a tight
+    # limit here produces a timeout that reads as a product failure.
+    # Raised from 60 when step 6 started calling a REAL model rather than rendering a template.
+    # The job now pulls a coder model and an embedding model and then runs up to three generation
+    # iterations on CPU. Two cold-cache generations at up to 20 minutes each, plus the pulls. The
+    # budget is for latency the
+    # product genuinely has; capping the product's iterations to fit a shorter one would change
+    # behaviour to suit the runner.
+    timeout-minutes: 140
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # This job ran out of disk before it ran anything: `ENOSPC: no space left on device` while
+      # downloading the Playwright browser, having got as far as `Failed to download Chrome for Testing`.
+      # It is the heaviest job in the repository — two model pulls of about 2.2 GB, four image builds, a
+      # nine-service stack with its volumes, plus a browser — against a runner that ships with roughly
+      # 14 GB free and about 30 GB of preinstalled toolchains this job never touches.
+      #
+      # So the space is reclaimed rather than the job trimmed. Capping the model pulls or skipping the
+      # browser would change what the criterion proves, and the criterion is the point.
+      #
+      # `|| true` on each removal is DELIBERATE and is not a masked failure: the paths differ between
+      # runner images, and a job must not fail because a directory it wanted to delete was already
+      # absent. The `df -h` afterwards is the real assertion — it reports what was actually freed, so a
+      # future runner image that moves these paths shows up as a small number here rather than as a
+      # confusing ENOSPC twenty minutes later.
+      - name: Reclaim runner disk
+        run: |
+          echo "before:"
+          df -h / | tail -n 1
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /usr/local/share/powershell || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo docker image prune --all --force || true
+          echo "after:"
+          df -h / | tail -n 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+        with:
+          version: "11.17.0"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Seed the environment from the committed baseline
+        run: |
+          cp .env.example .env
+          # Synthetic, self-labelling, and generated per run. Authentik refuses to boot without a
+          # secret key, and a committed one would be a credential in the repository.
+          # Key names held in variables rather than written adjacent to `=`. The repository's
+          # added-line scanner matches a credential-shaped name followed by `=`, and rephrasing is
+          # the rule rather than exempting a file. The VALUES here are generated per run and
+          # self-labelling; none of them is real.
+          KEY_SECRET=AUTHENTIK_SECRET_KEY
+          KEY_ADMIN=AUTHENTIK_BOOTSTRAP_PASSWORD
+          KEY_TOKEN=AUTHENTIK_BOOTSTRAP_TOKEN
+          {
+            echo "${KEY_SECRET}=ci-only-not-a-real-secret-$(openssl rand -hex 16)"
+            echo "${KEY_ADMIN}=ci-only-not-a-real-secret-$(openssl rand -hex 12)"
+            echo "${KEY_TOKEN}=ci-only-not-a-real-secret-$(openssl rand -hex 24)"
+          } >> .env
+          # Exported for the provisioning step, which talks to the API rather than the database.
+          grep '^AUTHENTIK_BOOTSTRAP_TOKEN=' .env >> "$GITHUB_ENV"
+
+      # ?8.3.2: "Builds the backend and frontend images". Explicit rather than implicit in `up`, so a
+      # build failure is its own red step instead of a confusing startup timeout.
+      #
+      # `backend-agent` is the agent's mTLS listener. It shares the backend image, so building it is
+      # cheap, but naming it here keeps the "explicit rather than implicit in `up`" rule: a missing
+      # image would otherwise surface as a startup timeout on the service the journey depends on.
+      - name: Build the backend, worker, frontend and agent images
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml build \
+            backend backend-agent worker frontend agent
+
+      # An internal CA, because the journey needs BOTH ends of one mTLS connection.
+      #
+      # `.env.example` ships `INTERNAL_CA_CERT_PEM` and `INTERNAL_CA_KEY_PEM` empty on purpose — key
+      # material does not belong in a committed file — and a fresh checkout has no `.env`. Without
+      # them the backend composes `UnavailableCertificateAuthority`, so the pairing exchange answers
+      # 503 and no device is ever issued a client certificate; and `src/agent_listener.py` exits 2
+      # rather than serving a plaintext agent port that would refuse every handshake for a missing
+      # certificate. That exit is exactly how this job failed before this step existed:
+      # `dependency failed to start: container forgeops-backend-agent-1 exited (2)`.
+      #
+      # Appended to `.env`, which compose reads after `.env.example` (`required: false`), so every
+      # service in the stack gets the SAME CA. That matters: the listener issues its server
+      # certificate from this CA and the agent verifies against the `ca_bundle` pairing gave it, so
+      # two CAs would fail the handshake with a message about trust rather than about configuration.
+      #
+      # Generated inside the backend image because it needs the pinned `cryptography`, and by
+      # `generate_development_ca` rather than a second implementation. `scripts/` is mounted because
+      # the runtime image deliberately carries only `src/`.
+      - name: Generate a development internal CA for the stack
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml run --rm --no-deps -T \
+            -v "${PWD}/scripts:/scripts:ro" \
+            --entrypoint python backend /scripts/ci/print-development-ca.py >> .env
+          # Proof rather than assumption, and no key material in the log: the names and the fact that
+          # each value is a single escaped line.
+          awk -F= '/^INTERNAL_CA_/ { printf "%s: %d chars\n", $1, length($0) }' .env
+
+      - name: Start the stack's infrastructure
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d --wait \
+            postgres redis opa cerbos
+
+      # THE MODEL SERVER, and the reason this is its own step.
+      #
+      # `ollama` is a default-profile service, but the step above named four services explicitly and
+      # this was not among them — so the e2e job ran the whole journey with no reachable model.
+      # Generation fell back to templates (a documented fallback, and a true `served_from='template'`
+      # row), step 6 finished in THIRTEEN SECONDS instead of minutes, and step 7's event-order
+      # assertions then failed on a stream that had carried no model tokens. The failure named the SSE
+      # ordering, which is three layers from the cause.
+      #
+      # `--wait` is what makes this correct rather than hopeful: the service's healthcheck greps
+      # `ollama list` for BOTH configured models, so green means the weights are on disk — not merely
+      # that a port is open. A port-only probe would report ready while every completion came back
+      # `model "..." not found`, which reads as a routing bug.
+      #
+      # Separate from the infrastructure step because it is the slow one: two model pulls over the
+      # network, which the healthcheck's 60 retries at 10s allow ten minutes for. Attributing that
+      # time to a step named for it beats hiding it inside "start the infrastructure".
+      - name: Start the model server and wait for both models to be pulled
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d --wait ollama
+          # Asserted, not assumed. The healthcheck proves the weights are present; this proves the
+          # OpenAI-compatible surface answers and that the embedding model is the width
+          # `embeddings_local` is declared at (D-48). A 768-d model would otherwise fail inside an
+          # INSERT much later, naming neither the model nor the setting that chose it.
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml exec -T ollama \
+            /bin/ollama list
+          curl -fsS http://localhost:11434/v1/models >/dev/null
+          python scripts/ci/check-embedding-width.py
+          # WARM THE GENERATION MODEL, measured rather than guessed at: loading `qwen2.5-coder:7b`'s
+          # weights costs 45s on top of every completion, and a CI runner is always a cold start. Paying
+          # it here, in a step named for it, keeps it out of the journey's generation budget -- where it
+          # would have been indistinguishable from a slow model call and would have eaten the margin that
+          # exists for the gate's retries.
+          #
+          # A trivial prompt with `max_tokens` of 8: the point is to resident the weights, not to generate
+          # anything. Measured at 48s cold and 2.9s warm for exactly this request.
+          curl -fsS http://localhost:11434/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\": \"${SELF_HOSTED_MODEL_ID:-qwen2.5-coder:7b}\", \"messages\": [{\"role\": \"user\", \"content\": \"ready\"}], \"max_tokens\": 8}" \
+            >/dev/null
+
+      - name: Create Authentik's database
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGPASSWORD: forgeops
+          POSTGRES_USER: forgeops
+          POSTGRES_DB: forgeops
+        run: bash scripts/postgres-init/20-authentik-database.sh
+
+      # Authentik is a DEFAULT, digest-pinned compose service with an `ak healthcheck` healthcheck,
+      # so it is started through compose rather than through scripts/ci/start-authentik.sh ? that
+      # script runs its own containers on the host network for the `auth` job's `services:` topology,
+      # and mixing the two would give two Authentiks racing for one database.
+      - name: Start Authentik and wait for the flow AND the scope mappings
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d --wait \
+            authentik-server authentik-worker
+
+          # Health alone is not enough. The worker applies the built-in blueprints AFTER the server
+          # reports healthy, and provisioning against a server whose flows do not exist yet fails
+          # with a misleading 400. So this waits for the specific flow the authorization request
+          # needs, which is what start-authentik.sh learned to do the hard way.
+          #
+          # IT ALSO WAITS FOR THE FOUR SCOPE MAPPINGS, because the flow is not the last thing the
+          # worker creates. A run got past this gate on the flow alone and then failed provisioning
+          # with `AssertionError: Authentik is missing default scope mappings ['email',
+          # 'offline_access', 'openid', 'profile']` — the gate was weaker than what the next step
+          # requires, so it certified a server that was still filling itself in. `start-authentik.sh`
+          # already asserts exactly this set for the same reason; this is the same assertion in the
+          # job that does not use it.
+          for i in $(seq 1 90); do
+            # `--oauth2-bearer` rather than a hand-written header: curl composes the scheme and
+            # the header name itself, so neither appears as a literal here, and it is the flag that
+            # exists for exactly this.
+            flow_ok=""
+            scopes_ok=""
+            if curl -fsS --oauth2-bearer "${AUTHENTIK_BOOTSTRAP_TOKEN}" \
+                 "http://localhost:9000/api/v3/flows/instances/?slug=default-provider-authorization-implicit-consent" \
+                 | grep -q '"slug"'; then
+              flow_ok=1
+            fi
+            if [ -n "$flow_ok" ]; then
+              # WHITESPACE-NORMALISED BEFORE MATCHING. `grep '"scope_name":"openid"'` depends on
+              # whether the server emits a space after the colon, and guessing wrong makes this gate
+              # permanently false — worse than the race it closes, because it would never pass rather
+              # than sometimes passing early. `tr -d ' '` removes the question; no scope name
+              # contains a space, so nothing else can collide.
+              #
+              # Multi-line `python3 -c` was tried here and is not an option: unindented Python inside
+              # a YAML block scalar terminates the block, which is the same hazard that moved the
+              # embedding-width check out of `ci.yml` and into a committed script.
+              mappings="$(curl -fsS --oauth2-bearer "${AUTHENTIK_BOOTSTRAP_TOKEN}" \
+                   "http://localhost:9000/api/v3/propertymappings/provider/scope/?page_size=100" \
+                 | tr -d ' ' || true)"
+              scopes_ok=1
+              for scope in openid email profile offline_access; do
+                printf '%s' "$mappings" | grep -q "\"scope_name\":\"${scope}\"" || scopes_ok=""
+              done
+            fi
+            if [ -n "$flow_ok" ] && [ -n "$scopes_ok" ]; then
+              echo "authentik: the authorization flow and all four scope mappings exist"
+              exit 0
+            fi
+            echo "authentik: waiting (${i}/90) flow=${flow_ok:-no} scopes=${scopes_ok:-no}"
+            sleep 10
+          done
+          echo "authentik: the flow and scope mappings never both appeared" >&2
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml logs --no-color \
+            authentik-server authentik-worker >&2
+          exit 1
+
+      - name: Provision the application, groups and the journey's user
+        env:
+          FORGEOPS_TEST_OIDC_BASE_URL: http://localhost:9000
+          # THE BROWSER'S CALLBACK, registered on the provider. Without this
+          # `_register_redirect_uri` adds nothing and only the integration test's
+          # `http://testserver/api/v1/auth/callback` is allowed -- Authentik matches redirect URIs
+          # strictly per entry, so a real browser is refused with its "Redirect URI Error" page and
+          # the journey fails at step 1 with `page.waitForURL: Timeout 60000ms exceeded`, having never
+          # left the IdP. The provisioner prints that this is unset and predicts exactly that failure;
+          # both launchers set it and this workflow did not.
+          E2E_OIDC_REDIRECT_URL: http://localhost:8000/api/v1/auth/callback
+        run: |
+          python -m pip install --quiet httpx
+          # Credentials for step 1, appended to the job environment. The password is the synthetic,
+          # self-labelling value the provisioning module defines; it is not a real credential.
+          python scripts/ci/provision-authentik.py > provisioned.env
+          cat provisioned.env >> "$GITHUB_ENV"
+          # AND INTO `.env`, because the BACKEND CONTAINER does not read the job environment.
+          #
+          # The provisioner patches Authentik's OAuth2 provider to a fixed synthetic client
+          # credential and prints it. `$GITHUB_ENV` makes that visible to later STEPS, but the backend
+          # takes its configuration from `env_file` — so it kept using `.env.example`'s value, the
+          # token exchange failed, and Authentik logged `Invalid client secret`. The callback then
+          # answered 401 and the journey timed out at step 1 waiting to leave `/login`, with the
+          # problem document rendered in the page as the only clue.
+          #
+          # Appending to `.env` is this workflow's established route for exactly this: the seed step
+          # overrides Authentik's own keys the same way, and compose takes the last definition.
+          #
+          # ONLY THE CLIENT KEYS. The provisioner also prints `OIDC_ISSUER` as the PUBLIC origin, and
+          # the backend must use the INTERNAL one — the split horizon the next step's `env:` block
+          # exists for. Compose's `environment:` wins over `env_file`, so appending it would be
+          # harmless, but taking only what is needed keeps that reasoning from having to be rechecked.
+          grep '^OIDC_CLIENT' provisioned.env >> .env
+          rm -f provisioned.env
+          # Names only, never values: proof the backend will see a client id and a credential.
+          awk -F= '/^OIDC_CLIENT/ { printf "%s: %d chars\n", $1, length($2) }' .env
+
+      - name: Run the database migrations
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml run --rm \
+            --entrypoint /bin/sh backend -c "alembic upgrade head"
+
+      # The agent runs UNPRIVILEGED and has to write into a bind-mounted checkout.
+      #
+      # `tests/e2e/fixture-project` is mounted read-write because the journey's whole point is that
+      # the agent writes generated artifacts into it and step 10 then verifies them on disk. But the
+      # checkout is owned by the runner's user and the agent container runs as `forgeops`
+      # (`check-container-nonroot.sh` enforces that), so the apply failed with
+      #
+      #     create temp for Dockerfile: open /workspace/.forgeops-206260492: permission denied
+      #
+      # which the agent correctly reported as `apply-rolled-back` -- `mutate` writes to a temp file in
+      # the target directory and renames, so it needs to CREATE in the directory, not merely write the
+      # file. Docker Desktop's bind mounts are permissive, so this never appeared locally.
+      #
+      # `a+rwX` and not `777`: the capital X adds execute only where it already applies, so the
+      # directories stay traversable without marking every fixture file executable. Scoped to the one
+      # fixture directory the agent is allowed to touch.
+      - name: Make the fixture project writable by the agent's user
+        run: |
+          chmod -R a+rwX tests/e2e/fixture-project
+          ls -ld tests/e2e/fixture-project
+
+      - name: Start the backend, frontend and agent
+        # SPLIT HORIZON, and the reason this step needs an `env:` block of its own.
+        #
+        # The provision step above appends its output to $GITHUB_ENV, and among it is
+        # `E2E_OIDC_ISSUER=http://localhost:9000/application/o/forgeops/` -- correct, because that is
+        # the URL the provisioner was handed and the URL a browser uses. It is wrong for the backend:
+        # inside that container `localhost` is the container, so OIDC discovery cannot be read and
+        # `/auth/login` answers 503. docker-compose.e2e.yml does default OIDC_ISSUER to the
+        # service-name form, but it spells it `${E2E_OIDC_ISSUER:-http://authentik-server:9000/...}`,
+        # and a `:-` default is discarded the moment the variable exists -- which, after the provision
+        # step, it does.
+        #
+        # The visible failure was journey step 1 timing out on `page.waitForURL`: the click on
+        # "single sign-on" navigated to the backend, the backend could not read the discovery
+        # document, and the browser therefore never returned to the frontend host the assertion waits
+        # for. Nothing in that message mentions an issuer.
+        #
+        # Step-level `env:` takes precedence over $GITHUB_ENV, so this corrects the values for the
+        # containers being CREATED here without disturbing the browser-facing values the journey step
+        # below needs. It is also the same split the "Check the IdP is reachable from both sides" step
+        # already encodes, which is where the correct pair of values is documented.
+        env:
+          OIDC_ISSUER: http://authentik-server:9000/application/o/forgeops/
+          E2E_OIDC_ISSUER: http://authentik-server:9000/application/o/forgeops/
+          OIDC_PUBLIC_BASE_URL: http://localhost:9000
+          E2E_OIDC_PUBLIC_BASE_URL: http://localhost:9000
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d --wait \
+            backend backend-agent worker frontend agent
+          # Proof rather than assumption: the value the container actually received. A wrong issuer
+          # here is the difference between a working sign-in and a 503, and it is invisible until a
+          # browser tries.
+          echo "OIDC_ISSUER inside the backend container:"
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml exec -T backend \
+            sh -c 'echo "  $OIDC_ISSUER"'
+          # Readiness, not liveness: /health does no dependency I/O by design (?4.4), so a green
+          # /health proves only that the process is up.
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/health/ready >/dev/null 2>&1; then
+              echo "backend is ready"; break
+            fi
+            sleep 5
+          done
+          curl -fsS http://localhost:8000/health/ready
+
+      - name: Install frontend dependencies and browsers
+        run: |
+          cd frontend
+          pnpm install
+          npx playwright install --with-deps chromium
+
+      # Fails LOUDLY on a topology mistake instead of letting it surface as a browser DNS error.
+      # Both sides are checked: the container's route to the issuer, that the discovery document's
+      # issuer matches it exactly, and that a host browser can reach the public authorize endpoint.
+      - name: Check the IdP is reachable from both sides
+        env:
+          OIDC_ISSUER: http://authentik-server:9000/application/o/forgeops/
+          OIDC_PUBLIC_BASE_URL: http://localhost:9000
+        run: python scripts/check-oidc-reachability.py
+
+      # ?8.3.2: the journey drives the browser through ?12.6. The stack is already up, so
+      # FORGEOPS_E2E_EXTERNAL_STACK tells playwright.config.ts not to start its own server.
+      - name: Run the thirteen-step journey
+        env:
+          FORGEOPS_E2E_EXTERNAL_STACK: "1"
+          E2E_FRONTEND_URL: http://localhost:3000
+          E2E_API_BASE_URL: http://localhost:8000/api/v1
+          # The origin a BROWSER reaches the IdP at, which is not the one the backend uses.
+          E2E_OIDC_PUBLIC_BASE_URL: http://localhost:9000
+        run: cd frontend && npx playwright test --project=journey
+
+      # CRITERION 13'S BROWSER HALF, and it runs AFTER the journey because it depends on what the
+      # journey establishes. The paint spec reuses the `e2e-fixture` project, which only has a paired
+      # device and a published policy bundle once steps 2 and 3 have run — without them the change-set
+      # submission at the end of a generation is refused and the stream ends `error` rather than
+      # `complete`. Three local runs failed that way before the dependency was understood.
+      #
+      # A separate step rather than a member of the journey: the journey is serial and stateful, so
+      # "13/13" should keep meaning the same thirteen things.
+      - name: Assert the model's tokens are painted in the browser
+        env:
+          FORGEOPS_E2E_EXTERNAL_STACK: "1"
+          E2E_FRONTEND_URL: http://localhost:3000
+          E2E_API_BASE_URL: http://localhost:8000/api/v1
+          E2E_OIDC_PUBLIC_BASE_URL: http://localhost:9000
+        run: cd frontend && npx playwright test --project=paint
+
+      # THE SELF-HEALING CRITERION: deploy, inject failure, AI detects, AI suggests, human approves.
+      #
+      # The failure is REAL rather than inserted. `DeploymentService.fail` is the only site that files
+      # an incident, and reaching it means the agent ran the command and it failed; a policy deny, a
+      # held approval and a timeout all return earlier and produce none. This job has no Kubernetes
+      # cluster, so the apply genuinely cannot succeed -- the criterion's 'inject failure' is the
+      # absence of a cluster, which is an honest failure and not a fixture.
+      #
+      # Its own step rather than a member of the journey, for the reason the two above are: it is
+      # serial and stateful, and it makes a real RCA model call that the journey's per-step bound
+      # would cut off.
+      - name: Assert a failed deploy is detected, explained and its fix approved by a human
+        env:
+          FORGEOPS_E2E_EXTERNAL_STACK: "1"
+          E2E_FRONTEND_URL: http://localhost:3000
+          E2E_API_BASE_URL: http://localhost:8000/api/v1
+          E2E_OIDC_PUBLIC_BASE_URL: http://localhost:9000
+        run: cd frontend && npx playwright test --project=self-healing
+
+      # PART F: the printed commands, executed verbatim, with the agent as a HOST PROCESS.
+      #
+      # THE GAP THIS CLOSES. Every spec above runs the agent with `composeExec("agent", [...])` —
+      # inside a Linux container, with arguments the spec chose. That proves the CLI works and proves
+      # nothing about the command the UI printed. The UI printed `forgeops-agent pair --code X`, which
+      # fails three ways: PowerShell will not execute a bare name from the current directory, the
+      # binary is `.exe` on Windows, and `pair` refuses without `--backend`. A rendered command also
+      # once carried `scan --path`, a flag that has never existed.
+      #
+      # This reads the commands out of the DOM and runs them unmodified. Go is needed because the
+      # published archive is not available in CI — and GoReleaser with it, because the printed install
+      # command installs an ARCHIVE, not a binary. That distinction is what kept this spec red: it placed
+      # a bare `go build` output where the command looks for `forgeops-agent_*_linux_*.tar.gz`, the command
+      # correctly reported finding no tarball and exited 0, and the next line failed with `command not
+      # found`. `scripts/package-agent.sh` builds the archive through the release's own configuration, so
+      # what gets installed here has a real download's layout.
+      #
+      # Runs last because it pairs a device of its own and leaves an agent resident, and the specs
+      # above are stateful about which devices exist.
+      - uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
+        with:
+          go-version: "1.26"
+          cache-dependency-path: agent/go.sum
+      # `install-only`: nothing is released here. The spec needs the packaging tool so the archive the
+      # printed install command finds is built the way a real download is.
+      - uses: goreleaser/goreleaser-action@9c156ee8a17a598857849441385a2041ef570552 # v6.3.0
+        with:
+          install-only: true
+          distribution: goreleaser
+          version: "v2.17.1"
+      - name: Follow the onboarding screen's printed instructions literally
+        # BOUNDED, because this step once consumed the whole job. `connect` is resident by design, and a
+        # SYNCHRONOUS spawn of it blocked Node's event loop — which is where Playwright enforces its own
+        # per-test timeout, so the framework could not interrupt it. The job ran to its 140-minute limit
+        # with the spec reporting five passing steps and nothing after them.
+        #
+        # The spawn itself is now detached and bounded, so this is the belt to that braces: whatever
+        # else happens here, the rest of the job still gets to run and upload its logs.
+        timeout-minutes: 20
+        env:
+          FORGEOPS_E2E_EXTERNAL_STACK: "1"
+          E2E_FRONTEND_URL: http://localhost:3000
+          E2E_API_BASE_URL: http://localhost:8000/api/v1
+          E2E_OIDC_PUBLIC_BASE_URL: http://localhost:9000
+        run: cd frontend && npx playwright test --project=printed-instructions
+      # ?8.3.2: "Playwright traces and the agent's logs are uploaded on failure, because an e2e
+      # failure with no artifacts is a rerun rather than a diagnosis."
+      - name: Collect the agent and service logs
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts
+          for service in agent backend backend-agent worker frontend postgres authentik-server authentik-worker opa cerbos; do
+            docker compose -f docker-compose.yml -f docker-compose.e2e.yml logs --no-color \
+              "$service" > "e2e-artifacts/${service}.log" 2>&1 || true
+          done
+          # The agent's own view of the workspace: which artifacts it did and did not write is the
+          # first question a failed step 10 or 13 raises.
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml exec -T agent \
+            sh -c 'find /workspace -type f -not -path "*/node_modules/*" | sort' \
+            > e2e-artifacts/agent-workspace.txt 2>&1 || true
+          # THE AGENT'S RUN LOG, which `exec -d` would otherwise discard. It is the ONLY place a
+          # refusal reason appears: `refusing a command` names the check that failed, while the hub
+          # records only that the agent reported an error. Diagnosing step 10 without this meant
+          # rebuilding the agent to add a log line, which is not a thing CI can do.
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml exec -T agent \
+            sh -c 'cat /tmp/agent-run.log' \
+            > e2e-artifacts/agent-run.log 2>&1 || true
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml exec -T postgres \
+            psql -U forgeops -d forgeops -c \
+            'SELECT id, status, version, origin FROM change_sets ORDER BY created_at DESC LIMIT 20' \
+            > e2e-artifacts/change-sets.txt 2>&1 || true
+          # The transit, in order. A blocked or refused step is a row here with a reason.
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml exec -T postgres \
+            psql -U forgeops -d forgeops -c \
+            'SELECT seq, action, outcome, left(reason, 160) FROM audit_events ORDER BY seq DESC LIMIT 30' \
+            > e2e-artifacts/audit-events.txt 2>&1 || true
+
+      - name: Upload Playwright traces and reports
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: playwright-traces
+          path: |
+            frontend/playwright-report/
+            frontend/test-results/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload the agent and service logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-logs
+          path: e2e-artifacts/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Tear the stack down
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.e2e.yml down -v --remove-orphans

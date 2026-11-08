@@ -25,7 +25,7 @@ func setProcessGroup(cmd *exec.Cmd) {
 // that ignored SIGTERM survived as an orphan. Polling with signal 0 asks the
 // kernel whether the group still exists without consuming the exit status.
 func terminateGroup(cmd *exec.Cmd, grace time.Duration) {
-	if cmd.Process == nil {
+	if cmd.Process == nil || cmd.Process.Pid <= 0 {
 		return
 	}
 	pgid := -cmd.Process.Pid // negative pid targets the whole group
@@ -40,3 +40,9 @@ func terminateGroup(cmd *exec.Cmd, grace time.Duration) {
 	}
 	_ = syscall.Kill(pgid, syscall.SIGKILL)
 }
+
+// attachProcessGroup is a no-op on Unix: Setpgid takes effect at exec, so the process
+// group exists from the child's first instruction and there is nothing to attach after
+// Start. The function exists so the runner has one call shape on both platforms; on
+// Windows a Job Object cannot be joined until a process handle exists.
+func attachProcessGroup(cmd *exec.Cmd) {}

@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+from src.generation.template_library import DEFAULT_TEMPLATES, get_default_template_loader
+
+
+def test_default_template_loader_all_languages():
+    loader = get_default_template_loader()
+
+    for lang_template in DEFAULT_TEMPLATES.keys():
+        rendered = loader.render(lang_template, {"PORT": 8080})
+        assert "8080" in rendered
+
+
+def test_template_loader_registered_count():
+    loader = get_default_template_loader()
+    # Every entry in the catalogue must reach the loader. Asserting the two agree catches a template
+    # added to DEFAULT_TEMPLATES that the loader never registers, which a hardcoded number would not.
+    assert len(loader.templates) == len(DEFAULT_TEMPLATES)

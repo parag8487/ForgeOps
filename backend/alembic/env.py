@@ -11,21 +11,80 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import sys
 from logging.config import fileConfig
 
 from alembic import context
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import pool
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_engine_from_config
 from sqlmodel import SQLModel
 
 # Ensure the backend src is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Import all models so SQLModel.metadata is populated
-from src.analysis.models import Embedding, FileTreeEntry  # noqa: F401, E402
-from src.projects.models import Project  # noqa: F401, E402
+# Import all models so SQLModel.metadata is populated. A model that is not imported
+# here is invisible to `--autogenerate`, which then proposes dropping its table:
+# `test_alembic_autogenerate_clean.py` (task 5.9) is what turns that into a failure
+# rather than a surprise in a later diff.
+from src.ai.provider_models import ProviderCredential, ProviderEndpoint  # noqa: F401, E402
+from src.analysis.models import (  # noqa: F401, E402
+    AnalysisReport,
+    Embedding,
+    EmbeddingLocal,
+    FileContent,
+    FileDependency,
+    FileTreeEntry,
+)
+from src.argocd.models import ArgocdRepositoryEvent  # noqa: F401, E402
+from src.audit.models import AuditEvent  # noqa: F401, E402
+from src.auth.device_models import AgentDevice  # noqa: F401, E402
+from src.auth.models import Session, User  # noqa: F401, E402
+from src.commands.models import CommandHistory  # noqa: F401, E402
+from src.deployments.models import (  # noqa: F401, E402
+    AutonomousDeployment,
+    AutonomousDeploymentLog,
+    AutonomousDeploymentOutbox,
+    AutonomousDeploymentStage,
+    Deployment,
+    DeploymentCircuitBreaker,
+)
+from src.environments.models import (  # noqa: F401, E402
+    Environment,
+    EnvironmentVariable,
+)
+from src.generation.models import GenerationRun  # noqa: F401, E402
+from src.governance.models import (  # noqa: F401, E402
+    Approval,
+    ChangeItem,
+    ChangeSet,
+    RollbackHandle,
+    Validation,
+)
+from src.incidents.models import (  # noqa: F401, E402
+    HealingAction,
+    Incident,
+    IncidentAnalysis,
+    IncidentEvidence,
+    IncidentFixSuggestion,
+    IncidentPostmortem,
+)
+from src.integrations.models import GitHubAccountLink  # noqa: F401, E402
+from src.learning.models import (  # noqa: F401, E402
+    LearningFeedback,
+    LearningPreference,
+    LearningSession,
+    LearningSkillFile,
+)
+from src.notifications.models import (  # noqa: F401, E402
+    Notification,
+    NotificationPreference,
+)
+from src.policies.models import Policy, PolicyBundle, PolicyEvaluation  # noqa: F401, E402
+from src.projects.models import Project, ProjectTag  # noqa: F401, E402
+from src.secrets.models import Secret  # noqa: F401, E402
 
 # Alembic Config object
 config = context.config
@@ -34,10 +93,27 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Use DATABASE_URL from environment if available
-database_url = os.environ.get("DATABASE_URL")
+# Which URL Alembic connects with — and it is NOT `DATABASE_URL` when a migrator URL
+# is configured (design §6.4, §13.1).
+#
+# §6.4: "`DATABASE_URL` uses `forgeops_app`, which cannot UPDATE or DELETE audit rows;
+# `ALEMBIC_DATABASE_URL` uses `forgeops_migrator`, which owns the schema. A single-role
+# deployment silently defeats mechanism 3." This file previously read `DATABASE_URL`
+# only, so `alembic upgrade head` ran as the APPLICATION role: the app would then own
+# `audit_events` and could drop its own append-only triggers, which is exactly the
+# arrangement §6.4 says must not happen. `ALEMBIC_DATABASE_URL` was registered in
+# `core/config.py` and shipped in `.env.example`, and nothing read it.
+#
+# `ALEMBIC_DATABASE_URL` wins when set; `DATABASE_URL` remains the fallback so a
+# single-role development database keeps working. The choice is announced, because a
+# migration running as the wrong role is invisible otherwise.
+database_url = os.environ.get("ALEMBIC_DATABASE_URL") or os.environ.get("DATABASE_URL")
+_source = "alembic.ini sqlalchemy.url"
 if database_url:
     config.set_main_option("sqlalchemy.url", database_url)
+    _source = "ALEMBIC_DATABASE_URL" if os.environ.get("ALEMBIC_DATABASE_URL") else "DATABASE_URL"
+    # Credentials are never printed: only which variable was chosen.
+    print(f"alembic: connecting with {_source}", file=sys.stderr)
 
 target_metadata = SQLModel.metadata
 
@@ -90,8 +166,34 @@ async def run_async_migrations() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
+    try:
+        async with connectable.connect() as connection:
+            await connection.run_sync(do_run_migrations)
+    except socket.gaierror as exc:
+        # D-75. Name the variable, the host and the remedy, because the bare failure names
+        # none of them.
+        #
+        # `make init-env` copies `.env.example` to `.env`, and `.env.example` is
+        # COMPOSE-targeted: its DSNs use the service names `postgres` and `redis`, which
+        # resolve only on the Compose network. `.env` also holds the development CA key
+        # (`make init-ca`), so a host-side developer has a real reason to load it - and
+        # loading it wholesale puts `ALEMBIC_DATABASE_URL=...@postgres:5432` into the OS
+        # environment. `os.environ` outranks anything a test fixture configures, this file
+        # prefers `ALEMBIC_DATABASE_URL` over `DATABASE_URL` by design (§6.4, and that
+        # preference is correct - it must not be relaxed), and so every DB-backed test
+        # errors at setup with `socket.gaierror: [Errno 11001] getaddrinfo failed` from
+        # `schema_at_head`'s `alembic downgrade base`. A Linux developer hits the identical
+        # thing; nothing here is Windows-specific. Recorded as finding 61.
+        host = make_url(config.get_main_option("sqlalchemy.url") or "").host
+        raise RuntimeError(
+            f"alembic: cannot resolve database host {host!r}, taken from {_source}. "
+            f"If {host!r} is a Compose service name you are running outside Compose: "
+            f"`.env.example` (and therefore `.env`) is Compose-targeted, and loading `.env` "
+            f"wholesale for its CA key also imports its Compose DSNs. Set "
+            f"ALEMBIC_DATABASE_URL to a host-reachable DSN, or load `.env` selectively - "
+            f"scripts/local-env.ps1 does the latter. See docs/development.md, "
+            f"'The .env and ALEMBIC_DATABASE_URL trap'."
+        ) from exc
     await connectable.dispose()
 
 

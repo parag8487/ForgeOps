@@ -36,6 +36,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from .capability import require_capability
+from .cerbos_stub import cerbos_health_stub
+from .opa_stub import opa_health_stub
 
 PROBLEM_CONTENT_TYPE = "application/problem+json"
 
@@ -93,6 +95,16 @@ def _clear_settings_cache() -> None:
 
 def _build_app(database_url: str, redis_url: str):
     """Import the app factory with a project configuration applied to the env."""
+    # Since debt D1 was closed (task 2.1) the lifespan builds the model router from
+    # config/model-tiers.yaml, whose `base_url` values are `${VAR}` placeholders that
+    # load_tier_config refuses to leave unexpanded. The committed baseline supplies
+    # them, which keeps this test a CONFIGURATION substitution and simultaneously
+    # asserts that `.env.example` is complete enough to boot the app.
+    from src.core.config import load_project_dotenv
+
+    for key, value in load_project_dotenv((".env.example",)).items():
+        os.environ.setdefault(key, value)
+
     os.environ["DATABASE_URL"] = database_url
     os.environ["REDIS_URL"] = redis_url
     os.environ.setdefault("MCP_OIDC_AUDIENCE", "forgeops-mcp-gateway")
@@ -166,8 +178,9 @@ class TestReadinessRecovery:
         )
         if not os.path.exists(redis_server) and shutil.which(redis_server) is None:
             require_capability(
+                "redis",
                 f"no real redis-server binary available at {redis_server}; this test must "
-                "start and stop its own Redis to observe the unavailable -> available transition"
+                "start and stop its own Redis to observe the unavailable -> available transition",
             )
 
         # The already-running test PostgreSQL is reachable; Redis is started on a
@@ -176,8 +189,18 @@ class TestReadinessRecovery:
         redis_port = _free_port()
         assert _port_is_closed(redis_port)
 
-        app = _build_app(database_url, f"redis://127.0.0.1:{redis_port}/0")
+        # Task 6.4 added Cerbos to readiness and task 9.2 added OPA, so this test needs
+        # both reachable or the 200 it waits for could never arrive — and the subject
+        # here is Redis recovering, not authorisation or policy. A transport substitution
+        # (§0.4.1): the production clients over real sockets, with stubs answering only
+        # health.
+        with cerbos_health_stub() as cerbos_url, opa_health_stub() as opa_url:
+            os.environ["CERBOS_URL"] = cerbos_url
+            os.environ["OPA_URL"] = opa_url
+            app = _build_app(database_url, f"redis://127.0.0.1:{redis_port}/0")
+            self._observe_recovery(app, redis_server, redis_port)
 
+    def _observe_recovery(self, app, redis_server: str, redis_port: int) -> None:
         redis_proc: subprocess.Popen[bytes] | None = None
         try:
             with TestClient(app) as client:
@@ -218,7 +241,10 @@ class TestReadinessRecovery:
                 )
                 payload = recovered.json()
                 assert payload["status"] == "ready"
-                assert payload["checks"] == {"postgres": "ok", "redis": "ok"}
+                # Still an EXACT set, now with the dependency task 6.4 added. Exact
+                # rather than a subset check because a probe silently disappearing from
+                # readiness is the failure this line exists to catch.
+                assert payload["checks"] == {"postgres": "ok", "redis": "ok", "cerbos": "ok", "opa": "ok"}
         finally:
             if redis_proc is not None:
                 redis_proc.terminate()

@@ -40,6 +40,12 @@ agent/dist/
 *.prof
 # `go.sum` is committed (design §16.1) — never ignored.
 !agent/go.sum
+# pgregory.net/rapid writes a reproduction failfile under testdata/rapid/ whenever a
+# property fails. It is a debugging artifact keyed to one seed and machine, not source,
+# and it appears every time a Go negative control is exercised — which would break the
+# mutation harness's "working tree is clean afterwards" guarantee (design §0.4.5) for a
+# reason that has nothing to do with the mutation.
+**/testdata/rapid/
 
 # ─── Node / frontend build output and caches ─────────────────────────────────
 node_modules/
@@ -51,6 +57,7 @@ out/
 playwright-report/
 test-results/
 blob-report/
+.auth/
 # `pnpm-lock.yaml` is committed (design §16.3) — never ignored.
 !frontend/pnpm-lock.yaml
 
@@ -85,3 +92,143 @@ Thumbs.db
 *.log
 tmp/
 .cache/
+# One-shot local scratch: `*.tmp` intermediates and `scripts/_*.py` helpers that
+# generate a committed artifact once and are not part of the build. A script that
+# CI or a Make target invokes never carries the `_` prefix. `scripts/_*.txt` holds
+# long commit messages passed to `git commit -F`, which must not themselves become
+# untracked files — the mutation harness (§0.4.5) requires `git status --porcelain`
+# to be empty after a run, so scratch that is not ignored would fail it.
+*.tmp
+# The rest of the scratch family, added 2026-08-19 after a cleanup found 202 loose files under
+# `.evidence/` and a `.commitmsg.tmp` at the root. `*.tmp` alone did not cover them: captured
+# command output tends to land as `.out`, `.err` or `.hits`, editors and patch tools leave `.bak`,
+# `.orig` and `.rej`, and a half-written replacement lands as `.new`. None of these extensions is
+# tracked anywhere in the tree, so ignoring them costs nothing and keeps
+# `git status --porcelain` empty — which the mutation harness (§0.4.5) requires after a run.
+*.bak
+*.new
+*.hits
+*.err
+*.out
+*.orig
+*.rej
+scripts/_*
+scripts/_*.py
+scripts/_*.sh
+scripts/_*.txt
+# Captured command output kept while working a task (check exit codes, test tails,
+# coverage numbers). Evidence belongs in PROGRESS.md, not in loose files, so this
+# directory is deliberately never committed.
+/.evidence/
+# The comprehension artifact's own working directory. `build-graph.mjs`,
+# `semantic-overlay.json`, `README.md` and `.ua/.understandignore` are authored source and
+# ARE committed. Everything else under `.ua/` is generated on every run — a 1.6 MB
+# knowledge graph, a raw scan of the tree and run metadata. Committing those would put a
+# second, staler copy of the repository's shape under version control and would leave
+# `git status --porcelain` dirty after every regeneration, which the mutation harness
+# (§0.4.5) treats as a failure. `docs/development.md` documents how to rebuild them.
+docs/understand-anything/.ua/*
+!docs/understand-anything/.ua/.understandignore
+
+
+# Captured command output. Not covered until now, which is exactly why 18 of these accumulated
+# at the repository root — 3.83 MB of pytest and agent transcripts named `agent_log4.log`,
+# `auth_failed3.log`, `run_failed.log` and so on. None was ever tracked and none was ever
+# wanted; the pattern was simply missing, so `git status` stayed noisy and the next person had
+# to decide, every time, whether a `.log` at the root mattered.
+#
+# Verified safe before adding: no tracked file anywhere in the repository has a `.log`
+# extension, so this pattern cannot hide something that is under version control. The four
+# `.log` files the comprehension artifact writes under `.ua/intermediate/` are already covered
+# by the rule above; this one catches them a second time, harmlessly.
+*.log
+
+# Personal presentation notes. `PRESENTATION-GUIDE.md` is a demo script and speaking crib
+# written for one person on one day: it holds a walkthrough order, phrasing to use out loud,
+# anticipated questions, and a frank list of gaps to disclose. None of that describes the
+# system, so it does not belong beside `README.md`, `PROGRESS.md` or `docs/` — and unlike
+# those files nothing verifies it, so a committed copy would become a fourth record that
+# drifts and then contradicts the three that are gated.
+#
+# It also names the machine-local setup traps (`make` needs Git Bash, the `LLM_KEY_*` values
+# in `.env` are placeholders), which are true of one workstation and would mislead anyone
+# else who cloned the repository and read them as project documentation.
+PRESENTATION-GUIDE.md
+
+# Local development credentials. `credentials.md` lists the sign-in accounts, the Authentik admin and
+# the infrastructure addresses for a stack that runs on one machine behind 127.0.0.1. None of it is a
+# production secret, and all of it is recreatable from `make init-env` + `provision-authentik.py`,
+# which is exactly why it should not be tracked: a committed credential file is a credential file
+# whether or not the values matter, and the next person to add a real value to it will not notice
+# that the rule changed.
+credentials.md
+
+# Architecture diagrams generated for the presentation, from a snapshot of the tree at one
+# commit. Same reasoning as `PRESENTATION-GUIDE.md` above: nothing gates them, so a committed
+# copy becomes a diagram that describes a tree it no longer matches — the exact defect this
+# repository has spent five sessions correcting in `api.md`, `architecture.md` and
+# `deployment.md`. They carry the commit they were read from and are meant to be regenerated,
+# not maintained. Folding them into `docs/architecture.md` is fine, but only alongside a check
+# that asserts every service they name still exists in `docker-compose.yml`.
+#
+# THAT CONDITION IS NOW MET, 2026-10-08, so the file is TRACKED and removed from this list.
+# `scripts/check-architecture-diagrams.sh` asserts every service the diagrams name exists in the
+# compose files, that the stated service counts match the tree, that the base images match the
+# Dockerfiles, that the journey step count agrees with `PROGRESS.md`, and that both Mermaid blocks
+# still parse. It was verified against a negative control — a wrong count fails the check.
+#
+# The rule was right about the risk and the risk had already materialised: the snapshot had drifted
+# to nine services (there are 22), ten migrations (there are 37), and a journey at four of thirteen
+# steps (it is six). Tracking the file is what let those be the check's business rather than
+# somebody's memory.
+#
+# The rendered archive stays ignored, unchanged below: a binary blob cannot be diffed or reviewed,
+# and `docs/diagrams.zip` is over `check-added-large-files`' limit for exactly that reason.
+
+# The rendered diagrams and their archive, for the same reason as the file above: they are
+# generated from a snapshot of the tree at one commit, nothing gates them, and a committed copy
+# becomes a picture that describes a tree it no longer matches. The archive is also 3.4 MB, which
+# `check-added-large-files` refuses at 2 MB — and it is right to, because a binary blob in git
+# history cannot be diffed or removed.
+docs/diagrams.zip
+docs/diagrams/
+
+# What the journey's agent WRITES into the fixture project.
+#
+# `tests/e2e/fixture-project` is mounted into the agent container read-write because criterion 10's
+# whole point is that the agent applies generated artifacts to a real working tree and step 10 then
+# verifies them on disk with the hashes the backend recorded. So a passing run necessarily leaves
+# them there, plus the `<name>.backup.<timestamp>` copies `mutate` writes beside a pre-existing
+# target before overwriting it — which is what makes the apply reversible.
+#
+# They are OUTPUT, not source. The fixture's own files (`package.json`, `server.js`, `README.md`)
+# stay committed, because they are the input the readiness scorer and the generator read; committing
+# what the generator produced from them would freeze one run's answer as the expected one.
+#
+# The journey resets these at the start of its pairing step, so a rerun is not fighting the previous
+# run's leftovers — the atomic apply correctly refuses a stale pre-image. Ignoring them keeps a test
+# run from also dirtying the checkout.
+tests/e2e/fixture-project/Dockerfile
+tests/e2e/fixture-project/k8s/
+tests/e2e/fixture-project/.forgeops/
+tests/e2e/fixture-project/*.backup.*
+# The three artifact kinds FR-24 added, and the reason this list needed extending: the generator gained
+# GitHub Actions workflows, Helm charts and OpenTofu modules, and nothing extended the ignore list — so a
+# journey run left them in the working tree and a `git add -A` swept them into a commit. The Helm chart is
+# the one that made it visible, because a template is not parseable YAML and `check-yaml` refused it in CI.
+#
+# The chart directory carries a per-run suffix (`charts/onboarding-mti15hj6/`), so the pattern has to be the
+# parent rather than a name.
+tests/e2e/fixture-project/charts/
+tests/e2e/fixture-project/infra/
+tests/e2e/fixture-project/.github/
+
+# Artifacts `scripts/verify-release.py` READS, produced by running the suites locally.
+#
+# They are evidence, not source, and two of them cannot be committed even by accident: a JUnit XML
+# embeds test names and captured output, so the credential-shaped fixtures the suite deliberately
+# exercises appear inside it and `check-added-shapes.py` blocks the commit -- correctly, since the
+# gate matches on shape rather than sensitivity.
+*.junit.xml
+backend/coverage.verify.json
+agent/race.status

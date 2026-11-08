@@ -69,6 +69,9 @@ run_pip_compile \
 	--quiet \
 	pyproject.toml
 
+
+
+
 cd "$REPO_ROOT"
 
 FAILED=0
@@ -84,6 +87,8 @@ for lock in requirements.lock requirements-dev.lock; do
 		FAILED=1
 	fi
 done
+
+
 
 if [ "$FAILED" -eq 1 ]; then
 	exit 1

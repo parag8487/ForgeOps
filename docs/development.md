@@ -5,7 +5,7 @@ IDE to read a build-rules file (conventionally `rules.md`) before anything else;
 does not exist in this workspace and nothing was invented to replace it (open question
 OQ-18). Until such a file is supplied, the rules an agent or contributor must follow are the
 ones written here, and the authoritative sources remain
-`.kiro/specs/phase-0-foundation/design.md` plus the four read-only reference documents at
+`.antigravity/specs/phase-0-foundation/design.md` plus the four read-only reference documents at
 the repository root.
 
 ## Read-only reference documents
@@ -39,6 +39,19 @@ supported shells for these targets.
 
 ## Getting started
 
+### 1-Click Automated Setup on Linux / Ubuntu (`./setup.sh`)
+
+For Linux environments (Ubuntu 22.04 / 24.04 LTS or 20.04 w/ Python 3.10+):
+
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+The master setup script installs Docker CE and Compose V2 plugin, sets up non-root Docker group permissions, balances package-manager locks, configures ports, generates internal CA certificates and secrets in `.env`, runs database migrations, and validates the entire stack against `/health/ready`.
+
+### Manual / Makefile Workflow
+
 ```sh
 make bootstrap      # verify pinned toolchains, install git hooks
 make init-env       # creates .env from .env.example only when .env is absent
@@ -53,9 +66,28 @@ truncates, merges, or overwrites an existing `.env`, so repeated runs leave the 
 byte-identical. Direct `docker compose up -d --wait` works on a fresh clone with no `.env`
 present.
 
-Local endpoints (loopback only): frontend `http://localhost:3000`, backend
-`http://localhost:8000`, OpenAPI `http://localhost:8000/api/v1/openapi.json`. Before
+Local endpoints (loopback only): frontend `http://localhost:3000` (or `13000` if shifted), backend
+`http://localhost:8000` (or `18000`), OpenAPI `http://localhost:8000/api/v1/openapi.json`. Before
 exposing anything, read `docs/deployment.md`.
+
+### Current Compose Services (14 Declared, 10–14 Active)
+
+The active development stack comprises 14 declared services in `docker-compose.yml`, with 10–14 active in the default unprofiled profile:
+
+- Core services: `postgres` (PostgreSQL 17 + pgvector), `redis` (Redis Stack 7.4), `opa` (OPA 1.4.2 policy server), `cerbos` (Cerbos 0.54.0 RBAC sidecar), `authentik-server` & `authentik-worker` (Authentik 2026.5.6 OIDC identity provider), `backend` (FastAPI REST API), `backend-agent` (mTLS listener on port 8443 / 18443 for paired agents), `worker` (ARQ distributed task runner), `frontend` (Next.js 16 App Router UI), `ollama` & `ollama-secondary` (local AI model cascade servers with shared weights), `inngest` (durable execution engine).
+- Optional profile services: `infisical` (`vault` profile), `agent-dev` (`tools` profile with OpenTofu), and the OTel observability tier (`observability` profile: `otel-agent`, `otel-gateway`, `prometheus`, `mimir`, `loki`, `tempo`, `grafana`).
+
+### Autonomous Deployment Verification Gates (G1–G7) & BuildKit Integration
+
+Deployments executed through the Autonomous Deployment Orchestrator pass through 7 sequential gates:
+
+- **G1 (Blueprint Baseline)**: Strategy constraints validation (`docker_github_vercel`, `docker_github`, `vercel_only`, `github_only`), target configuration presence, workspace path resolution, and baseline readiness assessment (R0).
+- **G2 (Synthesis & Template Library)**: Existing manifest evaluation or deterministic multi-stage Dockerfile synthesis for Vite, Node.js, Python, and Go. Consolidates `ENV` instructions (`ENV NODE_ENV=production PORT=...`) and mounts stable tenant/project-scoped npm cache mounts (`id=npm-{clean_tenant}-{clean_proj}`). Computes post-generation readiness (R1).
+- **G3 (Cross-artifact Consistency)**: Static pre-execution audit verifying port range integrity (1–65535), immutability of reserved environment variables, and enforcement of browser-safe host ports (rejecting all 77 Chromium/WHATWG bad ports including 4045).
+- **G4 (Build & Compile)**: Direct Docker Engine daemon integration via Unix Domain Socket (`/var/run/docker.sock`). Integrates the native **BuildKit HTTP API** (`version=2`) with tar streaming, BuildKit trace streaming (`moby.buildkit.trace`), and protobuf decoding. Evaluates the build graph directly without intermediate container commits (saving 808s on Code Review Platform), with sensitive credential exclusion (`.env*`, `*.pem`, `*.key`), symlink boundary confinement, and automatic graceful fallback to the legacy Docker V1 builder.
+- **G5 (Apply)**: Container launch via Docker Engine API over Unix Domain Socket with strict runtime port authority, conflict detection with immutable commands, and environment variable injection (`PORT`, `HOST=0.0.0.0`).
+- **G6 (Workload Convergence)**: Real-time container inspect publication check and live HTTP readiness probing with fast-failure on connection refusal or non-200 responses.
+- **G7 (Final Verification & Cryptographic Receipt)**: Comprehensive multi-target sign-off verifying exact physical container port bindings (`HostConfig.PortBindings`), live remote GitHub commit presence via Git Data API, and Vercel assigned production alias accessibility with SSO redirect bypass and synthetic placeholder rejection.
 
 ## Make targets
 
@@ -124,6 +156,294 @@ in the design appendix. Tests must not use mocks or fake data to manufacture a p
 HTTP servers, real Redis, and real PostgreSQL are used instead of vendor networks or real
 API keys. Backend coverage above 70 % is a reported goal in Phase 0, not a gate.
 
+## Local development on Windows
+
+Everything in this section was learned the expensive way and is written down so it is not
+learned again. The rule it all reduces to: **Python is launched from PowerShell, never from Git
+Bash. Bash runs the `.sh` check scripts and nothing else.**
+
+### Tracked entry points
+
+There is one tracked script per job. None of them is optional scaffolding; each replaced an
+untracked helper that was being rewritten from memory every session.
+
+| Script                           | Job                                                                |
+| :------------------------------- | :----------------------------------------------------------------- |
+| `scripts\local-env.ps1`          | dot-source to get the host-side integration environment            |
+| `scripts\pytest.ps1`             | the only entry point for pytest; loads `local-env.ps1` first       |
+| `scripts\leaf-gate.ps1`          | every fast whole-repo static check, run per leaf before committing |
+| `scripts\secret-gate.ps1`        | the mandatory pre-push secret gate, all stages                     |
+| `scripts\pre-commit-run.ps1`     | the real hook set from `.pre-commit-config.yaml`                   |
+| `scripts\install-pre-commit.ps1` | install `pre-commit` hash-verified from `requirements-tools.lock`  |
+
+### Git Bash and native Windows executables
+
+Git Bash rewrites values that look like absolute POSIX paths when it launches a **native**
+Windows executable. `.env` carries `API_PREFIX=/api/v1`, so any shell that sources `.env` and
+then runs `python.exe` delivers `API_PREFIX=C:/Program Files/Git/api/v1`. Because
+`backend/src/core/config.py` sets `env_file=None`, settings come from the OS environment only;
+`create_app()` then registers a route whose path does not start with `/` and Starlette asserts.
+`scripts/check-route-auth.py` surfaced that as "could not build the app from
+`src.main:create_app`", which reads like a repository defect and is not one — the same command
+from PowerShell passes.
+
+Two MSYS switches look interchangeable and are not:
+
+| Variable              | Governs                | Effect here                                                                              |
+| :-------------------- | :--------------------- | :--------------------------------------------------------------------------------------- |
+| `MSYS2_ENV_CONV_EXCL` | **environment values** | `='*'` stops `API_PREFIX` being rewritten. This is the one that fixes the problem above. |
+| `MSYS_NO_PATHCONV`    | **command arguments**  | `=1` stops argument rewriting — and breaks `check-chokepoint.sh`, which passes           |
+|                       |                        | `scripts/chokepoint_graph.py` to a native `python.exe` that then gets an unconverted     |
+|                       |                        | `/c/...` and reports `can't open file 'C:\c\IMP\...'`.                                   |
+
+Adding the second one alongside the first on a guess cost a full extra lap. Neither is needed
+now: the PowerShell entry points above never create an MSYS boundary for Python to cross.
+`MSYS_NO_PATHCONV=1` is still needed for `docker run -v` and for `git show <ref>:<path>` when
+those are invoked **from bash**.
+
+### PowerShell 5.1 reads UTF-8 as ANSI
+
+`Get-Content` without `-Encoding UTF8` decodes a UTF-8 file using the ANSI code page, and a
+child process's stdout is decoded using the **console** code page. The same en dash therefore
+becomes `â€"` one way and `Γ` the other, so a line compared across the two paths is unequal to
+itself. This produced a false "NEW secret shape" verdict in `secret-gate.ps1` stage 2b, and it
+truncates tool output when a `§` decodes to a control character. Two defences, both used by
+every script here:
+
+```powershell
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+Get-Content -LiteralPath $f -Encoding UTF8
+```
+
+**Never edit a `.md` file through PowerShell string replacement.** The mangling is silent and
+affects every en dash in the file.
+
+### The mutation harness reads a skipped property test as a passing one
+
+`scripts/mutation-harness.py` decides whether a control is real by running the property test with a
+deliberate mutation applied and requiring it to **fail**. A test that **skips** does not fail, so a
+harness run in a shell where `scripts/local-env.ps1` has not been dot-sourced reports `VACUOUS` for
+every DB- or Redis-backed row — the containers are up, but the test skips for want of
+`DATABASE_URL`, and the harness cannot tell "the mutation did not bite" from "the test never ran".
+
+Symptom, exactly as it appears: `tests/meta/test_regime_end_to_end.py` fails two cases,
+`::test_every_check_passes_on_the_real_tree[1.6 mutation harness]` and
+`::test_no_check_modifies_a_tracked_file` (which asserts each invocation exits 0), with
+`the property PASSED under its own negative control` and a pytest line like
+`5 passed, 13 skipped`. **The skip count is the tell.** Nothing is wrong with the tree.
+
+Every shell invocation is a fresh process, so the environment does not survive from one command to
+the next. Dot-source first, in the same process:
+
+```powershell
+. .\scripts\local-env.ps1
+python scripts\mutation-harness.py --all --allow-incomplete --skip-git-check
+```
+
+With the environment exported, every row reports `EXPECTED FAIL / OBSERVED OK`. That was nine rows
+when this note was written (leaf 8.5, 2026-08-02) and is **31** now that Appendix B is fully
+covered — see "Running the mutation harness" below for the current invocation. Making the harness
+distinguish a skip from a pass is the real fix and is not done: it would mean parsing the mutated
+run's report for a skip and reporting a third verdict. Until then, read a `VACUOUS` verdict together
+with the skip count before believing it.
+
+### The `.env` and `ALEMBIC_DATABASE_URL` trap
+
+`make init-env` copies `.env.example` to `.env`. `.env.example` is **Compose-targeted**: its
+DSNs name the Compose services `postgres:5432` and `redis:6379`, which resolve only on the
+Compose network. `.env` is also where `make init-ca` writes the development CA key, so a
+host-side developer has a genuine reason to load it — and loading it wholesale puts
+`ALEMBIC_DATABASE_URL=...@postgres:5432` into the OS environment.
+
+`backend/alembic/env.py` prefers `ALEMBIC_DATABASE_URL` over `DATABASE_URL` **by design**
+(§6.4: the migrator role owns the schema, the application role must not). `os.environ` outranks
+anything a fixture configures. So every DB-backed test errors at setup, inside
+`schema_at_head`'s `alembic downgrade base`, with `socket.gaierror: [Errno 11001] getaddrinfo
+failed` — a failure that names neither the variable nor the file that set it. Nothing about this
+is Windows-specific; a Linux developer who sources `.env` hits it identically.
+
+Two mechanisms address it, and the precedence is deliberately **not** one of them:
+
+1. `scripts/local-env.ps1` reads **no** `.env` at all. It clears every key `.env.example` declares
+   — names only, never values — and then exports one explicit set of host-facing variables.
+   Clearing first is what makes a run reproducible in a shell somebody has already polluted, and it
+   is the only thing that also addresses finding 57: sixty-odd tests assert on what is **absent**
+   from the environment, so an inherited `CERBOS_URL` is as fatal as a loaded one. A guard
+   afterwards reads the Compose file's own service names and fails if any exported value still
+   points at one; it found `OPA_URL=http://opa:8181` on its first run, and later found the same
+   three variables surviving in a parent shell from before this fix.
+
+   An earlier version loaded `.env` in full and overrode only the endpoint variables. That fixed
+   finding 61 and left finding 57 untouched, and the mandatory selection said so: **22 tests
+   failed**. It also exported `.env.example`'s trailing inline comments as part of the values, so
+   pydantic reported `Input should be 'read_only', 'workspace' or 'infrastructure'` for a variable
+   whose value was `read_only`. Both are recorded because the first fix looked right and was
+   measurably wrong.
+
+   `-WithDotEnv` exists for flows that genuinely want `.env`, such as driving `make init-ca` by
+   hand. It is off by default and must never be on for a test run.
+
+2. `alembic/env.py` catches `socket.gaierror` and re-raises naming the host, the variable it came
+   from, and the remedy. Credentials are never printed, only which variable was chosen.
+
+### `.evidence/` is not purely scratch
+
+Most of `.evidence/` is captured command output and is safe to delete — a cleanup on 2026-08-19
+removed 202 such files. **Two entries are load-bearing and must not be deleted:**
+
+| Path               | Consumed by                                                                           | Consequence of deleting it                                                                                        |
+| :----------------- | :------------------------------------------------------------------------------------ | :---------------------------------------------------------------------------------------------------------------- |
+| `.evidence/ak.env` | `scripts/local-env.ps1`                                                               | the two Authentik bootstrap keys disappear and the OIDC integration path loses its configuration; not regenerable |
+| `.evidence/tools/` | `scripts/install-pre-commit.ps1` installs it, `scripts/pre-commit-run.ps1` invokes it | the tracked hook entry point breaks until you re-run the installer                                                |
+
+The directory is gitignored, which makes it look disposable, and the name reinforces that. It is not.
+Anything else under it may be removed freely.
+
+### Test container ports
+
+Five containers, all published on loopback only, all named `forgeops-test-*`. Ports are
+deliberately non-default so a local development stack and the test stack can coexist. The
+PostgreSQL container runs with `POSTGRES_HOST_AUTH_METHOD=trust`, so the local DSNs carry no
+password — there is nothing to leak.
+
+| Container                 | Image                                 | Host port | Used as                     |
+| :------------------------ | :------------------------------------ | :-------- | :-------------------------- |
+| `forgeops-test-pg`        | `pgvector/pgvector:pg17`              | `25432`   | `forgeops_test` database    |
+| `forgeops-test-redis`     | `redis/redis-stack-server:7.4.0-v3`   | `26379`   | db 0 runtime, db 1 tests    |
+| `forgeops-test-cerbos`    | `ghcr.io/cerbos/cerbos:0.54.0`        | `23592`   | `CERBOS_URL`                |
+| `forgeops-test-ak-server` | `ghcr.io/goauthentik/server:2026.5.6` | `9000`    | OIDC issuer                 |
+| `forgeops-test-ak-worker` | `ghcr.io/goauthentik/server:2026.5.6` | —         | Authentik background worker |
+
+Docker Desktop stopping between sessions leaves all five `Exited (255)`. They restart with
+state intact:
+
+```powershell
+docker start forgeops-test-pg forgeops-test-redis forgeops-test-cerbos `
+             forgeops-test-ak-server forgeops-test-ak-worker
+```
+
+### Pushing from a machine with two GitHub accounts
+
+Both remotes carry the account in the URL:
+
+```
+origin  https://parag8487@github.com/parag8487/ForgeOps.git
+mirror  https://parag2-8487@github.com/parag2-8487/forgeops.git
+```
+
+**That is load-bearing, not cosmetic.** Without the `user@` prefix, Git Credential Manager cannot tell
+which of the two stored accounts a URL belongs to, so it opens an account-selection dialog — and an
+agent session or a script has no way to answer one. Worse, when it guessed wrong it produced two
+failures that look like something else entirely:
+
+- `origin` answered **"Repository not found"** intermittently. `parag8487/ForgeOps` is private, so a
+  request authenticated as the _other_ account gets a 404 rather than a 403 — GitHub does not reveal that
+  a private repository exists. The repository was never missing; the credential was the wrong one.
+- `mirror` answered **403 "Permission denied"** when the credential was the `parag8487` account, which
+  holds only `READ` there.
+
+**Which remote runs CI.** `parag8487/ForgeOps` has no Actions minutes left: every workflow fails in
+3–10 seconds with no step ever starting, which is the billing signal rather than a test failure. So CI
+evidence comes from `mirror`, where the same five workflows run normally. Push to both; read conclusions
+from the mirror.
+
+Nothing here stores a credential. The `user@` prefix is a username, not a secret, and each account's
+token stays where it already was — in the credential manager for one and in the gitignored
+`credentials.md` for the other.
+
+### Running the suite: the two-chunk split
+
+The whole backend suite passes 1,476 tests and takes over an hour, which exceeds the shell
+timeout available to an agent session. It is therefore run in two chunks, and only **once per
+task group** — never per leaf:
+
+```powershell
+scripts\pytest.ps1 -q tests/unit tests/meta tests/property
+scripts\pytest.ps1 -q tests/integration
+```
+
+Per leaf, run the leaf's own tests plus the mandatory selection, plus `leaf-gate.ps1`:
+
+```powershell
+scripts\pytest.ps1 -q tests/unit/test_<leaf>.py
+scripts\pytest.ps1 -q -m mandatory --report-log=../.evidence/mand.jsonl
+backend\.venv\Scripts\python.exe scripts\check-no-skips.py .evidence\mand.jsonl
+powershell -File scripts\leaf-gate.ps1
+```
+
+`check-no-skips.py` consumes a `--report-log` JSONL or `go test -json` events, so it is a
+property of a test **run** and cannot be part of the static gate.
+
+### Running the mutation harness
+
+The harness applies each declared mutation, runs the owning property test, and requires it to
+**fail**. A property that survives its own control is reported `VACUOUS`. All 31 Appendix B
+properties are covered, so `--allow-incomplete` is no longer needed.
+
+```powershell
+. .\scripts\local-env.ps1
+$env:GOFLAGS = "-p=1"
+$env:GOMAXPROCS = "2"
+backend\.venv\Scripts\python.exe scripts\mutation-harness.py --all
+```
+
+**`GOFLAGS=-p=1` is not optional on a 16-core Windows box.** `go build` defaults to one compiler
+process per CPU, and sixteen of them exhaust the Windows page file rather than RAM. The failure does
+not look like resource exhaustion — it looks like a broken toolchain:
+
+```
+fatal error: pageAlloc: out of memory
+compile.exe: fork/exec ...: The paging file is too small for this operation to complete.
+```
+
+With `-p=1` the whole agent module builds in about 364 s. Eleven of the 31 rows are Go rows that
+each rebuild the package under a `-overlay`, so this setting decides whether the run completes at
+all. Raising the page file also works and is the heavier option; limiting parallelism changes
+nothing outside the process.
+
+**Containers the run needs.** Twenty of the 31 rows are Python rows whose property tests are
+Postgres- or Redis-backed. Start the documented test containers first (see "Test container ports"
+above) — a stopped container produces a `VACUOUS` verdict with a high skip count, not an error:
+
+```powershell
+docker start forgeops-test-pg forgeops-test-redis forgeops-test-cerbos
+```
+
+**Redis Stack, not plain Redis.** The L2 semantic-cache tests in
+`backend/tests/integration/test_semantic_cache.py` and the BM25 sparse index both need
+`redis/redis-stack-server`. Plain `redis` starts, answers `PING`, and then fails those tests for
+reasons that read like application bugs. `forgeops-test-redis` is already the Stack image; if you
+substitute your own, match it.
+
+**Selecting rows.** `--only Q-13 Q-23` runs a subset, which is how a single new control is verified
+before it is committed. `--skip-git-check` suppresses the clean-tree assertion and exists for a
+working tree that is legitimately dirty mid-task; it must never reach CI, and
+`tests/meta/test_mutation_harness.py::test_the_clean_tree_clause_is_enabled_in_ci` asserts that.
+
+### Regenerating the Q-06 governance corpus
+
+`Q-06` is cross-runtime: the backend maps its stage-1 payload through
+`src.policies.opa.governance_input` and asks an OPA **server**, while the agent evaluates the same
+bundle in-process through OPA's Go Rego library. They cannot both be called from one process, so
+`scripts/gen-governance-fixtures.py` drives the Python side and commits the mapped inputs together
+with the decisions OPA returned; `agent/internal/policy/q06_property_test.go` re-derives the agent
+side and compares. Same asymmetric two-way lock as `Q-14`'s envelope corpus.
+
+Regenerate only when the bundle or the mapping changes. It needs an OPA server holding
+`policies/agent`, which is **not** what the Compose `opa` service serves — that one carries the MCP
+gateway policy and answers this document as undefined:
+
+```powershell
+$pol = (Resolve-Path policies\agent).Path
+docker run -d --name fo-opa-agent -p 8182:8181 -v "${pol}:/policies:ro" `
+  openpolicyagent/opa:1.4.2 run --server --addr 0.0.0.0:8181 /policies
+backend\.venv\Scripts\python.exe scripts\gen-governance-fixtures.py --opa-url http://127.0.0.1:8182
+```
+
+The generator refuses to write a corpus whose decisions are all identical — such a corpus cannot
+tell an agreeing agent from one that returns a constant — and the Go test carries both a
+corpus-size floor and a distinct-decision floor that may be raised but never lowered.
+
 ## Error and API conventions
 
 Every non-2xx backend response is an RFC 9457 problem document with
@@ -163,6 +483,61 @@ four-document exclusion applies only to mutating hooks; Gitleaks still scans all
 Never commit real secrets: `.env.example` contains placeholder values only, and `.env` is
 git-ignored.
 
+### The pre-push gate — three stages, not two
+
+`.antigravity/steering/secret-safety.md` mandates a scan before any push. Run **all three** stages;
+each catches something the others cannot, and stage 3 is the one that has actually blocked a
+push in this repository.
+
+1. **`gitleaks`** over the working tree and the staged change:
+
+   ```sh
+   gitleaks detect  --no-banner --redact
+   gitleaks protect --staged --no-banner --redact
+   ```
+
+   Use the pinned Docker image if the binary is absent; never skip the scan for want of a
+   binary. `gitleaks` scores **likelihood**. The rules below are about **shape**, which is a
+   different question, so a clean `gitleaks` is not a clearance.
+
+2. **High-risk pattern grep, applied to two units.** The pattern list is in
+   `secret-safety.md`. Grep (a) the **added** lines of the diff, and (b) the **full content**
+   of every file in the push. (b) matters because a shape sitting in a file's unchanged region
+   never appears in a diff and is still being published. Classify (b)'s hits against the file
+   as it exists on the remote: a line already on the remote is pre-existing, and a line that
+   is not is new and blocks.
+
+3. **Every commit in the push range, separately.** For each commit in
+   `origin/<branch>..HEAD`, grep that commit's own added lines.
+
+   ```sh
+   for c in $(git rev-list origin/<branch>..HEAD); do
+     git show "$c" --format= --unified=0 | grep -E '^\+' | grep -vE '^\+\+\+ ' | grep -niE "<patterns>"
+   done
+   ```
+
+   **Why this stage exists.** GitHub secret scanning and GitGuardian read each pushed commit
+   individually, not the range's net diff. A range whose cumulative diff is clean can still
+   contain an intermediate commit that introduced a shape and a later one that removed it —
+   and pushing the range publishes the intermediate blob. `REVIEW-PHASE-0.md` Pass 2 recorded
+   exactly that: GitGuardian went red on a pull-request head because an earlier commit still
+   carried a literal the tip had already removed.
+
+   If stage 3 blocks and the commits are **unpushed**, rebuild them so no commit ever
+   contained the shape, and prove it with `git diff <old-tip> <new-tip>` returning **empty** —
+   history changed, content did not. That repair is trivial before a push and becomes a
+   force-push over published history after one.
+
+Two implementation notes if you script this on Windows: export `MSYS_NO_PATHCONV=1`, because
+MSYS rewrites `git show <ref>:<path>` and the baseline lookup then silently returns nothing;
+and normalise line endings before comparing, because `git show` emits the blob at LF while the
+working copy is CRLF.
+
+If any stage reports a hit you did not introduce and cannot attribute, **stop and ask**. Do not
+grant yourself a "it is only prose" exemption — that puts a human in the loop for every future
+hit, which is a convention rather than a mechanism. See `docs/LEARNING-JOURNAL.md` chapter 9,
+pattern L.
+
 ## Documentation checks
 
 `scripts/check-docs.sh` validates the documentation set: the four `docs/` files exist, the
@@ -170,3 +545,44 @@ local-development-only warning appears in the first paragraph of `docs/deploymen
 Phase 0 route names are documented, the health/readiness distinction and RFC 9457 contract
 are stated, the licence identifiers are correct, and the non-registered FSL alias is absent.
 Run it with `sh scripts/check-docs.sh`.
+
+## Comprehension artifact
+
+`docs/understand-anything/` holds an interactive knowledge graph of this repository — every
+analysed file, function and class as a node, with tree-sitter-derived import edges, fourteen
+architectural layers and a dependency-ordered guided tour. It is generated by
+[Understand-Anything](https://github.com/Egonex-AI/Understand-Anything) pinned at **v2.9.0**
+(commit `f08763d11d0202a8a8f52b5dedda6d1b2e2ebac8`), installed at user level outside this
+repository. `docs/understand-anything/README.md` documents the layout, the exclusions, and
+which parts of the graph are machine-derived versus authored.
+
+Open it with Node.js ≥ 18. The viewer serves the graph read-only from local disk and makes no
+LLM calls and no network requests once the package is cached:
+
+```sh
+npx https://github.com/Egonex-AI/Understand-Anything/releases/download/v2.9.0/understand-anything-viewer.tgz docs/understand-anything
+```
+
+Regenerate it in two steps from the repository root. Step 1 is the plugin's deterministic file
+inventory; step 2 resolves imports, extracts structure, assembles the graph and validates it:
+
+```sh
+node "$HOME/.understand-anything/Understand-Anything-2.9.0/understand-anything-plugin/skills/understand/scan-project.mjs" \
+     . docs/understand-anything/.ua/intermediate/scan-result.raw.json
+node docs/understand-anything/build-graph.mjs
+```
+
+On Windows PowerShell the first path is `"$HOME\.understand-anything\…"`; everything else is
+identical.
+
+`build-graph.mjs` writes nothing when validation finds an issue, and exits non-zero when the
+inventory is empty or when any analysed path has no rule in `semantic-overlay.json` — so a new
+top-level directory forces a decision instead of landing in a default bucket. Update
+`semantic-overlay.json` in the same commit as source changes that alter what a directory is
+for.
+
+`.antigravity/steering/learning-journal.md` requires regenerating this artifact whenever a group of
+task leaves completes, and recording the date in the log at the bottom of
+`docs/understand-anything/README.md`. Step 1's scanner prefers `git ls-files -co
+--exclude-standard` for its inventory, which is why the exclusion list is short — files git
+already ignores never enter it.

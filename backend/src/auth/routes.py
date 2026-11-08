@@ -1,0 +1,461 @@
+# SPDX-License-Identifier: FSL-1.1-ALv2
+"""`/api/v1/auth/*` — login, callback, refresh, logout (design.md §3.5, §11.2, §13.1).
+
+All four routes are in `PUBLIC_ROUTES` and none carries `require_principal`: the flow
+that *creates* a principal cannot require one, and logout must succeed after the access
+token has already expired. That exemption is committed in `public_routes.py` with its
+reason, and `scripts/check-route-auth.py` asserts the set against the real router — so
+these four being unauthenticated is a deliberate, reviewed fact rather than an omission.
+
+The cookie carries the refresh token; the body carries the access token
+--------------------------------------------------------------------------
+§3.5 requires an httpOnly `SameSite=Lax` cookie and the access token in the body. The
+split is the point: the access token is short-lived and the frontend must send it as a
+bearer header on every call, so script has to be able to read it; the refresh token is
+long-lived, is never needed by script, and is therefore put where script cannot reach
+it. Putting the access token in the cookie too would make every authenticated request
+ambiently authorised and reintroduce CSRF on the whole API. `sessions.py` documents why
+it is the refresh token in the cookie rather than an opaque session id.
+
+`next` is validated, not trusted
+--------------------------------
+`/login?next=` is an open-redirect surface if it is echoed back. Only a same-origin
+absolute path is accepted; anything else falls back to `/`. The value is returned in the
+callback's JSON body rather than issued as a `Location`, so even a bypass could not
+produce a redirect to another origin from this endpoint.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Final
+from urllib.parse import urlsplit, urlunsplit
+
+from fastapi import APIRouter, Depends, Request, Response
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.responses import JSONResponse, RedirectResponse
+
+from ..core.db import get_session
+from ..core.errors import problem
+from .oidc import (
+    PKCE_STATE_KEY_PREFIX,
+    PKCE_STATE_TTL_SECONDS,
+    OidcClient,
+    PendingLogin,
+    TokenResponse,
+    access_token_expiry,
+    role_from_groups,
+)
+from .sessions import SessionService
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+#: Environments in which the session cookie may travel over plain HTTP. Anything else
+#: gets `Secure`, so a production deployment cannot accidentally ship a cookie that a
+#: downgraded connection can read.
+_INSECURE_COOKIE_ENVS: Final[frozenset[str]] = frozenset({"local", "development", "dev", "test"})
+
+#: The default landing path when `next` is absent or rejected.
+_DEFAULT_NEXT: Final[str] = "/"
+
+
+def _safe_next(raw: str | None) -> str:
+    """A same-origin absolute path, or `/`.
+
+    Three rejections, each for a concrete reason: anything not starting with `/` could
+    be an absolute URL to another origin; anything starting with `//` is
+    protocol-relative and *is* another origin; anything containing a backslash is
+    rejected because some user agents normalise `/\\evil.example` into a
+    protocol-relative URL, which would slip past a check that only looked for `//`.
+
+    A colon elsewhere in the path is fine — `/a:b` is a legal same-origin path and no
+    user agent reads it as a scheme once it begins with `/`.
+    """
+    if not raw or not raw.startswith("/"):
+        return _DEFAULT_NEXT
+    if raw.startswith("//") or "\\" in raw:
+        return _DEFAULT_NEXT
+    return raw
+
+
+def _wants_html(request: Request) -> bool:
+    """True for a browser's top-level navigation, false for a programmatic caller.
+
+    The callback has two genuinely different callers and one of them cannot read JSON usefully.
+    `test_auth_oidc_flow.py` drives it with an API client and asserts on the token body; a person
+    arrives via a 302 from the IdP with `Accept: text/html,...`. Negotiating on `Accept` keeps both
+    working off one route rather than adding a second callback that would need its own copy of the
+    state-consumption and nonce checks — and duplicating those is how one copy ends up missing a
+    check.
+
+    `text/html` must be explicitly present. A missing or `*/*` Accept header is treated as
+    programmatic, so the default for anything ambiguous is the JSON body the tests rely on.
+    """
+    return "text/html" in request.headers.get("accept", "").lower()
+
+
+def _resolve_redirect_url(request: Request, configured_redirect_url: str) -> str:
+    """Resolve the public callback redirect URI for the OIDC authorization request.
+
+    Respects reverse-proxy headers (X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-Port)
+    or the incoming request Host header when running in containerised/remote environments
+    (such as Ubuntu published on non-default ports like 18000 or public IP addresses),
+    while preserving explicit non-local configured URLs and test environments.
+    """
+    if not configured_redirect_url:
+        configured_redirect_url = "http://localhost:8000/api/v1/auth/callback"
+    parsed = urlsplit(configured_redirect_url)
+    if parsed.hostname == "testserver" or request.url.hostname == "testserver":
+        return configured_redirect_url
+    callback_path = parsed.path or "/api/v1/auth/callback"
+
+    settings = getattr(request.app.state, "settings", None)
+    backend_port = getattr(settings, "backend_port", None)
+
+    # Forwarded / reverse-proxy headers or direct request host
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",")[0].strip()
+    forwarded_host = (
+        (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc)
+        .split(",")[0]
+        .strip()
+    )
+    forwarded_port = (request.headers.get("x-forwarded-port") or "").split(",")[0].strip()
+
+    if forwarded_host:
+        host = forwarded_host
+        if (
+            forwarded_port
+            and ":" not in host
+            and not ((proto == "http" and forwarded_port == "80") or (proto == "https" and forwarded_port == "443"))
+        ):
+            host = f"{host}:{forwarded_port}"
+        elif ":" not in host and backend_port and backend_port not in (80, 443):
+            host = f"{host}:{backend_port}"
+
+        if parsed.hostname in ("localhost", "127.0.0.1", "testserver", None) or parsed.netloc == host:
+            return urlunsplit((proto, host, callback_path, "", ""))
+
+    if settings and parsed.hostname in ("localhost", "127.0.0.1"):
+        if backend_port and parsed.port != backend_port:
+            return urlunsplit((parsed.scheme, f"{parsed.hostname}:{backend_port}", callback_path, "", ""))
+
+    return configured_redirect_url
+
+
+def _resolve_frontend_landing(request: Request, next_path: str) -> str:
+    """Resolve the browser landing URL after successful authentication.
+
+    Ensures the user returns to the publicly accessible application origin on Ubuntu
+    (whether accessed via localhost, LAN IP, or reverse proxy), respecting frontend
+    port configuration (e.g. 13000 vs 3000).
+    """
+    settings = request.app.state.settings
+    configured = str(settings.frontend_base_url or "").rstrip("/")
+    if not configured:
+        configured = "http://localhost:3000"
+
+    parsed = urlsplit(configured)
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",")[0].strip()
+    forwarded_host = (
+        (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc)
+        .split(",")[0]
+        .strip()
+    )
+
+    fe_port = getattr(settings, "frontend_port", None) or parsed.port
+    if not fe_port and parsed.hostname in ("localhost", "127.0.0.1"):
+        fe_port = 13000 if getattr(settings, "backend_port", None) == 18000 else 3000
+
+    if parsed.hostname in ("localhost", "127.0.0.1") and forwarded_host:
+        req_host_only = forwarded_host.split(":")[0]
+        if req_host_only and req_host_only != "testserver":
+            port_suffix = f":{fe_port}" if fe_port and fe_port not in (80, 443) else ""
+            return f"{proto}://{req_host_only}{port_suffix}{next_path}"
+
+    return f"{configured}{next_path}"
+
+
+def _client(request: Request) -> OidcClient:
+    client = getattr(request.app.state, "oidc_client", None)
+    if client is None:
+        # A composition error, not a fact about the caller — the same reasoning as
+        # `dependencies.require_principal`. A 500 with a stack trace is what a wiring
+        # bug deserves; the §0.4.1 wiring test is what stops it reaching a deployment.
+        raise RuntimeError(
+            "app.state.oidc_client is not composed; the auth flow depends on it "
+            "(design §11.2). create_app() must build it in the lifespan."
+        )
+    return client
+
+
+def _sessions(request: Request) -> SessionService:
+    service = getattr(request.app.state, "session_service", None)
+    if service is None:
+        raise RuntimeError(
+            "app.state.session_service is not composed; the auth flow depends on it "
+            "(design §11.2). create_app() must build it in the lifespan."
+        )
+    return service
+
+
+def _set_session_cookie(request: Request, response: Response, refresh_token: str) -> None:
+    settings = request.app.state.settings
+    response.set_cookie(
+        key=settings.session_cookie_name,
+        value=refresh_token,
+        max_age=settings.refresh_ttl_seconds,
+        httponly=True,
+        samesite="lax",
+        secure=str(settings.app_env).lower() not in _INSECURE_COOKIE_ENVS,
+        path="/",
+    )
+
+
+def _clear_session_cookie(request: Request, response: Response) -> None:
+    settings = request.app.state.settings
+    response.delete_cookie(
+        key=settings.session_cookie_name,
+        httponly=True,
+        samesite="lax",
+        secure=str(settings.app_env).lower() not in _INSECURE_COOKIE_ENVS,
+        path="/",
+    )
+
+
+async def _store_pending(request: Request, state: str, pending: PendingLogin) -> None:
+    await request.app.state.redis.set(
+        f"{PKCE_STATE_KEY_PREFIX}{state}",
+        pending.to_json(),
+        ex=PKCE_STATE_TTL_SECONDS,
+    )
+
+
+async def _take_pending(request: Request, state: str) -> PendingLogin | None:
+    """Consume the pending-login record. Single-use, atomically.
+
+    `GETDEL` rather than `GET` then `DELETE`: the two-step version lets a replayed
+    `state` be accepted twice if both arrive before the delete lands, which is exactly
+    the race the single-use rule exists to close.
+    """
+    raw = await request.app.state.redis.getdel(f"{PKCE_STATE_KEY_PREFIX}{state}")
+    if raw is None:
+        return None
+    try:
+        return PendingLogin.from_json(raw)
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+# `operation_id` is EXPLICIT on the three dual-method routes, and that is a determinism fix rather than a
+# naming preference.
+#
+# FastAPI derives an operationId from the handler name and ONE of the route's methods, taken from a set —
+# so `/login` registered for GET and POST produced `login_api_v1_auth_login_get` in one process and
+# `login_api_v1_auth_login_post` in the next, depending on hash randomisation. `docs/openapi.json` was
+# therefore non-deterministic, and `dump-openapi.py --check` passed or failed by luck: it reported the file
+# stale immediately after writing it. The isolation that script re-execs itself for was an attempt at this
+# same symptom and could not fix it, because the cause is set ordering inside FastAPI rather than the
+# environment.
+#
+# Each METHOD is registered separately rather than through one `api_route(methods=["GET", "POST"])`, so the
+# two ids are distinct. A single shared id would be deterministic and still wrong: FastAPI warns
+# `Duplicate Operation ID` because two path-operations carrying one id make a generated client collide on
+# the method name. Stacked decorators on one handler keep the behaviour identical -- the same function
+# serves both -- while giving the document two nameable operations.
+@router.get("/login", operation_id="auth_login_get")
+@router.post("/login", operation_id="auth_login_post")
+async def login(request: Request) -> RedirectResponse:
+    """Begin the authorization-code + PKCE flow (§3.5 steps 2–3).
+
+    302 rather than a JSON body carrying the URL: the browser has to end up at the IdP,
+    and a redirect keeps that a property of the endpoint instead of something every
+    caller has to reimplement.
+    """
+    client = _client(request)
+    redirect_uri = _resolve_redirect_url(request, client.redirect_url)
+    next_path = _safe_next(request.query_params.get("next"))
+    authorization, pending = await client.authorization_request(next_path=next_path, redirect_uri=redirect_uri)
+    await _store_pending(request, authorization.state, pending)
+    # 302 and not 307: the browser must issue a GET to the IdP regardless of how it
+    # reached /login, and 307 would preserve a POST.
+    return RedirectResponse(url=authorization.url, status_code=302)
+
+
+@router.get("/callback", operation_id="auth_callback_get")
+@router.post("/callback", operation_id="auth_callback_post")
+async def callback(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    """Complete the exchange, upsert the user, open a session (§3.5 steps 5–11)."""
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    if not code or not state:
+        raise problem("unauthenticated")
+
+    pending = await _take_pending(request, state)
+    if pending is None:
+        # Covers an unknown state, an expired one, and a REPLAYED one — the record is
+        # consumed by the first use, so a second callback with the same state lands
+        # here. One response for all three: which of them it was is not information the
+        # caller needs, and the one who benefits from knowing is the one guessing.
+        raise problem("unauthenticated")
+
+    client = _client(request)
+    tokens = await client.exchange_code(
+        code=code,
+        verifier=pending.verifier,
+        redirect_uri=pending.redirect_uri or None,
+    )
+    body = await _open_session(request, session, tokens, nonce=pending.nonce)
+    body["next"] = pending.next_path
+
+    response: Response
+    if _wants_html(request):
+        # A BROWSER got here by following the IdP's redirect, and a JSON token document is not
+        # somewhere a person can be left standing. Bounce it into the app.
+        #
+        # No token in the URL, deliberately. A query parameter would be written to the browser
+        # history, sent in the `Referer` of the next outbound request, and captured by any access
+        # log along the way. The session cookie set below is `httpOnly`, and the app mints its
+        # access token from it by calling `POST /auth/refresh` once it loads — so the credential
+        # never becomes part of a URL, and the SPA still gets a bearer token to send.
+        landing = _resolve_frontend_landing(request, pending.next_path)
+        response = RedirectResponse(url=landing, status_code=302)
+    else:
+        response = JSONResponse(body)
+
+    if tokens.refresh_token:
+        _set_session_cookie(request, response, tokens.refresh_token)
+    return response
+
+
+@router.post("/refresh")
+async def refresh(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    """Rotate the session and return a fresh access token."""
+    settings = request.app.state.settings
+    presented = request.cookies.get(settings.session_cookie_name)
+    if not presented:
+        raise problem("unauthenticated")
+
+    service = _sessions(request)
+    current = await service.find_active(session, refresh_token=presented)
+    if current is None:
+        # Not found, expired, or already rotated. A replayed token that was rotated a
+        # moment ago lands here, which is the detection the revoke-then-insert scheme
+        # buys (see sessions.py).
+        raise problem("unauthenticated")
+
+    client = _client(request)
+    tokens = await client.refresh(refresh_token=presented)
+    # An IdP that does not rotate returns no new refresh token; carrying the presented
+    # one forward keeps the cookie valid rather than silently ending the session.
+    new_refresh = tokens.refresh_token or presented
+    rotated = await service.rotate(session, current=current, new_refresh_token=new_refresh)
+
+    claims = await _verified_id_claims(request, tokens, nonce=None)
+    body = _token_body(tokens, claims, session_id=rotated.id)
+    # THE ROLE, which this endpoint used not to return.
+    #
+    # `/callback` returned `role`; `/refresh` did not. A browser reaches the app through the callback
+    # ONCE and then mints every subsequent access token here — including on every reload — so in
+    # practice the client never saw a role at all, and the UI modelled none. Three routes require
+    # ADMIN or DEVELOPER (`DELETE /agents/{id}`, `GET /audit/verify`,
+    # `POST /agents/pairing-codes`), and without this the first feedback on those buttons was a 403.
+    #
+    # Extending the existing body rather than adding a `GET /auth/me`: the client already calls this
+    # on load to obtain a bearer token, so the role arrives with no extra round trip and there is no
+    # window in which the app is authenticated but does not know what it may do.
+    resolved = await service.load_user(session, user_id=rotated.user_id)
+    if resolved is not None:
+        body.update({"user_id": str(resolved.id), "email": resolved.email, "role": resolved.role.value})
+    response = JSONResponse(body)
+    _set_session_cookie(request, response, new_refresh)
+    return response
+
+
+@router.get("/logout", operation_id="auth_logout_get")
+@router.post("/logout", operation_id="auth_logout_post")
+async def logout(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    """End the session and clear the cookie. Always 200 (§4.4).
+
+    Deliberately succeeds when there is no live session: the common case is a user
+    clicking log out after their token expired, and a 401 there would leave the cookie
+    in place — the browser would keep presenting a credential the server has already
+    forgotten.
+    """
+    settings = request.app.state.settings
+    presented = request.cookies.get(settings.session_cookie_name)
+    if presented:
+        await _sessions(request).revoke_by_token(session, refresh_token=presented)
+
+    response = JSONResponse({"status": "logged_out"})
+    _clear_session_cookie(request, response)
+    return response
+
+
+async def _verified_id_claims(request: Request, tokens: TokenResponse, *, nonce: str | None) -> Any:
+    verifier = getattr(request.app.state, "id_token_verifier", None)
+    if verifier is None:
+        raise RuntimeError(
+            "app.state.id_token_verifier is not composed; the auth flow depends on it "
+            "(design §11.2). create_app() must build it in the lifespan."
+        )
+    return await verifier.verify_id_token(tokens.id_token, nonce=nonce)
+
+
+async def _open_session(
+    request: Request,
+    session: AsyncSession,
+    tokens: TokenResponse,
+    *,
+    nonce: str,
+) -> dict[str, Any]:
+    claims = await _verified_id_claims(request, tokens, nonce=nonce)
+    raw = claims.raw
+
+    role = role_from_groups(raw.get("groups"))
+    email = str(raw.get("email") or "")
+    name = str(raw.get("name") or raw.get("preferred_username") or email or claims.sub)
+
+    service = _sessions(request)
+    user = await service.upsert_user(
+        session,
+        idp_subject=claims.sub,
+        email=email or f"{claims.sub}@users.noreply.invalid",
+        name=name,
+        role=role,
+    )
+    # No refresh token means no session to persist. An IdP that was not asked for — or
+    # refuses — `offline_access` returns none, and inserting a row keyed on
+    # `HMAC(pepper, "")` would create a lookup key every future tokenless login shares,
+    # so `find_active` would match an arbitrary one of them. The access token still
+    # works until it expires; the caller simply cannot refresh, which is the truth.
+    session_id: Any = None
+    if tokens.refresh_token:
+        opened = await service.create_session(
+            session,
+            user_id=user.id,
+            refresh_token=tokens.refresh_token,
+            idp_session_id=str(raw.get("sid") or "") or None,
+        )
+        session_id = opened.id
+    body = _token_body(tokens, claims, session_id=session_id)
+    body.update({"user_id": str(user.id), "email": user.email, "role": user.role.value})
+    return body
+
+
+def _token_body(tokens: TokenResponse, claims: Any, *, session_id: Any) -> dict[str, Any]:
+    """The response body. Carries the access token and nothing derived from a secret."""
+    return {
+        "access_token": tokens.access_token,
+        "token_type": "Bearer",
+        "expires_in": access_token_expiry(tokens.access_token, tokens.expires_in),
+        "session_id": None if session_id is None else str(session_id),
+        "subject": claims.sub,
+    }

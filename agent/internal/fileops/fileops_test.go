@@ -2,7 +2,7 @@
 package fileops
 
 import (
-	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,197 +10,134 @@ import (
 	"testing"
 )
 
-func TestApplyAtomic_Basic(t *testing.T) {
+// The `TestApplyAtomic_*` tests that used to live here moved to
+// `agent/internal/executor/internal/mutate` with the algorithm they guard (D-45). A
+// property that guards an algorithm has to live where the algorithm lives, or it guards
+// the location instead.
+//
+// What remains here is what remains in the package: the two exported path resolvers and
+// the diff renderer.
+
+func TestResolveForWrite_RejectsTraversal(t *testing.T) {
 	root := t.TempDir()
-
-	ops := New()
-	report, err := ops.ApplyAtomic(context.Background(), root, []WriteEntry{
-		{RelPath: "hello.txt", Content: []byte("hello world"), Mode: 0o644},
-		{RelPath: "sub/nested.txt", Content: []byte("nested content"), Mode: 0o644},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(report.Written) != 2 {
-		t.Errorf("written = %d, want 2", len(report.Written))
-	}
-
-	// Verify content
-	got, _ := os.ReadFile(filepath.Join(root, "hello.txt"))
-	if string(got) != "hello world" {
-		t.Errorf("content = %q", string(got))
-	}
-	got, _ = os.ReadFile(filepath.Join(root, "sub", "nested.txt"))
-	if string(got) != "nested content" {
-		t.Errorf("nested content = %q", string(got))
+	for _, relPath := range []string{"../escape.txt", "../../etc/passwd", "sub/../../../out.txt"} {
+		if _, err := ResolveForWrite(root, relPath); !errors.Is(err, ErrPathOutsideRoot) {
+			t.Errorf("ResolveForWrite(%q) = %v, want ErrPathOutsideRoot", relPath, err)
+		}
 	}
 }
 
-func TestApplyAtomic_BackupBeforeMutate(t *testing.T) {
+func TestResolveForRead_RejectsTraversal(t *testing.T) {
 	root := t.TempDir()
-	existing := filepath.Join(root, "exists.txt")
-	os.WriteFile(existing, []byte("original"), 0o644)
-
-	ops := New()
-	report, err := ops.ApplyAtomic(context.Background(), root, []WriteEntry{
-		{RelPath: "exists.txt", Content: []byte("updated"), Mode: 0o644},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(report.Backups) != 1 {
-		t.Fatalf("expected 1 backup, got %d", len(report.Backups))
-	}
-
-	// Verify backup contains original
-	backupData, _ := os.ReadFile(report.Backups[0])
-	if string(backupData) != "original" {
-		t.Errorf("backup content = %q, want original", string(backupData))
-	}
-
-	// Verify new content
-	got, _ := os.ReadFile(existing)
-	if string(got) != "updated" {
-		t.Errorf("updated content = %q", string(got))
+	for _, relPath := range []string{"../escape.txt", "sub/../../../out.txt"} {
+		if _, err := ResolveForRead(root, relPath); !errors.Is(err, ErrPathOutsideRoot) {
+			t.Errorf("ResolveForRead(%q) = %v, want ErrPathOutsideRoot", relPath, err)
+		}
 	}
 }
 
-func TestApplyAtomic_TraversalRejected(t *testing.T) {
+func TestResolve_RejectsAbsolutePaths(t *testing.T) {
 	root := t.TempDir()
-	ops := New()
-
-	_, err := ops.ApplyAtomic(context.Background(), root, []WriteEntry{
-		{RelPath: "../escape.txt", Content: []byte("bad"), Mode: 0o644},
-	})
-	if err == nil {
-		t.Fatal("expected error for path traversal")
-	}
-	if !strings.Contains(err.Error(), "outside root") {
-		t.Errorf("error should mention outside root: %v", err)
-	}
-}
-
-func TestApplyAtomic_AbsolutePathRejected(t *testing.T) {
-	root := t.TempDir()
-	ops := New()
-
-	var absPath string
+	absPath := "/etc/passwd"
 	if runtime.GOOS == "windows" {
 		absPath = "C:\\Windows\\System32\\evil.txt"
-	} else {
-		absPath = "/etc/passwd"
 	}
-
-	_, err := ops.ApplyAtomic(context.Background(), root, []WriteEntry{
-		{RelPath: absPath, Content: []byte("bad"), Mode: 0o644},
-	})
-	if err == nil {
-		t.Fatal("expected error for absolute path")
+	if _, err := ResolveForWrite(root, absPath); !errors.Is(err, ErrPathOutsideRoot) {
+		t.Errorf("ResolveForWrite(%q) = %v, want ErrPathOutsideRoot", absPath, err)
+	}
+	if _, err := ResolveForRead(root, absPath); !errors.Is(err, ErrPathOutsideRoot) {
+		t.Errorf("ResolveForRead(%q) = %v, want ErrPathOutsideRoot", absPath, err)
 	}
 }
 
-func TestApplyAtomic_SymlinkEscape(t *testing.T) {
+func TestResolve_RejectsASymlinkEscape(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("symlink test requires Unix")
+		t.Skip("platform-only: posix - symlink creation and traversal semantics differ on Windows (D-68)")
 	}
-
 	root := t.TempDir()
 	outside := t.TempDir()
-
-	// Create a symlink inside root that points outside
-	link := filepath.Join(root, "escape-link")
-	os.Symlink(outside, link)
-
-	ops := New()
-	_, err := ops.ApplyAtomic(context.Background(), root, []WriteEntry{
-		{RelPath: "escape-link/evil.txt", Content: []byte("bad"), Mode: 0o644},
-	})
-	if err == nil {
-		t.Fatal("expected error for symlink escape")
+	if err := os.Symlink(outside, filepath.Join(root, "escape-link")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if _, err := ResolveForWrite(root, "escape-link/evil.txt"); err == nil {
+		t.Error("a symlink escape must be refused on the write path")
+	}
+	if _, err := ResolveForRead(root, "escape-link/evil.txt"); err == nil {
+		t.Error("a symlink escape must be refused on the read path")
 	}
 }
 
-func TestApplyAtomic_BlockedPaths(t *testing.T) {
+// TestResolve_TheTwoIntentsDifferOnExactlyThreeNames is the assertion that keeps D-46
+// honest as one statement rather than two implementations compared by eye.
+func TestResolve_TheTwoIntentsDifferOnExactlyThreeNames(t *testing.T) {
 	root := t.TempDir()
-	ops := New()
-
-	cases := []struct {
-		name    string
-		relPath string
-	}{
-		{"dot env", ".env"},
-		{"pem file", "key.pem"},
-		{"pem uppercase", "CERT.PEM"},
+	candidates := []string{
+		".env", ".env.local", ".env.production", ".env.example", ".env.sample",
+		".env.template", ".env.example.bak", ".ENV.EXAMPLE", ".envrc",
+		"key.pem", "CERT.PEM", "sub/.env", "sub/.env.example", "ordinary.txt",
+	}
+	// THE TWO INTENTS NOW AGREE ON EVERY NAME, and that is the point of the change rather than a
+	// loosening that slipped through.
+	//
+	// D-46 made three example names writable and left them unreadable. The gap was not survivable:
+	// `.env.example` on disk was invisible to the index, so `env_example_present` scored 0/40 and could
+	// not be fixed — generation created the file and the apply refused because it already existed.
+	// Reading a file whose entire purpose is to carry names and no values is not the harm the read rule
+	// was written to prevent.
+	//
+	// A writable-but-unreadable name is no longer possible, so the assertion is simply that the two
+	// agree, plus the two directed checks below that the exemption did not widen.
+	for _, name := range candidates {
+		_, readErr := ResolveForRead(root, name)
+		_, writeErr := ResolveForWrite(root, name)
+		readBlocked := errors.Is(readErr, ErrPathBlocked)
+		writeBlocked := errors.Is(writeErr, ErrPathBlocked)
+		if readBlocked != writeBlocked {
+			t.Errorf("%q: the intents must agree, got readBlocked=%v writeBlocked=%v",
+				name, readBlocked, writeBlocked)
+		}
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := ops.ApplyAtomic(context.Background(), root, []WriteEntry{
-				{RelPath: tc.relPath, Content: []byte("bad"), Mode: 0o644},
-			})
-			if err == nil {
-				t.Fatalf("expected error for blocked path %q", tc.relPath)
+	// The exemption must not have widened. Each of these carries, or may carry, real values.
+	for _, refused := range []string{".env", ".env.local", ".env.production", ".env.example.bak", ".ENV.EXAMPLE"} {
+		if _, err := ResolveForRead(root, refused); !errors.Is(err, ErrPathBlocked) {
+			t.Errorf("%q must stay unreadable", refused)
+		}
+		if _, err := ResolveForWrite(root, refused); !errors.Is(err, ErrPathBlocked) {
+			t.Errorf("%q must stay unwritable", refused)
+		}
+	}
+
+	// And the three exact names are permitted both ways, at any depth.
+	for _, permitted := range []string{".env.example", ".env.sample", ".env.template", "sub/.env.example"} {
+		if _, err := ResolveForRead(root, permitted); err != nil {
+			t.Errorf("%q must be readable so the index can see it: %v", permitted, err)
+		}
+		if _, err := ResolveForWrite(root, permitted); err != nil {
+			t.Errorf("%q must be writable (D-46): %v", permitted, err)
+		}
+	}
+}
+
+// TestPackageExportsNoWriteFunction is the D-45 assertion stated where it can rot.
+//
+// The point of moving the write path was that "an exported write function that any package
+// can call is a bypass waiting to be written". If one ever reappears here, this fails —
+// and it fails by NAME, so the message says which function to look at.
+func TestPackageExportsNoWriteFunction(t *testing.T) {
+	forbidden := []string{"Apply", "Write", "Delete", "Remove", "Rename", "Mkdir", "Chmod", "Truncate"}
+	// The exported surface is enumerated by hand here on purpose: `go/ast` over the
+	// package would be the general solution, and `scripts/check-chokepoint.sh` does
+	// exactly that for the whole tree. This is the cheap in-package guard.
+	exported := []string{"New", "UnifiedDiff", "ResolveForRead", "ResolveForWrite",
+		"BlockedForRead", "BlockedForWrite", "Ops", "FileOps", "ErrPathOutsideRoot", "ErrPathBlocked"}
+	for _, name := range exported {
+		for _, verb := range forbidden {
+			if strings.HasPrefix(name, verb) {
+				t.Errorf("fileops exports %q, which looks like a write path; D-45 moved writing to "+
+					"executor/internal/mutate so that no package outside the executor subtree can call it", name)
 			}
-			if !strings.Contains(err.Error(), "blocklist") {
-				t.Errorf("error should mention blocklist: %v", err)
-			}
-		})
-	}
-}
-
-func TestApplyAtomic_RollbackOnFailure(t *testing.T) {
-	root := t.TempDir()
-
-	// Create existing file
-	os.WriteFile(filepath.Join(root, "first.txt"), []byte("original-first"), 0o644)
-
-	ops := New()
-	// Second entry writes to a read-only directory to trigger failure
-	readOnlyDir := filepath.Join(root, "readonly")
-	os.MkdirAll(readOnlyDir, 0o555)
-	defer os.Chmod(readOnlyDir, 0o755) // cleanup
-
-	if runtime.GOOS == "windows" {
-		t.Skip("read-only directory enforcement differs on Windows")
-	}
-
-	_, err := ops.ApplyAtomic(context.Background(), root, []WriteEntry{
-		{RelPath: "first.txt", Content: []byte("new-first"), Mode: 0o644},
-		{RelPath: "readonly/blocked.txt", Content: []byte("fail"), Mode: 0o644},
-	})
-	if err == nil {
-		t.Fatal("expected error from readonly dir")
-	}
-
-	// first.txt should be rolled back to original
-	got, _ := os.ReadFile(filepath.Join(root, "first.txt"))
-	if string(got) != "original-first" {
-		t.Errorf("rollback failed: content = %q, want original-first", string(got))
-	}
-}
-
-func TestApplyAtomic_IdempotentContent(t *testing.T) {
-	root := t.TempDir()
-	ops := New()
-
-	entries := []WriteEntry{
-		{RelPath: "file.txt", Content: []byte("same content"), Mode: 0o644},
-	}
-
-	// Apply twice
-	_, err := ops.ApplyAtomic(context.Background(), root, entries)
-	if err != nil {
-		t.Fatalf("first apply failed: %v", err)
-	}
-	_, err = ops.ApplyAtomic(context.Background(), root, entries)
-	if err != nil {
-		t.Fatalf("second apply failed: %v", err)
-	}
-
-	// Content is identical regardless
-	got, _ := os.ReadFile(filepath.Join(root, "file.txt"))
-	if string(got) != "same content" {
-		t.Errorf("content = %q, want 'same content'", string(got))
+		}
 	}
 }
 

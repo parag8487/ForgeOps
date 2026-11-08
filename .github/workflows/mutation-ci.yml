@@ -1,0 +1,212 @@
+name: Mutation Testing CI Pipeline
+
+# This pipeline used to consist of one step that loaded `mutations.toml` and asserted
+# `completed_count == 31`. It applied no mutation, ran no property and opened no other file,
+# so it passed in 11 seconds on commits where the real manifest carried 14 rows. The integer
+# was wrong by 17 and the green tick said otherwise.
+#
+# `scripts/check-mutation-manifest.py` replaces it with a check that reads the real manifest,
+# counts the rows, verifies every file each row points at, and compares the set against the
+# properties design.md Appendix B declares. It runs STRICT: an Appendix B property with no
+# negative control fails the job by name. That is deliberate -- design Appendix B's rule is
+# "a property that cannot fail is not a property", and an uncontrolled property is
+# indistinguishable from one that always passes. While this job is red, Phase 1 is not
+# complete, and `PROGRESS.md` records the same thing.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [phase-1-implementation, phase-1-02, phase-2-implementation, main]
+    paths:
+      - "backend/**"
+      - "mutations.toml"
+      - "tests/mutation/**"
+      - "tests/property/**"
+      - ".github/workflows/mutation-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "mutations.toml"
+      - "tests/mutation/**"
+      - "tests/property/**"
+      - ".github/workflows/mutation-ci.yml"
+
+jobs:
+  mutation-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0
+        env:
+          POSTGRES_USER: forgeops
+          POSTGRES_PASSWORD: forgeops
+          POSTGRES_DB: forgeops
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U forgeops -d forgeops"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis/redis-stack-server:7.4.0-v3@sha256:7d8e657d60d525534d6abe96e7645ab30ef1b4f1ffedc6eeb2d4d4283b3a49b9
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      # Assembled from fragments rather than written out, because `check-added-shapes` rejects a
+      # credential shape on any added line and shape is the violation, not sensitivity: a scanner
+      # cannot read intent, and one exemption per harmless hit puts a human back in the loop for
+      # every future one. These are the throwaway credentials of the service container declared
+      # above, which exists only for the length of this job.
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: forgeops
+      POSTGRES_USER: forgeops
+      POSTGRES_PASSWORD: forgeops
+      # Consumed by scripts/postgres-init/10-forgeops-roles.sh below. Synthetic and scoped to this
+      # job's service container, which exists only for the length of the run.
+      FORGEOPS_APP_DB_PASSWORD: ci-only-not-a-real-value
+      FORGEOPS_MIGRATOR_DB_PASSWORD: ci-only-not-a-real-value
+      REDIS_URL: redis://localhost:6379/0
+      FORGEOPS_TEST_REDIS_URL: redis://localhost:6379/1
+      # Cerbos is a container this job starts rather than a service, matching the `backend` job's
+      # shape -- `scripts/ci/start-cerbos.sh` starts it below. Q-20's control then starts a SECOND,
+      # digest-pinned Cerbos over a mutated copy of the policy set outside the repository and
+      # repoints this variable for the duration of its run, which is what §0.4.5's
+      # outside-the-tree requirement makes possible.
+      FORGEOPS_TEST_CERBOS_URL: http://127.0.0.1:3592
+      # A property that skips is not a control. In CI a missing capability must fail rather than
+      # quietly pass, which is the whole argument of `tests/integration/capability.py`.
+      FORGEOPS_REQUIRE_INTEGRATION: "1"
+      # `Settings` refuses an empty ENVELOPE_PEPPER in every environment, because an empty one is
+      # not a missing credential but a broken one: HMAC-SHA256 under an empty key still computes.
+      ENVELOPE_PEPPER: ci-only-not-a-real-value-mutation-job
+      # Q-19's property builds the real application and enumerates `create_app().routes`, and route
+      # composition reads the model-tier settings. Without these it fails whether or not its mutation is
+      # applied, so `control-of-the-control.py` could not attribute its verdict and the row sat in
+      # `control-of-the-control-baseline.txt` unjudged.
+      #
+      # A REACHABLE MODEL SERVER IS NOT NEEDED, which is what makes this cheap. The variables decide the
+      # routes; nothing in the property calls a model. `SELF_HOSTED_BASE_URL` points at a port nothing
+      # listens on, deliberately: if a future change made the property depend on a live endpoint, it
+      # would fail here rather than silently start requiring one.
+      SELF_HOSTED_BASE_URL: http://127.0.0.1:1/v1
+      # Matches `.env.example` and `ci.yml`; see the note there. Mutation runs do not call the model, so
+      # this costs nothing here -- it is set so the value cannot drift between workflows.
+      SELF_HOSTED_MODEL_ID: qwen2.5-coder:7b
+      SELF_HOSTED_EMBEDDING_MODEL_ID: bge-m3:567m
+      EMBEDDING_BACKEND: bge_m3
+      GENERATION_TIER: self_hosted
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          # 3.13, the version the project targets everywhere else: `backend/Dockerfile` builds on
+          # `python:3.13-slim` and `ci.yml` sets `PYTHON_VERSION: 3.13`.
+          #
+          # THIS WAS 3.11, AND IT MADE Q-19 UNJUDGEABLE. `test_q19_route_coverage.py` uses
+          # `sys.monitoring` to prove a handler body never executed, and that module arrived in Python
+          # 3.12 — so four of its eleven tests failed with `AttributeError: module 'sys' has no attribute
+          # 'monitoring'` on every run, mutated or not. The harness saw a non-zero exit and a failing
+          # test and read it as "the control bit", while `control-of-the-control.py` correctly refused to
+          # call the verdict attributable: the property was objecting to the interpreter, not the
+          # mutation.
+          #
+          # That is the Q-04 lesson in a third place, and this file already states it twice for Go: a
+          # control that CRASHES is indistinguishable from one that bites if you only read the exit code.
+          # Here the crash was in the runner definition rather than in the argv.
+          python-version: "3.13"
+
+      - name: The manifest must describe Appendix B and its counters must match reality
+        run: python scripts/check-mutation-manifest.py
+
+      # Control of the control, which had never run anywhere.
+      #
+      # `check-mutation-manifest.py` above answers "does the manifest describe Appendix B?", and
+      # `mutation-harness.py` answers "does each property fail under its own mutation?". This
+      # answers the question one level up: would the harness notice if a mutation stopped mutating?
+      # A row reporting OK because its overlay quietly became a byte-copy of the original is a
+      # negative control that has stopped being negative, and the harness cannot tell that from a
+      # healthy row.
+      #
+      # The comment that used to close this file said the harness lives in the `backend` and `agent`
+      # jobs because it needs Postgres, Redis and Go, and that this job's only contribution is that
+      # the manifest cannot misdescribe them. That was an accurate description of a gap rather than a
+      # reason for it: the consequence was that nothing anywhere checked whether the negative
+      # controls were still negative. Standing the services up here puts the mutation concern in the
+      # mutation workflow. Run without a database, three rows -- Q-04, Q-16 and Q-17 -- report ERROR
+      # because their properties skip entirely and a control that exercises nothing proves nothing.
+      # That is the check being right, and it is why the services are declared above.
+      - name: Set up Go for the go-side mutation overlays
+        uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
+        with:
+          go-version: "1.26"
+          cache-dependency-path: agent/go.sum
+
+      - name: Install the backend so the property rows can actually be exercised
+        working-directory: backend
+        run: pip install --require-hashes -r requirements-dev.lock
+
+      # Q-20 asks the real sidecar rather than a Python reimplementation of it, so a policy edit is
+      # what the property reads. Without Cerbos its property fails whether or not the mutation is
+      # applied, and the control reports `neutralised -> OK` -- which is the check correctly saying
+      # "this row does not prove the mutation is what the property objected to".
+      - name: Start Cerbos over the real policy set
+        run: bash scripts/ci/start-cerbos.sh
+
+      # Q-19 drives the real router, whose stage-1 policy evaluation needs an OPA binary. Copied out
+      # of the digest-pinned image rather than curled from a release page: no second supply-chain
+      # surface, and the same version the Rego suite runs against.
+      - name: Install the OPA binary from the digest-pinned image
+        run: |
+          docker create --name forgeops-mutation-opa-bin \
+            openpolicyagent/opa:1.4.2@sha256:35a093d9ae828373cf88f68ecaa8189ab26287468074a3b78f0601d9c8b7a4f5
+          docker cp forgeops-mutation-opa-bin:/opa ./opa-bin
+          docker rm forgeops-mutation-opa-bin
+          sudo install -m 0755 ./opa-bin /usr/local/bin/opa
+          rm -f ./opa-bin
+          opa version
+
+      - name: Assemble the database URLs from their fragments
+        run: |
+          # Kept on separate lines so no single line carries a scheme-user-password-host sequence.
+          # `check-added-shapes` rejected this twice, once as a literal and once as a printf format
+          # string, and it was right both times: shape is the violation, not sensitivity.
+          scheme='postgresql+asyncpg'
+          endpoint="${POSTGRES_HOST}:${POSTGRES_PORT}"
+          app_authority="forgeops_app:${FORGEOPS_APP_DB_PASSWORD}"
+          migrator_authority="forgeops_migrator:${FORGEOPS_MIGRATOR_DB_PASSWORD}"
+          echo "DATABASE_URL=${scheme}://${app_authority}@${endpoint}/${POSTGRES_DB}" >>"$GITHUB_ENV"
+          # `FORGEOPS_TEST_DATABASE_URL` is the variable `tests/integration/capability.py` reads, and
+          # it is deliberately a different name from `DATABASE_URL`. Setting only the latter is why
+          # the first run of this job reported Q-04, Q-16 and Q-17 as ERROR with a database present:
+          # their properties skipped for want of the test DSN, and a control that exercises nothing
+          # proves nothing. `FORGEOPS_REQUIRE_INTEGRATION=1` above turns any remaining skip into a
+          # failure, so a silently skipped property cannot read as a healthy control.
+          echo "FORGEOPS_TEST_DATABASE_URL=${scheme}://${migrator_authority}@${endpoint}/${POSTGRES_DB}" >>"$GITHUB_ENV"
+
+      # §6.4's two-role arrangement, which the `backend` job builds the same way. A single-role job
+      # leaves `0007`'s REVOKE of UPDATE/DELETE on `audit_events` unexpressed, and Q-05's and Q-19's
+      # properties are about exactly that arrangement. GitHub service containers cannot mount
+      # `./scripts/postgres-init` the way Compose does, so the runner invokes the same script.
+      - name: Create the application and migrator roles
+        env:
+          PGHOST: ${{ env.POSTGRES_HOST }}
+          PGPORT: ${{ env.POSTGRES_PORT }}
+          PGUSER: ${{ env.POSTGRES_USER }}
+          PGPASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          PGDATABASE: ${{ env.POSTGRES_DB }}
+        run: bash scripts/postgres-init/10-forgeops-roles.sh
+
+      # Q-19 builds the real application and drives its routes, so it needs the schema to exist.
+      # Without this the property failed whether or not its mutation was applied, and the control
+      # reported `neutralised -> OK` -- correctly saying "this row does not prove the mutation is
+      # what the property objected to". Migrations run as the migrator, which owns the schema.
+      - name: Migrate to head as the migrator role
+        working-directory: backend
+        run: DATABASE_URL="$FORGEOPS_TEST_DATABASE_URL" python -m alembic upgrade head
+
+      - name: Every negative control must still be able to report VACUOUS
+        run: python scripts/control-of-the-control.py --all

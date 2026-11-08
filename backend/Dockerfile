@@ -15,13 +15,49 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 # Copy source for the editable install
 COPY pyproject.toml ./
 COPY src/ ./src/
+# `config/` holds model-tiers.yaml and mcp-servers.yaml. It was never copied into
+# the image, and nothing noticed: `load_mcp_server_config` returns an EMPTY registry
+# for a missing file — correct fail-closed behaviour for a gateway, and completely
+# invisible, so every containerised `tools/list` returned nothing by design rather
+# than by accident. Task 2.1 wired `load_tier_config` into the lifespan, which turned
+# the same missing directory into a startup crash and surfaced it (design §0.5 D1).
+COPY config/ ./config/
 COPY alembic.ini ./
 COPY alembic/ ./alembic/
 
-RUN pip install --no-deps -e .
+RUN pip install --default-timeout=120 hatchling editables && pip install --no-build-isolation --no-deps -e .
 
 # ---------- Stage 2: runtime ----------
 FROM python:3.13-slim AS runtime
+
+# The commit this image was built from, as an OCI standard label.
+#
+# WHY IT EXISTS. `start-forgeops.ps1` used to skip the image build whenever any forgeops image was
+# present, so a developer who pulled new commits got yesterday's backend — and the script then ran
+# `alembic upgrade head` from inside that stale image and reported "the schema is at head" while the
+# database sat two revisions behind the migrations on disk. This label is what lets the script tell a
+# CURRENT image from a merely PRESENT one.
+#
+# Declared AFTER the `FROM` because build arguments do not cross stage boundaries, and defaulted so a
+# hand-run `docker compose build` still succeeds. `unknown` is treated as not-current by the caller,
+# which is the fail-safe direction: an unnecessary rebuild rather than a silent stale run.
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.revision="${GIT_COMMIT}"
+
+# The OPA binary, for `POST /api/v1/policies/{id}/test` and `policies/validation.py::validate_rego`.
+#
+# WHY IT IS HERE AT ALL. The dry-run route used to answer with a SYNTHESISED allow/deny when
+# `shutil.which("opa")` found nothing — a verdict on a security surface that no policy engine had
+# computed. It now raises `503 dryrun-unavailable` instead, which is honest but useless if the
+# binary is never present, so the image that serves the route has to carry it.
+#
+# COPIED from the same digest-pinned image `docker-compose.yml` already runs, rather than curled
+# from a release page. A download would add a second supply-chain surface needing its own checksum;
+# this reference is already committed, already reviewed, and already the version `scripts/policy-test.sh`
+# greps out of Compose to run the Rego test suite — so the evaluator inside the API and the evaluator
+# the policy tests run against cannot drift apart.
+COPY --from=openpolicyagent/opa:1.4.2@sha256:35a093d9ae828373cf88f68ecaa8189ab26287468074a3b78f0601d9c8b7a4f5 \
+	/opa /usr/local/bin/opa
 
 # Security: run as non-root
 RUN groupadd -r forgeops && useradd --no-log-init -r -g forgeops forgeops
@@ -35,6 +71,7 @@ COPY --from=builder /usr/local/bin/alembic /usr/local/bin/alembic
 
 # Copy application source
 COPY --from=builder /app/src ./src
+COPY --from=builder /app/config ./config
 COPY --from=builder /app/alembic.ini ./
 COPY --from=builder /app/alembic ./alembic
 COPY --from=builder /app/pyproject.toml ./

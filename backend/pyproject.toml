@@ -7,7 +7,7 @@ packages = ["src"]
 
 [project]
 name = "forgeops-backend"
-version = "0.0.0"
+version = "2.4.0"
 description = "ForgeOps — AI-powered DevOps automation platform backend"
 license = "FSL-1.1-ALv2"
 requires-python = ">=3.13,<3.14"
@@ -26,7 +26,48 @@ dependencies = [
     "redis==5.2.1",
     "httpx==0.27.2",
     "orjson==3.11.6",
-    "pyjwt[crypto]==2.13.0",
+    # 2.2 and 2.4a: the durable execution engine. Business logic must never import this -- the banned-api
+    # rule in [tool.ruff.lint.flake8-tidy-imports] confines it to src/core/tasks.py.
+    "inngest==0.4.19",
+    # 2.10: OTel-native monitoring. Exact pins, and the SDK and the instrumentation packages version
+    # SEPARATELY (1.30.0 / 0.51b0) -- mixing an SDK with instrumentation built for another raises at
+    # import, so both lines move together or neither does.
+    "opentelemetry-sdk==1.30.0",
+    "opentelemetry-exporter-otlp-proto-grpc==1.30.0",
+    "opentelemetry-instrumentation-fastapi==0.51b0",
+    "opentelemetry-instrumentation-sqlalchemy==0.51b0",
+    # 2.4's second source for CPU and memory. Narrowly configured in `Telemetry.instrument_process` --
+    # the default metric set includes per-CPU and per-interface series, which is how a monitoring system
+    # takes down what it monitors.
+    "opentelemetry-instrumentation-system-metrics==0.51b0",
+    # 2.15.0 rather than 2.13.0: PYSEC-2026-4183 affects 2.13.0 and below, and the
+    # `audit` CI job fails the build on an unignored advisory. Raising the floor is the fix
+    # the gate asks for — the alternative is adding the advisory to the ignore list, which
+    # records a known-vulnerable dependency as acceptable rather than removing it.
+    "pyjwt[crypto]==2.15.0",
+    # design.md §4.6 / D-32: the Phase 1 task engine, behind the unchanged
+    # TaskDispatcher seam. Redis-backed, so it needs no new infrastructure. Importable
+    # only from src/core/tasks.py and src/worker.py — enforced by the Ruff banned-api
+    # rule below, which is what keeps the Phase 2 engine decision (OQ-16) a two-file
+    # change rather than a migration.
+    "arq==0.26.3",
+    # design.md §7.6 / §11.9: RFC 8785 JSON Canonicalization Scheme. One
+    # implementation shared by envelope signing and the audit hash chain, because a
+    # byte-level disagreement between those two makes a genuine audit chain look
+    # tampered with. Wrapped by src/core/canonical.py, which additionally refuses
+    # floats.
+    "rfc8785==0.1.4",
+    # design.md §16.2: promoted from a transitive of `pyjwt[crypto]` to a direct pin
+    # because Phase 1 uses it directly — AES-256-GCM for `agent_devices.envelope_key_enc`
+    # (D-62, `src/auth/devices.py`) and X.509 issuance for the internal CA (§3.1, leaf
+    # 8.2). Importing a package the project does not declare is a supply-chain defect
+    # regardless of it working, which is the same reasoning §16.2 applies to `pyyaml`.
+    #
+    # Pinned at the version the committed lock already resolves, not at §16.2's stated
+    # `44.0.0`. §15.9's resolution is explicit that the committed lockfiles win and that
+    # Phase 1 must not downgrade any of them; `pyjwt[crypto]` already pulls
+    # 49.0.0, so pinning 44.0.0 here would either be unsatisfiable or a downgrade.
+    "cryptography==49.0.0",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +75,17 @@ dev = [
     "pytest==8.3.4",
     "pytest-asyncio==0.25.3",
     "pytest-cov==6.0.0",
+    # design.md §0.4.4: `--report-log` is what `scripts/check-no-skips.py` reads to
+    # prove the mandatory selection actually ran. It ships in this plugin, not in
+    # pytest core, so the gate depends on it explicitly rather than by accident.
+    "pytest-reportlog==0.4.0",
     "hypothesis==6.125.3",
+    # design.md §0.4.1: the `production_app` fixture drives the REAL app factory
+    # through the ASGI lifespan protocol, so the composition under test is the one
+    # uvicorn runs. asgi-lifespan is the ASGI-native way to do that; a hand-rolled
+    # send/receive loop would be a second, untested implementation of a protocol
+    # that already has one.
+    "asgi-lifespan==2.1.0",
     "ruff==0.9.7",
     "pip-audit==2.7.3",
     "pip-tools==7.6.0",
@@ -46,9 +97,36 @@ asyncio_mode = "auto"
 addopts = [
     "--strict-markers",
     "--tb=short",
+    # Coverage is a GATE, not a goal (design.md §7.13, D-31; criterion 11). These three flags
+    # are the backend third of that criterion, and they were missing: the criterion recorded
+    # them as active while no configuration file carried them, and a unit test asserted their
+    # absence. See LEARNING-JOURNAL finding 81.
+    #
+    # This runs on EVERY pytest invocation, which is deliberate — a gate that only the CI
+    # entry point applies is a gate a developer can be surprised by. The consequence is that
+    # running a single test file fails the threshold, because one file does not cover the
+    # package. That is expected: pass `--no-cov` for a targeted run. Do not remove these flags
+    # to make a subset run quiet, which is exactly how the gate came to be missing before.
+    "--cov=src",
+    "--cov-branch",
+    "--cov-fail-under=70",
 ]
 markers = [
     "integration: marks integration tests (deselect with '-m not integration')",
+    # design.md §0.4.4: the mandatory selection is defined by MARKER, not by path,
+    # so moving a file cannot quietly drop it from the set CI must actually run.
+    # `scripts/check-no-skips.py` fails the build on any skip in this selection,
+    # and also on an EMPTY selection — a selector that matches nothing would
+    # otherwise pass silently.
+    "mandatory: must actually execute in CI; a skip here fails the build",
+    # design.md §8.3: the heavy jobs select by capability marker, so a test that needs a
+    # real Authentik is selected by `-m 'mandatory and oidc'` rather than by path. Moving
+    # the file cannot drop it from the set the `auth` job runs.
+    "oidc: needs a real Authentik container; selected by the `auth` CI job",
+    # Same rule, one service along (task 6.4). The RBAC matrix needs the digest-pinned
+    # Cerbos sidecar, and it is selected by marker in both the `backend` and `auth` jobs.
+    "cerbos: needs the real Cerbos sidecar; selected by the `backend` and `auth` CI jobs",
+    "infisical: needs the real Infisical container; selected by the `secrets` CI job",
 ]
 
 [tool.coverage.run]
@@ -56,7 +134,15 @@ source = ["src"]
 branch = true
 
 [tool.coverage.report]
-# Coverage is a GOAL (>70%), not a gate in Phase 0 (design.md §7.6, OQ-17).
+# Coverage is a GATE at 70 % (design.md §7.13, D-31; criterion 11). This line previously read
+# "Coverage is a GOAL (>70%), not a gate in Phase 0 (design.md §7.6, OQ-17)" and carried no
+# threshold — accurate for Phase 0 and false for Phase 1, which is what let criterion 11 claim a
+# gate that nothing implemented.
+#
+# `fail_under` here as well as `--cov-fail-under` in addopts, on purpose: the flag governs a
+# pytest run, this governs any direct `coverage report`, and `test_metadata.py` asserts on this
+# one because a value in a config file is what a test can read.
+fail_under = 70
 show_missing = true
 skip_empty = true
 
@@ -94,7 +180,10 @@ ignore = [
     # framework evaluates it per request, so the usual mutable-default hazard the
     # rule guards against does not apply.
     "B008",
+    # E501 line length: ruff format enforces layout; long strings and comments are preserved.
+    "E501",
 ]
+external = ["FO-TD001", "FO-TD002", "FO-TD003", "FO-TD004", "FO-SEC001"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 # Cross-domain imports: domains must depend only on src/core, never on each other.
@@ -102,13 +191,31 @@ ignore = [
 "src.analysis".msg = "Cross-domain import: use src.core only"
 "src.ai".msg = "Cross-domain import: use src.core only"
 "src.mcp".msg = "Cross-domain import: use src.core only"
-"src.auth".msg = "Cross-domain import: use src.core only"
+# `src.auth` is banned MODULE BY MODULE rather than wholesale, and the split is the
+# point: the identity *contract* is cross-cutting, the identity *implementation* is not.
+#
+# Deny-by-default routing (§4.4) is a property of every domain's router, so every router
+# must be able to name `require_principal` — §4.3 puts it at middleware row 7 precisely
+# because it is cross-cutting. `src.auth.dependencies`, `src.auth.principal`,
+# `src.auth.public_routes` and `src.auth.models` are therefore importable anywhere,
+# exactly as `core.security.TokenVerifier` already is. Everything that *implements*
+# authentication stays banned, so no domain can drive the login flow, construct a
+# verifier, or reach a device's envelope key. Exempting `src.auth` wholesale would have
+# granted all of that in order to reach one dependency.
+"src.auth.routes".msg = "Cross-domain import: the OIDC flow is auth's alone"
+"src.auth.oidc".msg = "Cross-domain import: the OIDC flow is auth's alone"
+"src.auth.sessions".msg = "Cross-domain import: session lifecycle is auth's alone"
+"src.auth.verifier".msg = "Cross-domain import: only the app factory constructs a verifier"
+"src.auth.devices".msg = "Cross-domain import: only governance may reach the device service (§2.2.1)"
 "src.generation".msg = "Cross-domain import: use src.core only"
 "src.deployment".msg = "Cross-domain import: use src.core only"
 "src.monitoring".msg = "Cross-domain import: use src.core only"
 "src.incidents".msg = "Cross-domain import: use src.core only"
+"src.learning".msg = "Cross-domain import: use src.core only"
 "src.policies".msg = "Cross-domain import: use src.core only"
-"src.secrets".msg = "Cross-domain import: use src.core only"
+"src.secrets.routes".msg = "Cross-domain import: secrets management is secrets' alone"
+"src.secrets.store".msg = "Cross-domain import: secret store is secrets' alone"
+"src.secrets.injection".msg = "Cross-domain import: secret injection is secrets' alone"
 "src.notifications".msg = "Cross-domain import: use src.core only"
 "src.websocket".msg = "Cross-domain import: use src.core only"
 # Queue engines forbidden outside the task seam (design.md §7.9).
@@ -117,9 +224,38 @@ ignore = [
 "dramatiq".msg = "Queue engine banned outside src/core/tasks.py (design.md §7.9)"
 "temporalio".msg = "Queue engine banned outside src/core/tasks.py (design.md §7.9)"
 "inngest".msg = "Queue engine banned outside src/core/tasks.py (design.md §7.9)"
+# ─── §2.2.1 mechanism 2: the mutation chokepoint's private surface ────────────
+# The same mechanism as the queue-engine bans above, pointed at a different problem. Each
+# of these five names is enough on its own to forge authority or bypass a stage, so naming
+# one outside `governance/` is a build failure rather than a review conversation.
+#
+# `_MINT_SENTINEL` is the sharpest: `MutationAuthority.__post_init__` compares against it by
+# IDENTITY, so the only way to construct an authority is to be able to name the sentinel.
+# This entry is what makes "cannot be named" true, and `governance/` is exempted below.
+"src.governance.authority._MINT_SENTINEL".msg = "Only governance.chokepoint may mint authority (design §2.2.1)"
+"src.governance.envelope.sign_envelope".msg = "Envelope signing belongs to governance.chokepoint only (design §2.2.1)"
+"src.governance.envelope._SIGNING_KEY".msg = "The envelope signing key is owned by governance/ (design §2.2.1)"
+# A SIXTH entry, beyond §2.2.1's five, added by D-60 because the fifth would otherwise be
+# bypassable in one specific way. `_SIGNING_KEY` is a ContextVar and `signing_key_scope` is the
+# only thing that sets it. Left unbanned, an outer caller could install a key of its choosing
+# and a governance path that forgot its own scope would sign with it instead of raising. Banning
+# the setter restores the property that matters: a missing scope ALWAYS raises.
+"src.governance.envelope.signing_key_scope".msg = "Only governance.chokepoint may install an envelope signing key (design §2.2.1, D-60)"
+"src.websocket.hub.send_command".msg = "Commands reach the hub only from governance.chokepoint (design §2.2.1)"
+# A service that can fetch a device's signing key is a service that can forge a command
+# (§11.2). Banned at the SYMBOL rather than relying on the `src.auth.devices` module ban
+# above, so `governance/` — which legitimately imports that module — still cannot reach
+# this one function by name.
+"src.auth.devices.envelope_key".msg = "Only governance.chokepoint may fetch a device envelope key (design §2.2.1)"
+"src.secrets.store.get_value".msg = "get_value is confined to secrets.injection so no route can reveal a value"
 
 [tool.ruff.lint.per-file-ignores]
+# The two modules allowed to import ARQ. `core/tasks.py` owns the dispatcher and the
+# pool factory; `worker.py` is the process entry point ARQ itself loads. Everywhere
+# else `import arq` is a build failure, which is what keeps the Phase 2 durable-engine
+# decision (OQ-16) a change to these two files instead of a migration.
 "src/core/tasks.py" = ["TID251"]
+"src/worker.py" = ["TID251"]
 # The cross-domain ban exists to stop DOMAINS coupling to each other, which is
 # what keeps the monolith extractable (design.md §5.2). Tests are not a domain:
 # a unit test for the gateway must import the gateway. Exempting tests keeps the
@@ -131,15 +267,107 @@ ignore = [
 "src/main.py" = ["TID251"]
 # A domain importing ITS OWN namespace is not a cross-domain import, but ruff's
 # banned-api matches on module-path prefix and cannot express "except from
-# within". Each domain is therefore exempted from its own entry; the ban still
-# catches the case that matters, e.g. src/ai reaching into src/mcp.
+# within". Each domain is therefore exempted from its own entry.
+#
+# **What that exemption really does, stated correctly.** An earlier version of this comment
+# claimed "the ban still catches the case that matters, e.g. src/ai reaching into src/mcp". That
+# was false and is finding 55: `["TID251"]` suppresses the whole RULE for the matched files, not
+# the one entry they need, so each glob below unbans EVERY entry in the table for that domain —
+# cross-domain imports and the §2.2.1 private surface alike. Measured: `src/ai/_probe.py`
+# importing `..mcp.gateway`, and the same file importing `..governance.authority._MINT_SENTINEL`,
+# both produce zero TID251 diagnostics.
+#
+# The private surface is now re-asserted by parsing, in `scripts/chokepoint_graph.py`'s
+# `CONFINED_NAMES` table, which runs in the Python half of `check-chokepoint.sh` and is not a
+# lint. The cross-domain MODULE bans are re-asserted the same way, by `parse_module_bans` +
+# `find_module_ban_violations` in the same script: the ban set is DISCOVERED from the
+# `banned-api` table below, so there is only one copy of it and the two cannot drift, and the
+# check exits 1 if that discovered set is ever empty. Narrowing these four globs to
+# file-by-file entries was the alternative and was rejected — it trades one mechanism for
+# forty-odd hand-maintained entries that churn on every new module. The globs below therefore
+# remain, and they no longer hide anything: Ruff is the fast feedback, the parse is the
+# boundary. `backend/tests/meta/fixtures/crossdomain/` is the negative control, and
+# `ai/reaches_mcp.py` in it is the exact case these globs used to let through.
 "src/ai/**/*.py" = ["TID251"]
 "src/mcp/**/*.py" = ["TID251"]
 "src/analysis/**/*.py" = ["TID251"]
 "src/projects/**/*.py" = ["TID251"]
+"src/policies/**/*.py" = ["TID251"]
+"src/secrets/**/*.py" = ["TID251"]
+"src/generation/**/*.py" = ["TID251"]
+"src/approvals/**/*.py" = ["TID251"]
+"src/websocket/**/*.py" = ["TID251"]
+# 2.6. A domain importing its own namespace is not a cross-domain import; the parse in
+# `scripts/chokepoint_graph.py` re-asserts the real boundary.
+"src/notifications/**/*.py" = ["TID251"]
+# 2.10. Same case: `monitoring/routes.py` importing `monitoring/queries.py` is a domain reaching its own
+# namespace, not a cross-domain import. The ban on `src.monitoring` is aimed at OTHER domains and still
+# holds -- `find_module_ban_violations` in `scripts/chokepoint_graph.py` re-asserts it by parsing, which
+# is the boundary; Ruff is only the fast feedback.
+"src/monitoring/**/*.py" = ["TID251"]
+# 2.11. Same case again: a domain reaching its own namespace is not a cross-domain import. The ban on
+# `src.incidents` still holds for every other domain -- which is why `deployments` depends on a Protocol
+# it declares itself, and why RCA reads metrics through `core.metrics_port` rather than importing
+# `monitoring`. `find_module_ban_violations` re-asserts all of it by parsing.
+"src/incidents/**/*.py" = ["TID251"]
+# 2.13. A domain reaching its own namespace, as above.
+"src/learning/**/*.py" = ["TID251"]
+"src/deployments/**/*.py" = ["TID251"]
+"src/recovery/**/*.py" = ["TID251"]
+
+# `src/auth` is exempted FILE BY FILE rather than by glob, which is the narrower form
+# of the rule above. Only `routes.py` composes the flow — it is the one module that must
+# name `auth.oidc` and `auth.sessions`, both of which the banned-api table forbids
+# elsewhere on purpose. Exempting `src/auth/**` instead would also have unbanned every
+# other domain from `verifier.py` and a future `devices.py`, which is precisely the
+# coupling §2.2.1 exists to prevent: a module that can construct a verifier or reach a
+# device's envelope key can forge authority.
+"src/auth/routes.py" = ["TID251"]
+# The second `src/auth` file, added by leaf 8.1. `agent_routes.py` serves §11.2's three device
+# routes, so it must name `auth.devices` — which the table above bans, correctly, everywhere
+# else. It reaches `DeviceService.exchange`, `.issue_pairing_code` and `.revoke`, and none of
+# the eight §2.2.1 names; the exemption is a consequence of the ban being module-shaped, not a
+# widening this file asked for.
+#
+# **Read this before adding a third entry.** A per-file `["TID251"]` disables the whole RULE for
+# that file, not the one entry it needs — so every exemption in this table, including the four
+# domain globs below, also unbans the §2.2.1 private surface for the exempted files. That is
+# finding 55 in `docs/LEARNING-JOURNAL.md` chapter 9. It is neutralised by the confinement half
+# of `scripts/check-chokepoint.sh`, which re-asserts the confined-name table by PARSING the tree
+# and cannot be switched off by a lint ignore. Ruff remains the fast feedback; the parse is the
+# boundary.
+"src/auth/agent_routes.py" = ["TID251"]
+# §2.2.1's five bans exist to keep the chokepoint's private surface private. `governance/`
+# is the one package that must reach it, and the exemption is FILE BY FILE rather than
+# `src/governance/**`, for the same reason `src/auth` is: a glob would also unban every
+# other name in the table for every future module in this package, and the whole point of
+# the five entries is that reaching any one of them is enough to forge authority.
+#
+# `authority.py` defines `_MINT_SENTINEL` and is the only legitimate reader of it;
+# `primitives.py` names nothing banned but is exempted alongside it so the pair reads as one
+# boundary. Any further file here that needs an exemption is a deliberate edit to this list,
+# which is exactly the review that addition deserves.
+"src/governance/authority.py" = ["TID251"]
+"src/governance/primitives.py" = ["TID251"]
+# The third entry, added by leaf 7.5, and the one the whole table exists to permit exactly
+# once. `chokepoint.py` is the sole minter: it names `mint_authority`, `signing_key_scope`,
+# `sign_envelope` and `auth.devices.envelope_key`, which is four of the eight banned names and
+# every capability §2.2.1 confines. Exempting it file by file rather than by glob is what keeps
+# that list to one file — a `src/governance/**` glob would silently unban all eight for every
+# future module in this package, and §2.2.2's claim ("the control plane is the SOLE holder of
+# the per-device envelope signing key") would then be true of a directory rather than of a file.
+"src/governance/chokepoint.py" = ["TID251"]
+"src/secrets/injection.py" = ["TID251"]
 # Alembic's env.py must import every domain's models to build target_metadata;
 # that is migration wiring, not runtime domain coupling.
 "alembic/env.py" = ["TID251"]
+# A revision imports the allowed-value tuples from the domain whose table it creates,
+# so the check constraint the database enforces is GENERATED from the same tuple the
+# application validates against — a new lifecycle state cannot be added to one without
+# the other. Retyping the values in the migration is the alternative, and it is how the
+# schema and the code drift apart silently. Migration wiring, like env.py above, not
+# runtime domain coupling: a revision runs once, offline, from the Alembic CLI.
+"alembic/versions/*.py" = ["TID251"]
 # Design §11.2 names this exception `ProblemException` after RFC 9457 "Problem
 # Details"; renaming it to ProblemError would obscure the spec it implements.
 "src/core/errors.py" = ["N818"]

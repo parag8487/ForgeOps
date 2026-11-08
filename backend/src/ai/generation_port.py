@@ -1,0 +1,296 @@
+# SPDX-License-Identifier: FSL-1.1-ALv2
+"""The `ArtifactModelPort` implementation: `ModelRouter` behind `src.core`'s seam (design §2.2.1).
+
+`src/generation/` must not import `src.ai` — the ban is re-asserted by parsing in
+`scripts/chokepoint_graph.py`, so it cannot be silenced with a lint ignore. This is the adapter on
+the routing side of `core/model_port.py`: it holds the router, the tier and the model identifier,
+and answers the one question a domain has.
+
+It also owns the ONE translation between the two `served_from` vocabularies. `TieredSemanticCache`
+reports `L1_exact`/`L2_semantic` and `ModelRouter` reports `endpoint`, while
+`generation_runs.served_from` has a CHECK constraint over `l1`/`l2`/`provider`. Translating at the
+persistence call site instead would put the mapping next to a string literal in an INSERT, which is
+how a run ends with the database refusing `L1_exact` after everything else succeeded.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..core.model_port import ModelCompletion, TokenSink
+from ..secrets.redaction import RedactedPrompt
+from .routing.endpoints import CompletionRequest
+from .routing.router import ModelRouter, RoutingOutcome
+from .routing.tiers import ModelTier, TierConfig
+
+#: Routing's vocabulary on the left, the database's on the right.
+_TO_SERVED_FROM: dict[str, str] = {
+    "L1_exact": "l1",
+    "L2_semantic": "l2",
+    "endpoint": "provider",
+}
+
+
+class RoutedArtifactModel:
+    """One tier of the six-tier cascade, presented as a single model a domain can call."""
+
+    def __init__(
+        self,
+        *,
+        router: ModelRouter,
+        tier: ModelTier,
+        model: str,
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+        pinned_endpoint_id: str | None = None,
+        pinned_provider: str | None = None,
+    ) -> None:
+        self._router = router
+        self._tier = tier
+        self._model = model
+        self._pinned_endpoint_id = pinned_endpoint_id
+        self._pinned_provider = pinned_provider
+        # ZERO, not 0.1, and the previous comment is why: it already said "the same request twice
+        # should produce the same answer". At 0.1 that is false. Sampling with a non-zero temperature
+        # is still sampling — a user who submitted an identical prompt twice got a different NUMBER OF
+        # FILES and different contents, which is exactly the promise the comment was making and the
+        # value was breaking.
+        #
+        # Nothing is lost by removing it. Generated artifacts are judged by a DETERMINISTIC gate, so
+        # sampling variety cannot produce a better outcome — only a different one, and a different one
+        # costs a repair attempt when it fails. Greedy decoding also makes the L1 exact-match cache
+        # actually useful: an identical prompt becomes a cache hit rather than a fresh run that happens
+        # to disagree with the last.
+        #
+        # THIS DOES NOT MAKE GENERATION BIT-EXACT, and claiming so would be overselling it. Two things
+        # still vary: the retrieval context is part of the prompt, so re-scanning a changed tree changes
+        # the request and correctly misses the cache; and a provider may batch requests differently
+        # between calls, which perturbs floating-point reduction order. What zero removes is the
+        # variation this code chooses.
+        self._temperature = temperature
+        self._max_tokens = max_tokens
+
+    @property
+    def tier_name(self) -> str:
+        # A pinned run records its PROVIDER in `generation_runs.tier`: it did not route through a tier.
+        return self._pinned_provider or self._tier.value
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    @property
+    def pinned_endpoint_id(self) -> str | None:
+        return self._pinned_endpoint_id
+
+    def pinned_to(self, endpoint_id: str) -> RoutedArtifactModel:
+        """A port that calls `endpoint_id` and nothing else -- no cascade, no cache.
+
+        Raises `KeyError` for an endpoint the tier configuration does not declare, so the route can answer
+        422 before a run row exists.
+
+        The cache is bypassed for pinned runs (see `complete`) because an operator who chose a provider is
+        asking that provider; a hit would answer without calling it and the run could not prove the choice
+        was honoured.
+
+        GEMINI GETS A LARGER OUTPUT BUDGET. Gemini 3.x reasons before answering and its reasoning tokens
+        count against `maxOutputTokens`; at Ollama's 4096 a multi-file artifact set was cut off mid-file.
+        """
+        descriptor = self._router._tier_config.endpoints[endpoint_id]
+        max_tokens = 32768 if descriptor.protocol.value == "google_native" else self._max_tokens
+        return RoutedArtifactModel(
+            router=self._router,
+            tier=self._tier,
+            model=descriptor.model,
+            temperature=self._temperature,
+            max_tokens=max_tokens,
+            pinned_endpoint_id=endpoint_id,
+            pinned_provider=descriptor.provider,
+        )
+
+    def endpoint_choices(self, extra_endpoint_ids: list[str]) -> list[dict[str, Any]]:
+        """What the Manual Generation page may offer: this tier's own chain, then each listed endpoint.
+
+        An extra endpoint is reported with `available` from the registry -- an adapter exists AND its
+        credential resolves -- and the reason when it is not, so the page can say "no Gemini key configured"
+        rather than silently omitting the option. Unknown ids are skipped: they name nothing to offer.
+        """
+        config = self._router._tier_config
+        registry = self._router._registry
+        primary = self.primary_endpoint_descriptor
+        choices: list[dict[str, Any]] = [
+            {
+                "endpoint_id": None,
+                "provider": getattr(primary, "provider", "self_hosted"),
+                "model": self._model,
+                "protocol": getattr(getattr(primary, "protocol", None), "value", None),
+                "available": True,
+                "reason": None,
+                "default": True,
+            }
+        ]
+        for eid in extra_endpoint_ids:
+            descriptor = config.endpoints.get(eid)
+            if descriptor is None:
+                continue
+            availability = registry.get_availability(eid)
+            choices.append(
+                {
+                    "endpoint_id": eid,
+                    "provider": descriptor.provider,
+                    "model": descriptor.model,
+                    "protocol": descriptor.protocol.value,
+                    "available": bool(availability and availability.available),
+                    "reason": availability.reason if availability else "not registered",
+                    "default": False,
+                }
+            )
+        return choices
+
+    @property
+    def primary_endpoint_descriptor(self) -> Any:
+        if self._pinned_endpoint_id is not None:
+            return self._router._tier_config.endpoints.get(self._pinned_endpoint_id)
+        chain = self._router._tier_config.tiers.get(self._tier)
+        if chain is None:
+            return None
+        return self._router._tier_config.endpoints.get(chain.primary)
+
+    async def ensure_ready(
+        self,
+        *,
+        warmup_timeout_seconds: float = 360.0,
+        heartbeat_callback: Any = None,
+    ) -> None:
+        """Warms up self-hosted / Ollama endpoints before streaming generation."""
+        descriptor = self.primary_endpoint_descriptor
+        if descriptor is None:
+            return
+        base_url = str(descriptor.base_url or "").lower()
+        if "11434" in base_url or "ollama" in base_url or getattr(descriptor, "provider", "") == "ollama":
+            from ..core.ollama_readiness import ensure_ollama_model_ready
+
+            await ensure_ollama_model_ready(
+                descriptor.base_url,
+                self._model,
+                warmup_timeout_seconds=warmup_timeout_seconds,
+                heartbeat_callback=heartbeat_callback,
+            )
+
+    async def complete(
+        self,
+        *,
+        prompt: RedactedPrompt,
+        on_token: TokenSink | None = None,
+        may_serve_from_cache: bool = True,
+        store_in_cache: bool = True,
+    ) -> ModelCompletion:
+        """Route one completion, streaming to `on_token` when the endpoint supports it."""
+        request = CompletionRequest(
+            model=self._model,
+            messages=[{"role": "user", "content": str(prompt)}],
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+        )
+        try:
+            result = await self._router.complete(
+                tier=self._tier,
+                request=request,
+                prompt=prompt,
+                on_token=on_token,
+                may_serve_from_cache=may_serve_from_cache and self._pinned_endpoint_id is None,
+                store_in_cache=store_in_cache,
+                only_endpoint=self._pinned_endpoint_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - reported as a failed completion, not a crash
+            # The router classifies per-endpoint failures into attempt records; an exception
+            # escaping it is a fault in the call itself. Reported as `ok=False` because the caller
+            # is a bounded retry loop with a template fallback behind it — raising here would turn
+            # a degraded provider into a failed request.
+            return ModelCompletion(
+                ok=False,
+                failure_reasons=(f"the model call raised {type(exc).__name__}: {str(exc)[:200]}",),
+            )
+
+        if result.outcome is not RoutingOutcome.OK or not result.content:
+            reasons = tuple(
+                f"endpoint {attempt.endpoint_id} -> {attempt.result}"
+                + (f" ({attempt.reason})" if attempt.reason else "")
+                for attempt in result.attempts
+            )
+            return ModelCompletion(
+                ok=False,
+                failure_reasons=reasons or ("every endpoint in the tier chain was skipped or unavailable",),
+            )
+
+        return ModelCompletion(
+            ok=True,
+            # `provider` is the default rather than an error for an unrecognised routing value: a
+            # completion that came back with content came from somewhere, and the safe reading is
+            # the one that does NOT claim a cache served it.
+            served_from=_TO_SERVED_FROM.get(result.served_from or "", "provider"),
+            content=result.content,
+            endpoint_id=result.endpoint_id,
+            usage=result.usage,
+            streamed=result.streamed,
+        )
+
+    async def remember(self, *, prompt: RedactedPrompt, content: str) -> None:
+        """Cache an ACCEPTED answer.
+
+        The params must match the ones `complete` used or the key differs and the entry is never found --
+        which would fail silently as a permanent cache miss, so they are built by the same expression
+        rather than restated.
+        """
+        await self._router.remember(
+            model=self._model,
+            prompt=prompt,
+            params=self._cache_params(),
+            content=content,
+        )
+
+    def _cache_params(self) -> dict[str, object]:
+        """The cache-key params. ONE definition, used by both the lookup and the store."""
+        return {"temperature": self._temperature, "max_tokens": self._max_tokens}
+
+
+def build_artifact_model(
+    *,
+    router: ModelRouter | None,
+    tier_config: TierConfig | None,
+    tier_name: str,
+    max_tokens: int = 4096,
+) -> RoutedArtifactModel | None:
+    """Compose the port from what the lifespan already built, or `None` if it cannot.
+
+    `None` rather than an exception, and that is a configuration statement: a deployment with no
+    router runs generation's template path and records `served_from='template'`, which is a true
+    row. Refusing to compose would turn a degraded configuration into an outage on a surface that
+    still works.
+
+    THE MODEL IDENTIFIER COMES FROM THE TIER'S PRIMARY ENDPOINT
+    `CompletionRequest.model` is what goes in the provider's request body, so naming a model the
+    endpoint does not serve produces 404 `model "..." not found` — a failure that reads like a
+    routing fault. `/api/v1/ai/complete` passes the TIER NAME as the model, which works only for a
+    provider that ignores the field.
+
+    The known limit, stated: a cascade that falls through to a secondary serving something else
+    would send that secondary the primary's model id. That is inherent in routing one identifier
+    through a chain of heterogeneous endpoints, and it is why the self-hosted chain — where every
+    entry is the same local server — is the configured default for generation.
+    """
+    if router is None or tier_config is None:
+        return None
+    try:
+        tier = ModelTier(tier_name)
+    except ValueError:
+        # `Settings.generation_tier` is a `Literal` over the six tier names, so reaching here means
+        # the configuration and the enum disagree — a code defect rather than an operator's.
+        return None
+    chain = tier_config.tiers.get(tier)
+    if chain is None:
+        return None
+    descriptor = tier_config.endpoints.get(chain.primary)
+    if descriptor is None or not descriptor.model.strip():
+        return None
+    return RoutedArtifactModel(router=router, tier=tier, model=descriptor.model, max_tokens=max_tokens)

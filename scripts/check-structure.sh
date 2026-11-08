@@ -90,21 +90,38 @@ frontend/e2e
 frontend/load'
 
 # Structural-only directories (design §1.3): marker files only, never code.
-GO_STRUCTURAL_DIRS='agent/internal/executor
-agent/internal/validator
-agent/internal/policy
-agent/internal/devtools
-agent/pkg'
+# Structural-only directories, narrowed for Phase 1.
+#
+# This list is the set of directories that are STILL markers — a phase owns them and
+# that phase has not started. It shrank when Phase 1 began, and the shrinking is the
+# point: a directory whose phase has arrived must be allowed to hold code, or the
+# check reports a violation for doing exactly what the plan says.
+#
+# Moved out because Phase 1 owns and populates them:
+#   agent/internal/executor   design §10.5, tasks 7.2 / 8.7
+#   agent/internal/policy     design §10.6, tasks 9.4
+#   agent/internal/validator  design §10.7, tasks 14.1-14.6
+#   agent/internal/devtools   design §10.10, tasks 14.7
+#   backend/src/auth          design §11.2, tasks 6.1-6.4
+#   backend/src/generation    design §11.5, tasks 13.x
+#   backend/src/policies      design §11.7, tasks 9.5
+#   backend/src/secrets       design §11.8, tasks 10.4
+#   backend/src/websocket     design §11.10, tasks 8.4
+#
+# What stays: `agent/pkg` (no phase claims it) and the four backend domains
+# design §1.2 excludes from Phase 1 outright. `governance/`, `audit/`, `projects/`
+# and `analysis/` were never on this list and are Phase 1 domains.
+GO_STRUCTURAL_DIRS='agent/pkg'
 
-PY_STRUCTURAL_DIRS='backend/src/auth
-backend/src/generation
-backend/src/deployment
-backend/src/monitoring
-backend/src/incidents
-backend/src/policies
-backend/src/secrets
-backend/src/notifications
-backend/src/websocket'
+# `notifications` LEFT THIS LIST IN PHASE 2. It was deferred by design 1.3 and 2.6 built it: five modules,
+# two tables and three channel adapters. A structural check that still demanded it be empty would be
+# asserting the absence of a shipped deliverable -- the same shape as the test that asserted no
+# `environments` table could exist after 2.1 created one. `monitoring` and `incidents` stay deferred until
+# 2.10 and 2.11; `deployment` (singular) stays because the built domain is `deployments`.
+# `monitoring` LEFT THIS LIST IN PHASE 2 (2.10), for the same reason `notifications` did: it was deferred by
+# design 1.3 and 2.10 built it. `incidents` stays deferred until 2.11. `deployment` (singular) stays because
+# the built domain is `deployments`.
+PY_STRUCTURAL_DIRS='backend/src/deployment'
 
 FE_STRUCTURAL_DIR='frontend/features'
 
@@ -125,7 +142,7 @@ printf '%s\n' "$AUTHORITATIVE_DOCS" | {
 			fail "authoritative document missing from the repository root: $doc"
 		fi
 		find . -mindepth 2 -type f -name "$doc" \
-			-not -path './.git/*' -not -path './.kiro/*' 2>/dev/null |
+			-not -path './.git/*' -not -path './.antigravity/*' 2>/dev/null |
 			report_matches 'authoritative document found outside the repository root (moved or copied)'
 	done
 }
@@ -158,13 +175,43 @@ else
 	fail 'the validated public env surface is missing: expected frontend/lib/env/ (design §2.3) or frontend/lib/env.ts (design §12.1)'
 fi
 
-echo 'Checking structural-only Go directories (design §1.3)...'printf '%s\n' "$GO_STRUCTURAL_DIRS" | {
+echo 'Checking structural-only Go directories (design §1.3)...'
+# Only TRACKED files are considered. §1.3 forbids a committed placeholder; a local
+# build artifact — __pycache__, a compiled object, an editor swap file — is not one,
+# and reporting it made this check produce findings a developer learns to ignore.
+tracked_in() {
+	git ls-files -- "$1" 2>/dev/null
+}
+
+STRUCTURAL_DIRS_SEEN=0
+# count_existing <newline-separated dirs> — how many exist. Computed with no external
+# command, and OUTSIDE the pipes below, because a variable set inside the right-hand
+# side of a pipe lives in that subshell: the guard would then read the outer value and
+# fire even when the list is fine. That is the vacuity trap arriving by a second route.
+count_existing() {
+	_n=0
+	for _d in $1; do
+		[ -d "$_d" ] && _n=$((_n + 1))
+	done
+	printf '%s' "$_n"
+}
+GO_DIRS_SEEN=$(count_existing "$GO_STRUCTURAL_DIRS")
+PY_DIRS_SEEN=$(count_existing "$PY_STRUCTURAL_DIRS")
+if [ "$GO_DIRS_SEEN" -eq 0 ]; then
+	fail 'no structural-only Go directory exists; GO_STRUCTURAL_DIRS resolves to nothing and the check is vacuous'
+fi
+if [ "$PY_DIRS_SEEN" -eq 0 ]; then
+	fail 'no deferred backend domain exists; PY_STRUCTURAL_DIRS resolves to nothing and the check is vacuous'
+fi
+
+printf '%s\n' "$GO_STRUCTURAL_DIRS" | {
 	while IFS= read -r dir; do
 		[ -n "$dir" ] || continue
 		[ -d "$dir" ] || continue
-		find "$dir" -type f -name '*.go' 2>/dev/null |
+		STRUCTURAL_DIRS_SEEN=1
+		tracked_in "$dir" | grep -E '\.go$' |
 			report_matches 'structural-only Go directory must contain no .go file (design §1.3)'
-		find "$dir" -type f ! -name 'README.md' ! -name '.gitkeep' 2>/dev/null |
+		tracked_in "$dir" | grep -vE '(^|/)(README\.md|\.gitkeep)$' |
 			report_matches 'structural-only Go directory may contain only README.md or .gitkeep (design §1.3)'
 	done
 }
@@ -174,19 +221,44 @@ printf '%s\n' "$PY_STRUCTURAL_DIRS" | {
 	while IFS= read -r dir; do
 		[ -n "$dir" ] || continue
 		[ -d "$dir" ] || continue
-		find "$dir" -type f -name '*.py' 2>/dev/null |
+		tracked_in "$dir" | grep -E '\.py$' |
 			report_matches 'deferred backend domain must contain no importable Python module (design §1.3)'
-		find "$dir" -type f ! -name 'README.md' ! -name '.gitkeep' 2>/dev/null |
+		tracked_in "$dir" | grep -vE '(^|/)(README\.md|\.gitkeep)$' |
 			report_matches 'deferred backend domain may contain only README.md or .gitkeep (design §1.3)'
 	done
 }
 
 echo 'Checking frontend/features (design §1.3)...'
+# Phase-scoped, the same way `check-go-module.sh`'s structural list is, and for the same reason.
+#
+# In Phase 0 `frontend/features` was structural: no files, no subdirectories, because no feature
+# existed. Phase 1's entire job was to populate it, and it now holds eight feature directories.
+# Asserting emptiness here would be pattern O — a rule frozen at a previous phase, reporting the
+# work as a violation. Had this gate been wired anywhere, Phase 1 could not have been committed.
+#
+# So the rule inverts rather than being deleted, which is what keeps it meaningful: the directory
+# must now hold at least one feature, every feature directory must contain a real component rather
+# than a placeholder, and `README.md` must survive as the explanation of the layout.
 if [ -d "$FE_STRUCTURAL_DIR" ]; then
-	find "$FE_STRUCTURAL_DIR" -type f ! -name 'README.md' ! -name '.gitkeep' 2>/dev/null |
-		report_matches 'frontend/features is structural only and must contain no feature placeholder (design §1.3)'
-	find "$FE_STRUCTURAL_DIR" -mindepth 1 -type d 2>/dev/null |
-		report_matches 'frontend/features must contain no feature subdirectory (design §1.3)'
+	FE_FEATURES=$(find "$FE_STRUCTURAL_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+	if [ -z "$FE_FEATURES" ]; then
+		report_matches 'frontend/features must hold at least one feature directory (design §1.3, Phase 1)' <<-'EOF'
+			frontend/features has no feature directory
+		EOF
+	fi
+	if [ ! -f "$FE_STRUCTURAL_DIR/README.md" ]; then
+		report_matches 'frontend/features must keep its README.md explaining the layout (design §1.3)' <<-'EOF'
+			frontend/features/README.md is missing
+		EOF
+	fi
+	# A feature directory holding nothing but a placeholder is the failure this rule now guards:
+	# it reads as a delivered feature and is not one.
+	for feature in $FE_FEATURES; do
+		if [ -z "$(find "$feature" -type f \( -name '*.tsx' -o -name '*.ts' \) 2>/dev/null)" ]; then
+			printf '%s\n' "$feature" |
+				report_matches 'a frontend/features directory must contain a component, not only a placeholder (design §1.3)'
+		fi
+	done
 fi
 
 echo 'Checking for package-doc-only Go stubs (design §1.3)...'

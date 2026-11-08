@@ -11,7 +11,7 @@ Proves:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -32,6 +32,7 @@ from src.ai.routing.tiers import (
     TierChain,
     TierConfig,
 )
+from src.secrets.redaction import create_redacted_chunk
 
 # ---------------------------------------------------------------------------
 # Strategies
@@ -81,21 +82,26 @@ def _build_router_from_chain(
             protocol = EndpointProtocol.OPENAI_COMPATIBLE
             availability[eid] = EndpointAvailability(endpoint_id=eid, available=True)
 
-            # Create mock endpoint
-            mock_ep = AsyncMock(spec=OpenAICompatibleEndpoint)
+            # Create autospec'd endpoint. `spec=` alone constrains attribute NAMES
+            # but not child SIGNATURES, so `complete` could be called with any
+            # arguments at all - the D-23 hole. autospec closes it; spec_set makes
+            # assigning over a child raise. `endpoint_id`/`provider_kind` are
+            # class-level properties, so they are part of the spec and remain
+            # settable here.
+            mock_ep = create_autospec(OpenAICompatibleEndpoint, spec_set=True, instance=True)
             mock_ep.endpoint_id = eid
             mock_ep.provider_kind = "test"
 
             if behavior:
                 # Success
-                async def _success(req, *, api_key=None, _eid=eid):
+                async def _success(req, *, credential=None, _eid=eid):
                     invocation_counts[_eid] += 1
                     return CompletionResponse(content=f"ok from {_eid}", model="test")
 
                 mock_ep.complete = _success
             else:
                 # Failure
-                async def _fail(req, *, api_key=None, _eid=eid):
+                async def _fail(req, *, credential=None, _eid=eid):
                     invocation_counts[_eid] += 1
                     raise RuntimeError(f"provider error from {_eid}")
 
@@ -164,7 +170,7 @@ class TestCascadeTermination:
             messages=[{"role": "user", "content": "hello"}],
         )
 
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request)
+        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request, prompt=create_redacted_chunk("foo"))
 
         # Must terminate (we got here) with at most |chain| attempts
         assert len(result.attempts) <= len(chain)
@@ -179,7 +185,7 @@ class TestCascadeTermination:
             messages=[{"role": "user", "content": "hello"}],
         )
 
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request)
+        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request, prompt=create_redacted_chunk("foo"))
         assert result.outcome in (RoutingOutcome.OK, RoutingOutcome.EXHAUSTED)
 
 
@@ -196,7 +202,7 @@ class TestAtMostOnceOrderedInvocation:
             messages=[{"role": "user", "content": "hello"}],
         )
 
-        await router.complete(tier=ModelTier.HIGH_CODING, request=request)
+        await router.complete(tier=ModelTier.HIGH_CODING, request=request, prompt=create_redacted_chunk("foo"))
 
         for eid, count in counts.items():
             assert count <= 1, f"{eid} invoked {count} times"
@@ -211,7 +217,7 @@ class TestAtMostOnceOrderedInvocation:
             messages=[{"role": "user", "content": "hello"}],
         )
 
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request)
+        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request, prompt=create_redacted_chunk("foo"))
 
         # Extract invoked endpoint IDs in order from attempts
         invoked_ids = [a.endpoint_id for a in result.attempts]
@@ -242,7 +248,9 @@ class TestUnsupportedEndpointsNeverInvoked:
             messages=[{"role": "user", "content": "hello"}],
         )
 
-        _result = await router.complete(tier=ModelTier.HIGH_CODING, request=request)
+        _result = await router.complete(
+            tier=ModelTier.HIGH_CODING, request=request, prompt=create_redacted_chunk("foo")
+        )
 
         # Unsupported endpoints (behavior=None) should have 0 invocations
         for name, behavior in chain:
@@ -265,6 +273,6 @@ class TestProviderErrorsSwallowed:
         )
 
         # This must not raise
-        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request)
+        result = await router.complete(tier=ModelTier.HIGH_CODING, request=request, prompt=create_redacted_chunk("foo"))
         assert isinstance(result, RoutingResult)
         assert result.outcome in (RoutingOutcome.OK, RoutingOutcome.EXHAUSTED)

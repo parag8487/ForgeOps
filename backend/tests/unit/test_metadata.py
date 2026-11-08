@@ -78,15 +78,39 @@ class TestPyprojectMetadata:
         for dep in all_deps:
             assert "celery" not in dep.lower(), f"Disallowed dependency found: {dep}. Celery is permanently banned."
 
-    def test_disallowed_dependency_opentelemetry(self):
-        """opentelemetry-* must not appear — OTel SDK is Phase 3."""
+    def test_opentelemetry_arrives_in_phase_2_and_is_exactly_pinned(self):
+        """OTel is REQUIRED as of Phase 2 §2.10, and this guard inverted rather than being deleted.
+
+        It previously asserted `opentelemetry-*` must NOT appear, and its own docstring said why: "OTel
+        SDK is Phase 2". That was a phase boundary, not a permanent ban like `celery` -- so the arrival
+        of §2.10 is the behaviour legitimately changing, and the authority is updated rather than the
+        test relaxed.
+
+        Inverting it keeps a guard where there was one. What matters now is that the SDK and the
+        instrumentation packages are EXACTLY pinned and that their two version lines move together:
+        they version separately (1.30.0 and 0.51b0), and mixing an SDK with instrumentation built for
+        another raises at import -- which presents as a broken application rather than as a dependency
+        mistake.
+        """
         data = _load_pyproject()
         all_deps = data["project"]["dependencies"]
         all_deps += data["project"]["optional-dependencies"].get("dev", [])
-        for dep in all_deps:
-            assert not dep.lower().startswith("opentelemetry"), (
-                f"Disallowed dependency found: {dep}. OTel SDK is Phase 3."
-            )
+        otel = [dep for dep in all_deps if dep.lower().startswith("opentelemetry")]
+        assert otel, (
+            "no opentelemetry package is declared, but Phase 2 2.10 requires OTel-native monitoring. "
+            "If that section were reverted this guard should be inverted back, not deleted."
+        )
+        for dep in otel:
+            assert "==" in dep, f"{dep} is not exactly pinned"
+        # The SDK and the instrumentation packages version SEPARATELY, and each family must be internally
+        # consistent: two different SDK versions, or two different instrumentation versions, is the
+        # mismatch that raises at import.
+        sdk = {dep.split("==")[1] for dep in otel if "-instrumentation-" not in dep}
+        instrumentation = {dep.split("==")[1] for dep in otel if "-instrumentation-" in dep}
+        assert len(sdk) <= 1, f"opentelemetry SDK packages disagree on version: {sorted(sdk)}"
+        assert len(instrumentation) <= 1, (
+            f"opentelemetry instrumentation packages disagree on version: {sorted(instrumentation)}"
+        )
 
     def test_disallowed_dependency_structlog(self):
         """structlog must not appear — stdlib logging is the choice (OQ-3)."""
@@ -128,12 +152,36 @@ class TestPyprojectMetadata:
         pytest_cfg = data["tool"]["pytest"]["ini_options"]
         assert pytest_cfg["asyncio_mode"] == "auto"
 
-    def test_coverage_not_a_gate(self):
-        """Coverage is a goal, not a gate — no fail_under in coverage config."""
+    def test_coverage_is_a_gate(self):
+        """Coverage is a gate at 70 — `fail_under` must be set in the coverage config.
+
+        This test previously asserted the OPPOSITE. It was `test_coverage_not_a_gate` and it
+        asserted `fail_under` was ABSENT, with the message "Coverage must be a GOAL not a gate
+        in Phase 0". That was correct for Phase 0 and became an active guard against Phase 1's
+        own requirement: criterion 11 makes coverage a gate, and this test passed on every run
+        by proving it was not one. Three documents claimed the gate while this asserted its
+        absence, and nothing compared them (LEARNING-JOURNAL finding 81).
+
+        The lesson is in the shape rather than the value: a test of the form
+        `assert X not in config` encodes an intent, and intents expire at phase boundaries.
+        Asserting the threshold's VALUE rather than merely its presence is what stops the gate
+        being quietly weakened to whatever the code currently achieves.
+        """
         data = _load_pyproject()
         coverage_report = data.get("tool", {}).get("coverage", {}).get("report", {})
-        assert "fail_under" not in coverage_report, (
-            "Coverage must be a GOAL not a gate in Phase 0 (design.md §7.6, OQ-17)"
+        assert "fail_under" in coverage_report, (
+            "Coverage must be a GATE in Phase 1 (design.md §7.13, D-31, criterion 11): "
+            "`fail_under` is missing from [tool.coverage.report]"
+        )
+        assert coverage_report["fail_under"] == 70, (
+            f"the coverage gate must be 70, not {coverage_report['fail_under']} — a threshold "
+            "tuned down to what the code currently reaches is not a gate"
+        )
+
+        pytest_addopts = data["tool"]["pytest"]["ini_options"]["addopts"]
+        assert "--cov-fail-under=70" in pytest_addopts, (
+            "`--cov-fail-under=70` must be in the backend addopts so the gate applies to every "
+            "pytest run and not only to the CI entry point"
         )
 
     def test_banned_imports_cross_domain(self):

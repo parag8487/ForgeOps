@@ -1,0 +1,404 @@
+/**
+ * Part F: follow the printed instructions literally, as a user would.
+ *
+ * WHAT THIS EXISTS TO CATCH
+ *
+ * Every other spec runs the agent with arguments the SPEC chose:
+ *
+ *     composeExec("agent", ["forgeops-agent", "pair", "--code", code, "--backend", "ws://backend:8000/..."])
+ *
+ * That proves the CLI works. It proves nothing about the command the UI printed — and the UI printed
+ * `forgeops-agent pair --code BYDPQC`, which fails three ways: PowerShell will not execute a bare name
+ * from the current directory, the binary is `forgeops-agent.exe` on Windows, and `pair` refuses without
+ * `--backend`. A separate rendered command once carried `scan --path`, a flag the CLI has never
+ * accepted. Every one of those was a claim about the CLI made in a file that never met the CLI.
+ *
+ * So this spec reads the command strings OUT OF THE DOM and executes them verbatim. No arguments are
+ * chosen here, nothing is appended, and nothing is corrected. If the printed command does not run,
+ * this test fails.
+ *
+ * IT ALSO RUNS THE AGENT AS A HOST BINARY. The journey and onboarding specs run it inside a Linux
+ * container, which is why the Windows keychain limit went unnoticed for so long. Here the binary is
+ * built and executed on the runner itself, against the composed backend over its published port —
+ * the same way a user runs it. `ci.yml`'s `agent-host` job covers the Windows and macOS credential
+ * stores, which no Linux runner can.
+ */
+
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+import { expect, test, type Page } from "@playwright/test";
+
+import { gotoAsOperator, mintAccessToken, OPERATOR, signIn } from "./helpers/auth";
+import { eventually, sqlScalar } from "./helpers/stack";
+
+test.describe.configure({ mode: "serial" });
+
+const API = process.env.E2E_API_BASE_URL ?? "http://localhost:8000/api/v1";
+
+/**
+ * The repository root, resolved from the working directory rather than from `__dirname`.
+ *
+ * `frontend/package.json` declares `"type": "module"`, so `__dirname` does not exist — the first
+ * version used it and the whole module failed to load, which Playwright reported as "No tests found".
+ * A spec that cannot be loaded is worse than one that fails: the run went green-adjacent with zero
+ * tests executed. `e2e/helpers/stack.ts` already resolves the root as
+ * `path.resolve(process.cwd(), "..")`, and Playwright is invoked from `frontend/`, so this matches
+ * what the rest of the suite does instead of inventing a second convention.
+ */
+const REPO_ROOT = resolve(process.cwd(), "..");
+
+/** Unique per run, so a rerun does not collide with the previous run's project. */
+const SUFFIX = Date.now().toString(36);
+const PROJECT_NAME = `Printed ${SUFFIX}`;
+
+const printed: {
+  projectId?: string;
+  code?: string;
+  connectCommand?: string;
+  installCommand?: string;
+  workspace?: string;
+  binDir?: string;
+  deviceId?: string;
+} = {};
+
+function requireOperator() {
+  test.skip(OPERATOR.password === "", "E2E_OIDC_PASSWORD is unset; provision-authentik.py sets it");
+}
+
+async function open(page: Page, path: string, heading: RegExp) {
+  await gotoAsOperator(page, path);
+  await expect(page.getByRole("heading", { level: 1, name: heading })).toBeVisible({
+    timeout: 30_000,
+  });
+}
+
+/**
+ * Run a command string the way a shell would, and return its output.
+ *
+ * `bash -lc` rather than splitting on spaces: the point is to execute what was PRINTED, and a printed
+ * command may legitimately contain quoting that only a shell resolves. Splitting on whitespace here
+ * would be this spec correcting the string, which is the one thing it must never do.
+ */
+function runPrinted(
+  command: string,
+  options: { cwd: string; env?: Record<string, string> },
+): string {
+  return execFileSync("bash", ["-lc", command], {
+    cwd: options.cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 300_000,
+    env: { ...process.env, ...options.env },
+  });
+}
+
+test.describe("Part F: the printed instructions, run verbatim", () => {
+  test.afterAll(() => {
+    // The agent is left running by the connect step, and a stray process holding a WebSocket would
+    // outlive the run and confuse the next one.
+    try {
+      execFileSync("pkill", ["-f", "forgeops-agent connect"], { stdio: "ignore" });
+    } catch {
+      // Nothing to kill is the normal case when an earlier step failed.
+    }
+    if (printed.binDir) rmSync(printed.binDir, { recursive: true, force: true });
+    if (printed.workspace) rmSync(printed.workspace, { recursive: true, force: true });
+  });
+
+  test("step 1 — a project exists, with a workspace on this machine", async ({ page }) => {
+    requireOperator();
+    await signIn(page);
+    await mintAccessToken(page, API);
+
+    // A real directory on the runner, with real content for the scan to find. Not the container's
+    // /workspace: this spec runs the agent as a HOST process, so the path it indexes must be one the
+    // host actually has.
+    printed.workspace = mkdtempSync(join(tmpdir(), "forgeops-printed-"));
+    mkdirSync(join(printed.workspace, "src"), { recursive: true });
+    writeFileSync(
+      join(printed.workspace, "package.json"),
+      JSON.stringify(
+        { name: "printed-fixture", version: "1.0.0", dependencies: { express: "4.19.2" } },
+        null,
+        2,
+      ),
+    );
+    writeFileSync(
+      join(printed.workspace, "src", "index.js"),
+      "const express = require('express');\nconst app = express();\napp.listen(3000);\n",
+    );
+
+    await open(page, "/projects", /Projects/i);
+    await page.getByLabel(/directory on the machine/i).check();
+    await page.getByLabel("Name", { exact: true }).fill(PROJECT_NAME);
+    await page.getByLabel(/working-tree path/i).fill(printed.workspace);
+    // `getByRole`, not a testid. `create-project` was an invented `data-testid` that exists nowhere
+    // in the app — the spec waited the full 15-minute timeout for an element that could never appear.
+    // `onboarding.spec.ts` already submits this form by its accessible name, so this matches it.
+    await page.getByRole("button", { name: /create project/i }).click();
+
+    const id = await eventually("the project row", () =>
+      sqlScalar(`SELECT id FROM projects WHERE name = '${PROJECT_NAME}'`),
+    );
+    expect(id).not.toBeNull();
+    printed.projectId = id!;
+  });
+
+  test("step 2 — the onboarding screen prints a runnable install command", async ({ page }) => {
+    requireOperator();
+    await open(page, "/onboarding", /Getting started/i);
+    await page.getByLabel("Project").selectOption(printed.projectId!);
+
+    const panel = page.getByTestId("agent-connect-panel");
+    await expect(panel).toBeVisible();
+
+    // THE PLATFORM IS CHOSEN, NOT ASSUMED.
+    //
+    // The panel detects the platform from the browser, and Playwright's `Desktop Chrome` descriptor
+    // sends a WINDOWS user-agent whatever host it runs on — so detection correctly answered "windows"
+    // on a Linux runner and this spec, which asserts the POSIX form, failed on its own assumption.
+    // That was a defect in the spec, not in the panel.
+    //
+    // Choosing explicitly is also the better test: the picker exists precisely because detection can
+    // be wrong, and a user whose platform was misdetected relies on it. Driving it here is the only
+    // end-to-end assertion that it works.
+    await panel.getByTestId("platform-picker").selectOption("linux");
+
+    const install = await panel.getByTestId("install-command").innerText();
+    printed.installCommand = install.trim();
+    expect(printed.installCommand).toContain("forgeops-agent");
+    expect(
+      printed.installCommand,
+      "after choosing Linux the panel must not print a PowerShell command",
+    ).not.toContain("$env:");
+    expect(printed.installCommand).toContain("/usr/local/bin/forgeops-agent");
+
+    // NOTHING TO COMPILE. Building from source was the first step of the old flow, and it is what put
+    // the five-minute code expiry out of reach.
+    const wholePanel = await panel.innerText();
+    expect(wholePanel, "the screen must not tell a user to build the agent").not.toMatch(
+      /go build/,
+    );
+  });
+
+  test("step 3 — the install command puts the binary on PATH, run exactly as printed", async () => {
+    requireOperator();
+
+    // THE ARCHIVE, NOT A BARE BINARY — and this is the whole repair.
+    //
+    // The printed command searches for `forgeops-agent_*_<os>_*.tar.gz` here and in `~/Downloads`,
+    // extracts it into a temporary directory and installs the binary from inside it. This step used to
+    // place a bare `go build` output in the directory instead, so the printed command found no archive,
+    // SAID SO, and exited 0 — a deliberate design decision recorded in `commands.ts`, because `exit` in
+    // an interactive shell closes the user's terminal. `expect(output).toBeDefined()` was therefore
+    // satisfied by the message "No forgeops-agent tarball found here or in ~/Downloads", nothing was
+    // installed, and the next line failed with `command not found`. The spec's setup did not match the
+    // instructions it was checking, and the product was right throughout.
+    //
+    // `scripts/package-agent.sh` produces the archive by running the same GoReleaser configuration the
+    // tagged release uses, so the name template, the archive format and the binary's name inside it are
+    // the ones a real download has. Tarring a binary here instead would assert this spec's own idea of
+    // the layout and would keep passing after the real layout changed.
+    printed.binDir = mkdtempSync(join(tmpdir(), "forgeops-bin-"));
+    execFileSync("bash", [join(REPO_ROOT, "scripts", "package-agent.sh"), printed.binDir], {
+      cwd: REPO_ROOT,
+      stdio: "inherit",
+      // Bounded like every other synchronous spawn here. `inherit` means Node holds no pipe to wait
+      // on, so this one was never the hang — but an unbounded blocking call cannot be timed out by
+      // Playwright at all, so none of them is left unbounded. Six cross-compiled targets and their
+      // archives take about 100 seconds on a runner.
+      timeout: 900_000,
+      env: { ...process.env, CGO_ENABLED: "0" },
+    });
+
+    // Fail here, loudly, rather than let the printed command report an absent archive as a success.
+    const archives = readdirSync(printed.binDir).filter(
+      (f) => f.endsWith(".tar.gz") || f.endsWith(".zip"),
+    );
+    expect(
+      archives.length,
+      `packaging produced no archive for this platform; the directory holds ${JSON.stringify(readdirSync(printed.binDir))}`,
+    ).toBeGreaterThan(0);
+
+    // Run from the directory holding the download, which is what the instructions assume — exactly as
+    // printed, with no substitution.
+    const output = runPrinted(printed.installCommand!, { cwd: printed.binDir });
+    expect(output).toBeDefined();
+    // The one message that means the command ran and installed nothing. Asserted explicitly, because
+    // it exits 0 on purpose and every later assertion would otherwise blame the wrong thing.
+    expect(output).not.toContain("No forgeops-agent tarball found");
+
+    // THE POINT OF THE INSTALL STEP: the bare command now works, from anywhere, with no prefix.
+    const version = runPrinted("forgeops-agent version", { cwd: tmpdir() });
+    expect(version).toContain("forgeops-agent");
+    // And no spurious shutdown noise, which on Windows appeared above every real message.
+    expect(version.toLowerCase()).not.toContain("handle is invalid");
+  });
+
+  test("step 4 — doctor runs bare and reports the credential store", async () => {
+    requireOperator();
+
+    // `doctor` is what the panel offers when something goes wrong, so it must work as printed too.
+    // It exits non-zero when Docker or Kubernetes is absent on the runner, which is a true report
+    // about the machine rather than a failure of this test — so the output is what is asserted.
+    let output = "";
+    try {
+      output = runPrinted("forgeops-agent doctor", {
+        cwd: tmpdir(),
+        env: { AGENT_STATE_DIR: join(printed.binDir!, "state") },
+      });
+    } catch (error) {
+      output = String((error as { stdout?: string }).stdout ?? "");
+    }
+    expect(output).toContain("Credential store:");
+    expect(
+      output,
+      "doctor must predict whether a credential fits before a code is spent",
+    ).toContain("a device credential fits");
+  });
+
+  test("step 5 — a code is minted and the connect command carries it and the backend", async ({
+    page,
+  }) => {
+    requireOperator();
+    await open(page, "/onboarding", /Getting started/i);
+    await page.getByLabel("Project").selectOption(printed.projectId!);
+
+    await open(page, "/pairing", /Agent pairing/i);
+    await page.getByLabel("Project").selectOption(printed.projectId!);
+    await page.getByTestId("mint-code").click();
+
+    const code = (await page.getByTestId("pairing-code-value").innerText()).trim();
+    expect(code).toMatch(/^[0-9A-Z]{6}$/);
+    printed.code = code;
+
+    // A LIVE COUNTDOWN, not a raw timestamp. The old screen printed `expires_at` verbatim and left the
+    // user to subtract two times; on a first run the code always expired before it could be used.
+    await expect(page.getByTestId("code-countdown")).toBeVisible();
+    const countdown = await page.getByTestId("code-countdown-value").innerText();
+    expect(countdown, "the countdown must show minutes and seconds").toMatch(/^\d+:\d{2}$/);
+    await expect(page.getByTestId("pairing-code")).not.toContainText(/\d{4}-\d{2}-\d{2}T/);
+
+    // The command the user is told to run, read from the DOM — with the platform chosen rather than
+    // assumed, for the reason step 2 records: Playwright's browser reports a Windows user-agent.
+    const panel = page.getByTestId("agent-connect-panel");
+    await expect(panel).toBeVisible();
+    await panel.getByTestId("platform-picker").selectOption("linux");
+
+    const connect = (await panel.getByTestId("connect-command").innerText()).trim();
+    printed.connectCommand = connect;
+
+    // It must carry the code, and the --backend the old command was missing entirely.
+    expect(connect).toContain(code);
+    expect(connect, "the printed command must carry --backend or pair refuses").toContain(
+      "--backend",
+    );
+    expect(connect, "after choosing Linux there must be no .exe").not.toContain(".exe");
+    expect(connect, "the binary is on PATH, so no ./ prefix").not.toContain("./forgeops-agent");
+  });
+
+  test("step 6 — the printed connect command runs and pairs this machine", async () => {
+    requireOperator();
+    const command = printed.connectCommand!;
+
+    // EXECUTED VERBATIM. Nothing is appended and nothing is corrected — if this string does not run,
+    // the screen is wrong and this test is the thing that says so.
+    //
+    // `connect` stays resident by design, so it is started detached and its output tailed. A
+    // foreground run would hang this spec forever, which is the correct behaviour for the command and
+    // the wrong behaviour for a test.
+    const logPath = join(printed.binDir!, "connect.log");
+
+    // FULLY DETACHED, AND THE REASON IS A REAL HANG THIS CAUSED.
+    //
+    // `connect` is resident by design — it holds the session open so an approved change set can be
+    // applied. It only became resident once this branch made stage 3 succeed; before that the session
+    // was refused on the pairing port and the process exited, which is why the naive spawn below used
+    // to work and then started hanging for over an hour.
+    //
+    // `execFileSync` is SYNCHRONOUS, so it blocks Node's event loop, and Playwright's per-test timeout
+    // is enforced on that loop. A blocking spawn therefore cannot be timed out by the test framework:
+    // the only thing that stops it is the JOB timeout, 140 minutes later, with no useful output. That
+    // is the worst possible failure shape, so it is removed three ways at once rather than one:
+    //
+    //   setsid          a new session, so the child is not in this shell's process group and holds no
+    //                   controlling terminal
+    //   < /dev/null     stdin is not inherited, so the resident agent cannot hold the parent's
+    //   stdio: ignore   Node creates NO pipes, so there is nothing for it to wait on for EOF
+    //   timeout         a hard bound, so any future variant of this fails in a minute with a message
+    //                   instead of consuming the whole job
+    execFileSync(
+      "bash",
+      ["-lc", `cd ${printed.workspace} && setsid nohup ${command} > ${logPath} 2>&1 < /dev/null &`],
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "ignore", "ignore"],
+        timeout: 60_000,
+        env: { ...process.env, AGENT_WORKSPACE_ROOT: printed.workspace! },
+      },
+    );
+
+    // PAIRED. Observed in the database rather than in the log, because the backend's row is the fact
+    // and the log is a report of it.
+    //
+    // This is the assertion the original defect report was about: a user who follows the printed
+    // instructions ends up with an active device. Before this work the printed command could not run
+    // at all, and on Windows `pair` could not have succeeded even when it did.
+    const deviceId = await eventually(
+      "an active device for the project",
+      () =>
+        sqlScalar(
+          `SELECT id FROM agent_devices WHERE project_id = '${printed.projectId}' AND status = 'active'`,
+        ),
+      { timeoutMs: 120_000 },
+    );
+    expect(deviceId, "the printed command did not pair; see connect.log").not.toBeNull();
+    printed.deviceId = deviceId!;
+
+    // WHERE THIS SPEC STOPS, AND WHY — stated rather than left as a silent gap.
+    //
+    // `connect`'s later stages, the scan submit and the resident WebSocket session, both authenticate
+    // with TWO factors: a device token AND a client certificate. The certificate is only presented on
+    // the dedicated mTLS listener (`backend/src/agent_listener.py`), which this compose topology does
+    // not publish to the host, and the agent's pairing client uses the system trust store so it could
+    // not verify the internal CA on that port even if it were published.
+    //
+    // So a HOST agent can pair here and cannot index here. That is a fact about the test topology, not
+    // about the product: `journey.spec.ts` and `onboarding.spec.ts` exercise scan, run, apply and
+    // revert against that listener on every single run, from inside the compose network where the
+    // certificate and the CA are both available.
+    //
+    // What this spec uniquely proves is the part nothing else did: that the commands the SCREEN PRINTS
+    // are correct, complete and runnable as printed, on a host, by a user who edits nothing.
+  });
+
+  test("step 7 — the command reported its backend, its source and its first stage", async () => {
+    requireOperator();
+
+    // A single command replacing three must say what it did, or a failure is unattributable. The log is
+    // read here rather than asserted on earlier, so the database assertion above stands on its own.
+    const log = runPrinted(`cat ${join(printed.binDir!, "connect.log")}`, { cwd: tmpdir() });
+
+    // The backend it used, and WHERE THAT VALUE CAME FROM. An agent dialling a host the user did not
+    // expect was previously impossible to diagnose; this line is the fix, and the printed command
+    // carries `--backend`, so the flag is what must be reported.
+    expect(log).toContain("Backend:");
+    expect(log).toMatch(/from the --backend flag/);
+    expect(log).toContain(printed.connectCommand!.split("--backend ")[1].split(" ")[0]);
+
+    // Stage 1 announced itself. Stages 2 and 3 need the mTLS listener, which step 6 explains is not
+    // reachable from the host in this topology — so asserting them here would be asserting the
+    // topology, not the command.
+    expect(log).toContain("[1/3] pair");
+
+    // And the stage labels exist at all, so a failure in any of them would be attributable. Checked
+    // against the command's own help rather than its output, which is where the contract lives.
+    const help = runPrinted("forgeops-agent connect --help", { cwd: tmpdir() });
+    for (const stage of ["pair", "scan", "run"]) {
+      expect(help, `connect's help must name the ${stage} stage`).toContain(stage);
+    }
+  });
+});

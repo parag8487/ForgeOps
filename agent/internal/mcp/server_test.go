@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
 
-	"github.com/parag8487/ForgeOps/agent/internal/fileops"
 	"github.com/parag8487/ForgeOps/agent/internal/iac"
 	"github.com/parag8487/ForgeOps/agent/internal/telemetry"
 )
@@ -20,6 +20,21 @@ import (
 type fakeRunner struct {
 	validateFn func(ctx context.Context, workdir string) (*iac.ValidateResult, error)
 	planFn     func(ctx context.Context, workdir string, opts iac.PlanOptions) (*iac.PlanResult, error)
+	// applyCalls counts something that must never happen. See `Apply` below.
+	applyCalls int
+}
+
+// Apply exists because `iac.Runner` gained it in Phase 2 and NOT because the MCP surface may apply
+// anything. It fails, loudly, and the count is asserted to be zero.
+//
+// THE COMPILE ERROR THAT BROUGHT THIS HERE IS THE INTERFACE DOING ITS JOB. Widening `iac.Runner` broke
+// every double in one obvious place, which is exactly what `contract_test.go` says the assertion is for.
+// The tempting fix was a method returning an empty result; that would have given the MCP tool surface a
+// silent, working apply that no approval covered -- an AI-initiated `tofu apply` outside the chokepoint,
+// which is the most serious thing this codebase could accidentally acquire.
+func (f *fakeRunner) Apply(ctx context.Context, workdir string, opts iac.ApplyOptions) (*iac.ApplyResult, error) {
+	f.applyCalls++
+	return nil, errors.New("the MCP surface must never apply infrastructure")
 }
 
 func (f *fakeRunner) Validate(ctx context.Context, workdir string) (*iac.ValidateResult, error) {
@@ -36,11 +51,10 @@ func (f *fakeRunner) Plan(ctx context.Context, workdir string, opts iac.PlanOpti
 	return &iac.PlanResult{ExitCode: 2, HasChanges: true, PlanJSON: json.RawMessage(`{"changes":1}`)}, nil
 }
 
+// fakeOps satisfies fileops.Ops, which after D-45 has exactly one method and no write
+// path. That is the point: a double for this interface can no longer pretend to apply a
+// change-set, because the interface cannot express one.
 type fakeOps struct{}
-
-func (f *fakeOps) ApplyAtomic(ctx context.Context, root string, entries []fileops.WriteEntry) (*fileops.ApplyReport, error) {
-	return nil, nil
-}
 
 func (f *fakeOps) UnifiedDiff(before, after, label string) string { return "" }
 
@@ -255,6 +269,44 @@ func TestTofuValidate_ReturnsDiagnostics(t *testing.T) {
 	}
 	if vr.Diagnostics == nil {
 		t.Error("diagnostics is nil, expected non-nil")
+	}
+}
+
+func TestTofuValidate_RedactsSecrets(t *testing.T) {
+	deps := newTestDeps()
+	deps.Tofu = &fakeRunner{
+		validateFn: func(_ context.Context, _ string) (*iac.ValidateResult, error) {
+			rawDiag := `{"detail": "Error matching github token ghp_123456789012345678901234567890123456"}`
+			return &iac.ValidateResult{
+				ExitCode:    1,
+				Diagnostics: json.RawMessage(rawDiag),
+			}, nil
+		},
+	}
+	s := NewServer(deps, "1.0.0")
+	result := callTool(t, s, "agent.tofu.validate", map[string]interface{}{
+		"workdir": "/tmp/terraform",
+	})
+
+	if result.IsError {
+		t.Fatal("agent.tofu.validate returned error")
+	}
+
+	text := getToolResultText(t, result)
+	var vr validateResponse
+	if err := json.Unmarshal([]byte(text), &vr); err != nil {
+		t.Fatalf("invalid JSON: %v\ntext: %s", err, text)
+	}
+
+	if vr.Diagnostics == nil {
+		t.Fatal("diagnostics is nil, expected non-nil")
+	}
+	diagStr := string(*vr.Diagnostics)
+	if strings.Contains(diagStr, "ghp_123456789012345678901234567890123456") {
+		t.Errorf("secret leaked in validator diagnostic! diag: %s", diagStr)
+	}
+	if !strings.Contains(diagStr, "FORGEOPS_REDACTED") {
+		t.Errorf("expected redacted marker in diagnostic, got: %s", diagStr)
 	}
 }
 
@@ -682,4 +734,24 @@ func stringContains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestTheMcpSurfaceNeverApplies is the assertion behind `fakeRunner.Apply`'s refusal.
+//
+// The MCP tools are a surface an AI drives. `validate` and `plan` read; an apply creates and destroys real
+// infrastructure and must travel the chokepoint's six stages with a human approval attached. `toolMeta` is
+// the registry every registered tool appears in, so walking it is walking the surface.
+func TestTheMcpSurfaceNeverApplies(t *testing.T) {
+	for name, meta := range toolMeta {
+		if strings.Contains(strings.ToLower(name), "apply") {
+			t.Fatalf("the MCP surface registers %q, which an AI could drive with no approval attached", name)
+		}
+		// AND NO TOOL MAY CLAIM A BLAST RADIUS BEYOND THE WORKSPACE. `read_only` and `workspace` are the
+		// only two this surface is allowed to have; anything wider is infrastructure, which belongs behind
+		// an approval and not behind a tool call.
+		if meta.BlastRadius != "read_only" && meta.BlastRadius != "workspace" {
+			t.Fatalf("MCP tool %q declares blast radius %q, which is wider than this surface may be",
+				name, meta.BlastRadius)
+		}
+	}
 }

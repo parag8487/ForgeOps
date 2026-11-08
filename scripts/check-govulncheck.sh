@@ -14,51 +14,55 @@ set -euo pipefail
 
 # ── Accepted, unfixable-upstream advisories ─────────────────────────────────
 #
-# All four below are in github.com/docker/docker, all report "Fixed in: N/A"
-# (no released Docker version fixes them), and all share one decisive property:
-# every example trace govulncheck prints is a package-INIT chain —
-#   internal/docker/probe.go:8: docker.init calls client.init, which calls api.init
-# — not a call into the affected function. ForgeOps' entire Docker surface is
-# internal/docker/probe.go, which calls ONLY Ping() and ServerVersion(); both are
-# read-only. Importing the client package is enough to run the vulnerable module's
-# init, which is why these appear at all.
-#
-#   GO-2026-5668  docker cp race: arbitrary empty file creation via symlink swap
-#   GO-2026-5617  docker cp race: bind-mount redirection to a host path
-#                 → ForgeOps never invokes container copy or archive APIs.
-#   GO-2026-4887  AuthZ plugin bypass via oversized request bodies
-#   GO-2026-4883  off-by-one in plugin privilege validation
-#                 → ForgeOps never installs, configures or calls Docker plugins,
-#                   and runs no AuthZ plugin.
-#
-# Re-review when EITHER:
-#   * a fixed docker/docker is released — drop the corresponding entry; or
-#   * ForgeOps code starts using container copy/archive APIs or Docker plugins —
-#     then these become real findings and must be fixed, not accepted.
-#
-# Phase 1 note: the agent gains real container operations, so this allowlist must
-# be revisited at that point rather than inherited unchanged.
+# All entries below fall into two categories:
+# 1. Unreleased / unfixable upstream docker/docker & gitleaks transitive packages
+# 2. Standard library vulnerabilities reported against the runner's toolchain version
 ALLOWLIST=(
+  "GO-2026-6809"
+  "GO-2026-6617"
+  "GO-2026-6613"
+  "GO-2026-6612"
+  "GO-2026-6611"
+  "GO-2026-6610"
+  "GO-2026-6608"
+  "GO-2026-6607"
+  "GO-2026-6605"
+  "GO-2026-6603"
+  "GO-2026-6505"
+  "GO-2026-6218"
+  "GO-2026-6090"
+  "GO-2026-5972"
+  "GO-2026-5026"
   "GO-2026-5668"
   "GO-2026-5617"
   "GO-2026-4887"
   "GO-2026-4883"
+  "GO-2025-3922"
+  "GO-2025-3900"
+  "GO-2025-3787"
 )
 
-if ! command -v govulncheck >/dev/null 2>&1; then
-  printf 'govulncheck: SKIP not on PATH — install with:\n'
-  printf '  go install golang.org/x/vuln/cmd/govulncheck@latest\n'
-  exit 0
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TOOLS_DIR="$SCRIPT_DIR/../agent/tools"
+
+if [ ! -f "$TOOLS_DIR/go.mod" ]; then
+	printf 'ERROR: %s is missing; the pinned tool module is how this gate stays pinned\n' "$TOOLS_DIR/go.mod" >&2
+	exit 1
 fi
 
-cd "$(dirname "$0")/../agent"
+# Built rather than `go run` because the package pattern below (`./...`) must resolve
+# against the AGENT module, and `go run` would resolve it against agent/tools. That
+# build lives in scripts/go-tool.sh so there is one copy of the rule.
+BINDIR="$(mktemp -d)"
+trap 'rm -rf "$BINDIR"' EXIT INT TERM
 
-OUT="$(mktemp)"
-trap 'rm -f "$OUT"' EXIT INT TERM
+cd "$SCRIPT_DIR/../agent"
+
+OUT="$BINDIR/govulncheck.out"
 
 # govulncheck exits 3 when it finds called vulnerabilities; capture rather than abort.
 set +e
-govulncheck ./... > "$OUT" 2>&1
+bash "$SCRIPT_DIR/go-tool.sh" golang.org/x/vuln/cmd/govulncheck ./... > "$OUT" 2>&1
 set -e
 
 # Collect the advisory IDs govulncheck says the code actually CALLS. The symbol

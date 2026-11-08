@@ -1,0 +1,100 @@
+# The services `docker compose up -d --wait` must start with NO profile flags, and
+# with no `.env` present (design.md §2.3, §13.3).
+#
+# Read by the `compose-smoke` CI job and by scripts/check-compose-validate.py. Kept as
+# data rather than as a shell literal inside the workflow so that adding a
+# default-profile service is a reviewable one-line diff next to the task that adds it,
+# and so the assertion and the compose file cannot drift silently.
+#
+# Format: one service name per line. `# task N.N` marks a service design §2.3 requires
+# that has not landed yet; the owning task removes the marker in the same commit that
+# adds the service. A marker still present when Phase 1 closes is a real gap.
+#
+# design §2.3's complete target set is eight services:
+#   postgres redis opa cerbos authentik-server authentik-worker backend frontend
+#
+# Deviation recorded deliberately: task 2.3 cannot assert the eight-service set,
+# because `cerbos` arrives with task 6.4 and the two Authentik services with task 6.3.
+# Asserting a set containing services that do not exist would make the smoke job red
+# for four groups, and weakening it to "at least these" would stop it detecting an
+# accidental default-profile addition — which is the thing it is for. The three
+# pending rows below carry their owning task instead.
+
+postgres
+redis
+opa
+cerbos
+authentik-server
+authentik-worker
+backend
+frontend
+# The ARQ worker that RUNS what the API enqueues.
+#
+# A NINTH service, and a deliberate widening of §2.3's eight rather than an accident. The design
+# text lists the services that SERVE traffic; it does not name a worker because §4.6 treats the
+# task engine as an implementation concern. The consequence of leaving it out of this file was that
+# it was left out of the stack: `.env.example` sets `TASK_DISPATCHER=arq`, so the API enqueued jobs
+# that nothing consumed. `redis-cli --scan` showed `arq:job:*` keys accumulating with no consumer,
+# and an approved change set never applied. `make worker` had always run exactly this command, so
+# the worker was documented and simply absent from what `make up` starts.
+#
+# Recorded here rather than gated behind a profile, because a stack that accepts work it will never
+# perform is not a working default.
+worker
+# The local OpenAI-compatible model server that makes §11.7's `self_hosted` tier reachable.
+#
+# A TENTH service, and unprofiled for the same class of reason as `worker`. Every other endpoint in
+# `backend/config/model-tiers.yaml` needs a hosted key, and `.env.example` ships those as
+# placeholders by design — so without this service the whole six-tier cascade has nothing it can
+# reach, `ModelRouter.complete` answers EXHAUSTED for every tier, and generation's template
+# fallback is not a fallback but the only path. Behind a profile the default stack would be in
+# exactly that state, which is the condition this service was added to remove.
+ollama
+# The SECOND model server, which is what makes the cascade's fallback hop real.
+#
+# AN ELEVENTH service, unprofiled for a reason that is one step further along than `ollama`'s. With
+# only one model server, the `self_hosted` tier's primary AND its secondary both pointed at the same
+# base URL — so the cascade had a second hop on paper and nowhere to go in practice, and stopping the
+# one server took both entries with it. Nothing could distinguish a working failover from a broken
+# one, and trying to prove it found that `ModelRouter` had never substituted each endpoint's declared
+# model, so a fallback would have been asked for the primary's model and refused.
+#
+# Behind a profile the default stack would be back in that state: a declared fallback that is always
+# down. Recorded here for the same reason `worker` is — a stack whose documented recovery path cannot
+# run is not a working default.
+#
+# It costs no second download. It shares the `ollamamodels` volume and waits for `ollama` to be
+# healthy, so the weights are already present and its own `pull` is a no-op.
+ollama-secondary
+# The agent's mTLS listener, which is where a signed apply command is DELIVERED.
+#
+# A TWELFTH service, and the same class of omission as `worker` above with a larger consequence.
+# `/api/v1/ws/agent` authenticates the peer with two secrets, one of which is a client certificate,
+# and requiring a client certificate is a property of the LISTENER rather than of a route - so it
+# cannot be turned on for the port the browser uses, and it needs a second listener.
+# `backend/src/agent_listener.py` carries the full argument.
+#
+# That listener existed only in `docker-compose.e2e.yml`. So `make up` produced a stack with NOTHING
+# holding 8443, and onboarding step 8 was impossible: a user could generate, approve, watch the audit
+# chain record both transits, and no file would ever land on disk, because the command had nowhere to
+# be delivered. An agent inside the Compose network could receive one; the supported deployment - a
+# host binary on the user's own machine - could not.
+#
+# Unprofiled, and its host port published, for the reason `worker` is unprofiled: a stack that accepts
+# an approval it can never carry out is not a working default.
+backend-agent
+
+# 2.2 / 2.4a: the durable-execution engine, added to the DEFAULT set deliberately.
+#
+# The alternative was a profile, as the 2.10 observability tier uses -- and the difference is the
+# number of containers and whether the feature degrades honestly. The observability tier is six
+# services and the backend's telemetry is a no-op without them, so a deployment that skips it behaves
+# identically. Inngest is ONE service and is the engine of the deployment pipeline: behind a profile,
+# every pipeline route would answer `pipeline-engine-absent` for anyone who did not know to start it,
+# which is a supported failure but a poor default for a shipped feature.
+#
+# `test_unprofiled_compose_matches_the_committed_default_service_list` and
+# `test_no_optional_profile_services` both read this file, and both failed until this line was added --
+# which is the intended friction: promoting a service into everyone's default stack should require
+# writing down why.
+inngest

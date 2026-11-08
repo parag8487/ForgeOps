@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,10 +91,7 @@ func (r *TofuRunner) Validate(ctx context.Context, workdir string) (*ValidateRes
 
 	// Parse JSON diagnostics from stdout.
 	if len(stdout) > 0 {
-		combined := ""
-		for _, line := range stdout {
-			combined += line
-		}
+		combined := strings.Join(stdout, "\n")
 		if json.Valid([]byte(combined)) {
 			result.Diagnostics = json.RawMessage(combined)
 		}
@@ -152,10 +150,7 @@ func (r *TofuRunner) Plan(ctx context.Context, workdir string, opts PlanOptions)
 		showArgs := []string{"show", "-json", planFile}
 		showStdout, _, showExit, showErr := r.run(ctx, binPath, showArgs, workdir)
 		if showErr == nil && showExit == 0 && len(showStdout) > 0 {
-			combined := ""
-			for _, line := range showStdout {
-				combined += line
-			}
+			combined := strings.Join(showStdout, "\n")
 			if json.Valid([]byte(combined)) {
 				result.PlanJSON = json.RawMessage(combined)
 			}
@@ -170,6 +165,15 @@ func (r *TofuRunner) resolvedBinary() (string, error) {
 	path, err := exec.LookPath(r.cfg.BinaryPath)
 	if err != nil {
 		return "", fmt.Errorf("%w: %s", ErrTofuNotFound, r.cfg.BinaryPath)
+	}
+	base := filepath.Base(path)
+	if base == "tofu" || base == "tofu.exe" {
+		// If opentofu/setup-opentofu created a wrapper, prefer the real binary tofu-bin if present next to it.
+		dir := filepath.Dir(path)
+		realBin := filepath.Join(dir, "tofu-bin")
+		if info, err := os.Stat(realBin); err == nil && !info.IsDir() {
+			return realBin, nil
+		}
 	}
 	return path, nil
 }
@@ -228,6 +232,13 @@ func (r *TofuRunner) run(ctx context.Context, binPath string, args []string, wor
 		_ = stderrW.Close()
 		return nil, nil, -1, fmt.Errorf("start command: %w", err)
 	}
+
+	// Immediately after Start, and nowhere later. On Windows this assigns the process
+	// to the Job Object created by setProcessGroup, and every descendant it creates
+	// from this point is contained automatically (D-37). A descendant created in the
+	// window between Start and here would escape, so the two calls stay adjacent. No-op
+	// on Unix, where Setpgid already took effect at exec.
+	attachProcessGroup(cmd)
 
 	// The child holds its own descriptors now. Dropping the parent's copies is
 	// what lets the read ends reach EOF when the child (and any descendant
@@ -332,19 +343,44 @@ func (r *TofuRunner) drainGrace() time.Duration {
 
 // scanPipe reads lines from a pipe, capping each line at MaxLineBytes.
 func (r *TofuRunner) scanPipe(pipe io.Reader, stream string) []string {
-	scanner := bufio.NewScanner(pipe)
-	scanner.Buffer(make([]byte, r.cfg.MaxLineBytes), r.cfg.MaxLineBytes)
+	maxLine := r.cfg.MaxLineBytes
+	if maxLine <= 0 {
+		maxLine = 1024 * 1024
+	}
 
+	reader := bufio.NewReaderSize(pipe, 64*1024)
 	var lines []string
-	for scanner.Scan() {
-		line := scanner.Text()
-		// Truncate overlong lines that exactly fill the buffer.
-		if len(line) > r.cfg.MaxLineBytes {
-			line = line[:r.cfg.MaxLineBytes]
+	var current strings.Builder
+
+	for {
+		chunk, isPrefix, err := reader.ReadLine()
+		if len(chunk) > 0 {
+			if current.Len() < maxLine {
+				remaining := maxLine - current.Len()
+				if len(chunk) > remaining {
+					current.Write(chunk[:remaining])
+				} else {
+					current.Write(chunk)
+				}
+			}
 		}
-		lines = append(lines, line)
-		if r.sink != nil {
-			r.sink(stream, line)
+		if err != nil {
+			if current.Len() > 0 {
+				line := current.String()
+				lines = append(lines, line)
+				if r.sink != nil {
+					r.sink(stream, line)
+				}
+			}
+			break
+		}
+		if !isPrefix {
+			line := current.String()
+			current.Reset()
+			lines = append(lines, line)
+			if r.sink != nil {
+				r.sink(stream, line)
+			}
 		}
 	}
 	return lines

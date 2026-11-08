@@ -4,11 +4,13 @@ import userEvent from "@testing-library/user-event";
 import { AppSidebar } from "@/components/layout/app-sidebar";
 import { AppHeader } from "@/components/layout/app-header";
 import { ThemeToggle } from "@/components/layout/theme-toggle";
+import { ThemeProvider } from "@/components/providers/theme-provider";
 
 // Mock next/navigation
 let mockPathname = "/";
 vi.mock("next/navigation", () => ({
   usePathname: () => mockPathname,
+  useRouter: () => ({ replace: vi.fn(), push: vi.fn() }),
 }));
 
 // Mock next-themes
@@ -36,13 +38,40 @@ vi.mock("next/link", () => ({
 }));
 
 describe("AppSidebar", () => {
-  it("renders exactly one navigation link: Home -> /", () => {
+  // Home, the onboarding path, and every feature route. These two tests asserted exactly one link,
+  // which was accurate and was the problem: eight feature modules existed and the sidebar reached
+  // none of them. The counts stay exact so a nav entry added without a page behind it fails here.
+  //
+  // The ORDER is asserted, and it is the onboarding order rather than alphabetical or historical:
+  // getting started, then the project you are setting up, then what you do to it, then the surfaces
+  // that observe the result. A user who works down the sidebar works through the path.
+  const EXPECTED_LINKS = [
+    ["/", "Home"],
+    ["/onboarding", "Getting started"],
+    ["/projects", "Projects"],
+    ["/readiness", "Readiness"],
+    ["/generation", "Generation"],
+    ["/approvals", "Approvals"],
+    ["/policies", "Policies"],
+    ["/vault", "Vault"],
+    ["/pairing", "Pairing"],
+    ["/analysis", "Plan analysis"],
+    ["/models", "Model tiers"],
+    ["/audit", "Audit"],
+    // Settings rather than a feature: a GitHub link belongs to the person and outlives every project
+    // made with it, so it is inspected and revoked from here.
+    ["/settings/integrations", "Integrations"],
+  ] as const;
+
+  it("renders one navigation link per route, in order", () => {
     render(<AppSidebar />);
     const nav = screen.getByRole("navigation", { name: "Primary" });
     const links = nav.querySelectorAll("a");
-    expect(links).toHaveLength(1);
-    expect(links[0]).toHaveAttribute("href", "/");
-    expect(links[0]).toHaveTextContent("Home");
+    expect(links).toHaveLength(EXPECTED_LINKS.length);
+    EXPECTED_LINKS.forEach(([href, label], i) => {
+      expect(links[i]).toHaveAttribute("href", href);
+      expect(links[i]).toHaveTextContent(label);
+    });
   });
 
   it("has no disabled or placeholder future links", () => {
@@ -50,9 +79,14 @@ describe("AppSidebar", () => {
     const nav = screen.getByRole("navigation", { name: "Primary" });
     const disabledLinks = nav.querySelectorAll('[aria-disabled="true"], [disabled]');
     expect(disabledLinks).toHaveLength(0);
-    // No other links exist at all
+    // Every link points somewhere real: no `#`, and no empty href.
     const allLinks = nav.querySelectorAll("a");
-    expect(allLinks).toHaveLength(1);
+    expect(allLinks).toHaveLength(EXPECTED_LINKS.length);
+    allLinks.forEach((a) => {
+      const href = a.getAttribute("href");
+      expect(href).toBeTruthy();
+      expect(href).not.toBe("#");
+    });
   });
 
   it("sets aria-current=page at / pathname", () => {
@@ -126,5 +160,26 @@ describe("ThemeToggle", () => {
     const button = screen.getByRole("button", { name: /theme/i });
     await user.click(button);
     expect(mockSetTheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("calls setTheme on click when theme is dark", async () => {
+    mockTheme = "dark";
+    render(<ThemeToggle />);
+    const user = userEvent.setup();
+    const button = screen.getByRole("button", { name: /switch to light theme/i });
+    expect(button).toBeInTheDocument();
+    await user.click(button);
+    expect(mockSetTheme).toHaveBeenCalledWith("light");
+  });
+});
+
+describe("ThemeProvider", () => {
+  it("renders children wrapped cleanly", () => {
+    const { container } = render(
+      <ThemeProvider attribute="class">
+        <span>Child content</span>
+      </ThemeProvider>,
+    );
+    expect(container).toHaveTextContent("Child content");
   });
 });

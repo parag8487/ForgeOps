@@ -1,0 +1,206 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// Package executor dispatches verified commands to named operations (design §7.7, §10.5).
+//
+// There is no `exec`, no `shell`, no `run_command`, and no operation whose argument is a
+// command line. `phases.md` §1.1 requires named operations only, and the claim is checkable by
+// reading this one file: the catalogue below is the whole vocabulary, and `dispatcher.go` is the
+// only place any of it is reachable from.
+package executor
+
+import (
+	"errors"
+	"time"
+)
+
+// Operation is §7.7's closed catalogue.
+//
+// A string type rather than an integer enum so a wire value maps to a constant without a
+// conversion table, and so a log line names the operation rather than an ordinal. Closedness is
+// not enforceable by the Go type system for a string type, which is why it is enforced by the
+// dispatch table instead: `Operations()` derives from the table, `ParseOperation` accepts only
+// what the table holds, and a test asserts every constant declared here has an entry.
+type Operation string
+
+// The catalogue, in §7.7's order. Mutating operations are grouped last, deliberately: a reader
+// checking "which of these can write" should find them together rather than interleaved.
+const (
+	OpProjectRegister   Operation = "project.register"
+	OpProjectUnregister Operation = "project.unregister"
+
+	OpScanFull        Operation = "scan.full"
+	OpScanIncremental Operation = "scan.incremental"
+
+	OpValidateCompose Operation = "validate.compose"
+	OpValidateK8s     Operation = "validate.k8s"
+	OpValidateTofu    Operation = "validate.tofu"
+	OpValidateHelm    Operation = "validate.helm"
+	OpValidateYAML    Operation = "validate.yaml"
+	OpValidateTrivy   Operation = "validate.trivy"
+
+	OpReadinessInventory Operation = "readiness.inventory"
+	OpSecretScanRun      Operation = "secretscan.run"
+
+	OpChangeSetApply      Operation = "changeset.apply"
+	OpChangeSetRevert     Operation = "changeset.revert"
+	OpGitBranchCommitPush Operation = "git.branch_commit_push"
+	OpGitOpenPR           Operation = "git.open_pr"
+	OpSecretsInject       Operation = "secrets.inject"
+	// OpRepositoryClone puts a repository on the operator's machine. Mutating, and the only operation
+	// that creates the directory a project points at rather than writing inside one.
+	OpRepositoryClone Operation = "repository.clone"
+	// OpDeploymentApplyManifests applies Kubernetes manifests to a real cluster AND waits for the
+	// workloads to converge. Mutating: it changes what is running, which is the largest blast radius
+	// any operation here has.
+	OpDeploymentApplyManifests Operation = "deployment.apply_manifests"
+
+	// ── Phase 2 ──
+	//
+	// OpDockerInventory and OpKubernetesInventory are READS. They exist as their own operations, rather
+	// than as a mode of the action operations below, so that "may look" is never a route to "may act":
+	// the dashboards hold the read authority continuously and the write authority never.
+	OpDockerInventory     Operation = "docker.inventory"
+	OpKubernetesInventory Operation = "kubernetes.inventory"
+
+	// OpDockerContainerAction and OpDockerImageAction act on ONE named container or image with an action
+	// from a closed set. Not one operation per verb: the authority is the same and the whitelist would
+	// grow without narrowing. Not a docker command line either — there is no such operation here.
+	OpDockerContainerAction Operation = "docker.container_action"
+	OpDockerImageAction     Operation = "docker.image_action"
+
+	// OpKubernetesWorkloadAction scales, restarts or rolls back ONE named workload, and then verifies
+	// it converged. Confined to the same three pod-bearing kinds the deployment operation can verify,
+	// because acting on something unverifiable would report the API server's acceptance as success.
+	OpKubernetesWorkloadAction Operation = "kubernetes.workload_action"
+
+	// OpDockerContainerLogs and OpKubernetesPodDetail are READS of output. Bounded by line count and time
+	// window, and the applied bounds travel with the answer so a tail is never mistaken for a whole log.
+	// Two operations rather than one: a container with no logs and a pod that never scheduled are different
+	// facts, and the pod read returns EVENTS alongside logs because for an unscheduled pod the events are
+	// the entire explanation.
+	OpDockerContainerLogs Operation = "docker.container_logs"
+	OpKubernetesPodDetail Operation = "kubernetes.pod_detail"
+
+	// OpIacApply applies OpenTofu configuration, from a plan it makes inside the same approval. 2.2.
+	//
+	// ONE OPERATION AND NOT plan-then-apply, because the authority is "change this project's
+	// infrastructure" and a plan changes nothing. Two operations would mean two approvals with the state
+	// free to move between them, which defeats the reason an apply runs from a SAVED PLAN.
+	OpIacApply Operation = "iac.apply"
+
+	// OpArgoAppAction acts on ONE ArgoCD Application. 2.7.
+	//
+	// One authority with a closed verb set. `delete` is NOT among them: deleting an Application cascades
+	// through the resources finalizer to everything it deployed, which is a fleet-scale delete behind a
+	// single verb. Neither is `rollback`: `argocd app rollback` deploys a previous revision without
+	// changing Git, so the cluster and the repository disagree and the next sync undoes it.
+	OpArgoAppAction Operation = "argocd.app_action"
+
+	// OpKubernetesRolloutDetail reads ONE Argo Rollout's progress in detail. 2.7a.
+	//
+	// Separate from `kubernetes.inventory` for the reason `pod_detail` is: an inventory answers what
+	// exists across a namespace, and this answers what is happening to this one Rollout right now.
+	// Folding it in would fetch analysis runs for every workload on every dashboard refresh.
+	OpKubernetesRolloutDetail Operation = "kubernetes.rollout_detail"
+
+	// OpDevToolsRun runs the PROJECT'S OWN tests, linters, build, compose stack or migrations. The argument
+	// is a KIND from a closed set, never a command line: this is where an arbitrary-shell operation would
+	// most naturally appear and it deliberately does not. Mutating and approval-required, because a
+	// project's own test command is code the project controls, a build writes artifacts, compose starts
+	// containers and a migration changes a database.
+	OpDevToolsRun Operation = "devtools.run"
+)
+
+// allOperations is the declared vocabulary, used only to assert that the dispatch table covers
+// it. It is NOT the dispatch surface: `handlerTable` is, and `Operations()` reads that table.
+//
+// Two lists of the same thing is the shape journal pattern H warns about, so the relationship
+// between them is asserted in both directions — every constant has an entry, and every entry is
+// a declared constant. Kept because the alternative is deriving the constants from the table,
+// which would make a typo in a table key a silently new operation.
+var allOperations = []Operation{
+	OpProjectRegister, OpProjectUnregister,
+	OpScanFull, OpScanIncremental,
+	OpValidateCompose, OpValidateK8s, OpValidateTofu, OpValidateHelm, OpValidateYAML, OpValidateTrivy,
+	OpReadinessInventory, OpSecretScanRun,
+	OpChangeSetApply, OpChangeSetRevert, OpGitBranchCommitPush, OpGitOpenPR, OpSecretsInject,
+	OpRepositoryClone, OpDeploymentApplyManifests,
+	OpDockerInventory, OpKubernetesInventory,
+	OpDockerContainerAction, OpDockerImageAction, OpKubernetesWorkloadAction,
+	OpDockerContainerLogs, OpKubernetesPodDetail,
+	OpDevToolsRun,
+	OpIacApply,
+	OpArgoAppAction,
+	OpKubernetesRolloutDetail,
+}
+
+// OperationInfo is what `agent.status` and `agent doctor` report about one operation (§10.5).
+type OperationInfo struct {
+	Operation Operation `json:"operation"`
+	Mutating  bool      `json:"mutating"`
+	// RequiresApproval mirrors §7.7's third column. Every mutating operation requires one, and
+	// `TestEveryMutatingOperationRequiresAnApproval` asserts that rather than leaving it to
+	// whoever adds the next row.
+	RequiresApproval bool `json:"requires_approval"`
+	// Timeout is the per-operation bound. Reported so an operator can see why something was
+	// cut off, and so the numbers are reviewable in one place.
+	Timeout time.Duration `json:"timeout"`
+	// Implemented is false for a catalogued operation whose body arrives in a later group.
+	// Reported rather than hidden: a backend that knows the agent will refuse `scan.full`
+	// today can say so to a user instead of sending a command that comes back as an error.
+	Implemented bool `json:"implemented"`
+}
+
+// Errors this package returns. Each maps to an `agent.error` code through Code().
+var (
+	// ErrUnknownOperation is A.2's step 6: an operation outside the closed catalogue. It lands
+	// here rather than in `envelope` because the catalogue lives here and `envelope` is a leaf
+	// package that cannot import it (D-59).
+	ErrUnknownOperation = errors.New("executor: operation is not in the closed catalogue")
+
+	// ErrApprovalRequired is D-83's half of the approval rule. `envelope.parse` no longer
+	// requires a non-empty `approval_id`, because §7.7's read-only operations legitimately
+	// carry it empty; the requirement is operation-dependent and therefore belongs where
+	// operations are known. This is stronger than the blanket check it replaced: it
+	// distinguishes the cases §7.7 distinguishes.
+	ErrApprovalRequired = errors.New("executor: this operation mutates and requires an approval_id")
+
+	// ErrUnimplemented is a catalogued operation with no body in this phase.
+	//
+	// Distinct from ErrUnknownOperation on purpose (D-85). Reporting "unknown" for an
+	// operation that is in the catalogue would send the backend looking for a version skew
+	// that does not exist, and would make the closed catalogue unreadable from the outside:
+	// "we do not have that operation" and "we have it and it does nothing yet" are different
+	// facts and only one of them is a bug.
+	ErrUnimplemented = errors.New("executor: this operation is catalogued but not implemented in this phase")
+
+	// ErrNoAuthority guards the whole surface: Execute takes a *envelope.Verified and refuses a
+	// nil one rather than dereferencing it.
+	ErrNoAuthority = errors.New("executor: a verified envelope is required")
+
+	// ErrBadArgs is a malformed `args` object for an otherwise valid operation.
+	ErrBadArgs = errors.New("executor: the operation's args are malformed")
+)
+
+// Code maps an error to its Appendix C.2 `agent.error` suffix.
+//
+// One function, so the vocabulary has one dialect (journal pattern R is a second, weaker
+// dialect of an existing rule).
+func Code(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, ErrUnknownOperation):
+		return "operation-unknown"
+	case errors.Is(err, ErrUnimplemented):
+		return "operation-unimplemented"
+	case errors.Is(err, ErrApprovalRequired):
+		return "approval-required"
+	case errors.Is(err, ErrNoAuthority):
+		return "envelope-signature-invalid"
+	case errors.Is(err, ErrBadArgs):
+		return "envelope-malformed"
+	default:
+		return "operation-failed"
+	}
+}
