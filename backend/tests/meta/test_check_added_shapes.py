@@ -52,6 +52,24 @@ def _checker() -> ModuleType:
     return module
 
 
+def _clean_history(tmp_path: Path, commits: int = 2) -> Path:
+    """A throwaway repository whose tip is an ordinary commit adding one harmless line.
+
+    The process-level tests used to run against this repository's own tip, which made their
+    verdict depend on whatever commit happened to be on top: once `main`'s tip became a merge,
+    `HEAD~1..HEAD` spanned every merged commit and `git show HEAD` showed no added lines. The
+    checker's contract does not depend on that, so neither should the tests.
+    """
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": str(tmp_path / "nogit"), "GIT_CONFIG_SYSTEM": str(tmp_path / "nogit")}
+    for command in (["init", "-q"], ["config", "user.email", "t@t.invalid"], ["config", "user.name", "t"]):
+        subprocess.run(["git", *command], check=True, cwd=tmp_path, env=env)
+    for index in range(commits):
+        (tmp_path / f"file{index}.py").write_text(f"value = 'harmless {index}'\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], check=True, cwd=tmp_path, env=env)
+        subprocess.run(["git", "commit", "-q", "-m", f"commit {index}"], check=True, cwd=tmp_path, env=env)
+    return tmp_path
+
+
 # --------------------------------------------------------------------------------------------
 # Parsing the PowerShell table.
 #
@@ -170,11 +188,11 @@ class TestOnlyAddedLinesAreConsidered:
 class TestTheCheckerRunsAsAProcess:
     """It is a pre-commit hook, so the exit status is the contract, not the return value."""
 
-    def test_a_clean_range_exits_zero(self) -> None:
+    def test_a_clean_range_exits_zero(self, tmp_path: Path) -> None:
         result = subprocess.run(
             [sys.executable, str(CHECKER_PATH), "--range", "HEAD~1..HEAD"],
             capture_output=True,
-            cwd=REPO_ROOT,
+            cwd=_clean_history(tmp_path),
             encoding="utf-8",
             errors="replace",
         )
@@ -246,20 +264,18 @@ class TestItNeverPassesWhileCheckingNothing:
     both are asserted because an unasserted fallback is indistinguishable from the bug.
     """
 
-    def test_with_nothing_staged_it_scans_the_tip_commit_and_says_so(self) -> None:
+    def test_with_nothing_staged_it_scans_the_tip_commit_and_says_so(self, tmp_path: Path) -> None:
         result = subprocess.run(
             [sys.executable, str(CHECKER_PATH)],
             capture_output=True,
-            cwd=REPO_ROOT,
+            cwd=_clean_history(tmp_path),
             encoding="utf-8",
             errors="replace",
         )
         assert result.returncode == 0, result.stdout + result.stderr
-        if "nothing staged" in result.stdout:
-            considered = int(re.search(r"(\d+) added line\(s\)", result.stdout).group(1))
-            assert considered > 0, "fell back to HEAD and still found nothing to scan"
-        else:
-            assert "staged change" in result.stdout
+        assert "nothing staged" in result.stdout, result.stdout
+        considered = int(re.search(r"(\d+) added line\(s\)", result.stdout).group(1))
+        assert considered > 0, "fell back to HEAD and still found nothing to scan"
 
     def test_the_scope_is_always_named(self) -> None:
         """Whichever branch ran, the output must say which, so a reader can tell a real scan from
