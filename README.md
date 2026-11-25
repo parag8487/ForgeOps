@@ -8,7 +8,7 @@ AI-powered DevOps automation platform.
 - **Master Technical Document:** For the complete, authoritative specification covering the full architecture, problem statement, objectives, feature catalogue, G1–G7 gate workflows, G8 recovery, port authority, testing evidence, and evaluation guide, see [`FORGEOPS_PROJECT_MASTER_DOCUMENT.md`](FORGEOPS_PROJECT_MASTER_DOCUMENT.md).
 - **Canonical Architecture & System Diagrams:** For the complete, unified architectural flowchart and subsystem breakdown (UI, Security/Governance, FastAPI, ARQ/Redis queues, G1–G7 verification gates, Docker UDS/BuildKit v2, multi-target execution, and automated host setup), see [`docs/architecture/FORGEOPS_CANONICAL_ARCHITECTURE.md`](docs/architecture/FORGEOPS_CANONICAL_ARCHITECTURE.md) and [`ARCHITECTURE-DIAGRAMS.md`](ARCHITECTURE-DIAGRAMS.md).
 - **Status:** **Phase 2 Autonomous Deployment Engine Implemented.**
-  Phase 0 (foundation scaffolding) and Phase 1 (MVP core analysis, generation, and approval) are complete. Phase 2 (Autonomous Deployment Orchestrator, multi-target deployment strategies across Docker, GitHub, and Vercel, G1–G7 verification gates, deterministic port authority, and G8 bounded self-healing recovery) is active and implemented on the `phase-2-implementation` branch.
+  Phase 0 (foundation scaffolding) and Phase 1 (MVP core analysis, generation, and approval) are complete. Phase 2 (Autonomous Deployment Orchestrator, multi-target deployment strategies across Docker, GitHub, and Vercel, G1–G7 verification gates, deterministic port authority, and G8 bounded self-healing recovery) is implemented and merged into `main`.
 
 ## Running on Linux / Ubuntu (1-Click Master Setup)
 
@@ -22,17 +22,14 @@ needs, configures the environment, and then starts and verifies the entire platf
 Open your Ubuntu terminal and execute the following commands:
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/parag2-8487/forgeops.git
-cd forgeops
+# 1. Clone the repository (Phase 2 is on the default branch, main)
+git clone https://github.com/parag8487/ForgeOps.git
+cd ForgeOps
 
-# 2. Switch to the active implementation branch
-git checkout phase-2-implementation
-
-# 3. Grant execute permissions to the setup script
+# 2. Grant execute permissions to the setup script
 chmod +x setup.sh
 
-# 4. Run the 1-click master setup
+# 3. Run the 1-click master setup
 ./setup.sh
 ```
 
